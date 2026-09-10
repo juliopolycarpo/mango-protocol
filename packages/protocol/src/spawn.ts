@@ -1,0 +1,13 @@
+/**
+ * `@mangostudio/protocol/spawn`: the child-process launcher and the hardened
+ * ssh argv preset. This entry may import `node:`; the core entry may not.
+ */
+
+export {
+  type ExitStatus,
+  type SpawnChild,
+  type SpawnedPeer,
+  type SpawnOptions,
+  sanitizedEnv,
+  spawnPort,
+} from './transports/spawn';
