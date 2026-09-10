@@ -1,3 +1,10 @@
-/** Mango Protocol SDK entry point. The wire types land with the spec in the next commits. */
-export const PROTOCOL_MAJOR = 1 as const;
-export const PROTOCOL_MINOR = 0 as const;
+/**
+ * Mango Protocol SDK entry point: wire schemas, the codecs, version
+ * negotiation, the close-code table and the error vocabulary.
+ *
+ * Everything reachable from here is browser-safe; no module imports `node:`.
+ */
+
+export * from './close';
+export * from './errors';
+export * from './version';
