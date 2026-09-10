@@ -2,10 +2,10 @@
 //!
 //! This crate is the Rust half of one wire contract published three ways: the
 //! normative specification under `spec/`, the TypeScript SDK
-//! `@mangostudio/protocol`, and this crate. It carries the frame types and the
-//! rules a decoder enforces; the catalog document and JSON Schema emission land
-//! in the commits that follow. Sessions, transports and any async runtime are a
-//! later milestone and live outside this crate.
+//! `@mangostudio/protocol`, and this crate. It carries the frame types, the
+//! rules a decoder enforces, the two framings a transport needs, and the
+//! catalog document. Sessions, transports and any async runtime are a later
+//! milestone and live outside this crate.
 //!
 //! # Example
 //!
@@ -33,6 +33,7 @@
 //! - [`version`] — the wire version and the negotiation rule.
 //! - [`close`] and [`error`] — the reserved close codes and error codes.
 //! - [`catalog`] — the catalog document that describes an application contract.
+//! - `schema` — JSON Schema emission, behind the `schema` feature.
 
 pub mod catalog;
 pub mod close;
@@ -41,6 +42,9 @@ pub mod error;
 pub mod frame;
 pub mod validate;
 pub mod version;
+
+#[cfg(feature = "schema")]
+pub mod schema;
 
 pub use catalog::{Catalog, CatalogEvent, CatalogMethod};
 pub use close::{close_code_name, close_codes, is_fatal_close_code};
