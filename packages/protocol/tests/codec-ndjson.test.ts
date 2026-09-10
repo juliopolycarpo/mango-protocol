@@ -8,22 +8,12 @@ import {
   MIN_MAX_FRAME_BYTES,
   measureFrameBytes,
 } from '../src/codec/ndjson';
-import { CodecError } from '../src/errors';
+import type { CodecError } from '../src/errors';
 import type { Frame } from '../src/schemas/frames';
+import { refusalOf } from './support/refusal';
 
 const encoder = new TextEncoder();
 const PING: Frame = { type: 'ping' };
-
-/** Runs `body` and returns the CodecError it threw, failing on anything else. */
-function refusalOf(body: () => void): CodecError {
-  try {
-    body();
-  } catch (error) {
-    if (error instanceof CodecError) return error;
-    throw error;
-  }
-  throw new Error('expected a CodecError; the call returned normally');
-}
 
 function bulkFrame(bytes: number): Frame {
   return { type: 'req', id: 'bulk', method: 'test.bulk', params: { blob: 'x'.repeat(bytes) } };

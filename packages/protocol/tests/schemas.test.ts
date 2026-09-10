@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'bun:test';
-import { CodecError } from '../src/errors';
 import { assertCatalog, type Catalog, isCatalog } from '../src/schemas/catalog';
 import {
   isReservedMethodName,
@@ -8,17 +7,7 @@ import {
   RPC_RESERVED_PREFIX,
 } from '../src/schemas/common';
 import { assertFrame, type Frame, isFrame } from '../src/schemas/frames';
-
-/** Runs `body` and returns the CodecError it threw, failing on anything else. */
-function refusalOf(body: () => void): CodecError {
-  try {
-    body();
-  } catch (error) {
-    if (error instanceof CodecError) return error;
-    throw error;
-  }
-  throw new Error('expected a CodecError; the call returned normally');
-}
+import { refusalOf } from './support/refusal';
 
 describe('isValidMethodName', () => {
   it('accepts the grammar of §6.1', () => {
@@ -181,6 +170,16 @@ describe('catalog documents', () => {
     expect(isCatalog({ name: 'x', version: '1', methods: [{ name: 'a.b', params: {} }] })).toBe(
       false
     );
+  });
+
+  it('still validates the protocol member it carries a description on', () => {
+    expect(
+      isCatalog({ name: 'x', version: '1', methods: [], protocol: { major: 1, minor: 0 } })
+    ).toBe(true);
+    expect(
+      isCatalog({ name: 'x', version: '1', methods: [], protocol: { major: 0, minor: 0 } })
+    ).toBe(false);
+    expect(isCatalog({ name: 'x', version: '1', methods: [], protocol: { major: 1 } })).toBe(false);
   });
 
   it('assertCatalog names the failing path', () => {

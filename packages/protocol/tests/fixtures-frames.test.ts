@@ -3,6 +3,7 @@ import frames from '../../../spec/fixtures/1/frames.json';
 import { decodeLine, encodeLine } from '../src/codec/ndjson';
 import { CodecError, type CodecErrorKind } from '../src/errors';
 import { isSubset } from './support/fixtures';
+import { refusalOf } from './support/refusal';
 
 interface FrameCase {
   readonly name: string;
@@ -21,14 +22,8 @@ const KIND_OF_REASON: Readonly<Record<string, CodecErrorKind>> = {
   'too-large': 'too-large',
 };
 
-function refusalOf(line: string): CodecError {
-  try {
-    decodeLine(line);
-  } catch (error) {
-    if (error instanceof CodecError) return error;
-    throw error;
-  }
-  throw new Error(`expected a CodecError; the line decoded: ${line}`);
+function refusalOfLine(line: string): CodecError {
+  return refusalOf(() => decodeLine(line), `the line ${line}`);
 }
 
 describe('frame corpus', () => {
@@ -47,7 +42,7 @@ describe('frame corpus', () => {
 
   for (const item of cases.filter((entry) => entry.verdict === 'reject')) {
     it(`refuses ${item.name}`, () => {
-      const error = refusalOf(item.line);
+      const error = refusalOfLine(item.line);
       const expectedKind = item.reason === undefined ? undefined : KIND_OF_REASON[item.reason];
 
       expect(error.kind).toBe(expectedKind as CodecErrorKind);

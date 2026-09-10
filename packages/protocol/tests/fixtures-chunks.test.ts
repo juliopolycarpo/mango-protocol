@@ -6,9 +6,10 @@ import {
   ChunkReassembler,
   encodeChunks,
 } from '../src/codec/chunk';
-import { CodecError, type CodecErrorKind } from '../src/errors';
+import type { CodecError, CodecErrorKind } from '../src/errors';
 import type { Frame } from '../src/schemas/frames';
 import { fromBase64, isSubset, toBase64 } from './support/fixtures';
+import { refusalOf } from './support/refusal';
 
 interface ChunkCase {
   readonly name: string;
@@ -39,14 +40,8 @@ function reassemble(item: ChunkCase): Frame[] {
   return frames;
 }
 
-function refusalOf(item: ChunkCase): CodecError {
-  try {
-    reassemble(item);
-  } catch (error) {
-    if (error instanceof CodecError) return error;
-    throw error;
-  }
-  throw new Error(`expected a CodecError; ${item.name} reassembled`);
+function refusalOfCase(item: ChunkCase): CodecError {
+  return refusalOf(() => reassemble(item), item.name);
 }
 
 /** True when the reference chunker produced the run: every non-final message is full. */
@@ -88,7 +83,7 @@ describe('chunk corpus', () => {
 
   for (const item of cases.filter((entry) => entry.verdict === 'reject')) {
     it(`refuses ${item.name}`, () => {
-      expect(refusalOf(item).kind).toBe(item.reason as CodecErrorKind);
+      expect(refusalOfCase(item).kind).toBe(item.reason as CodecErrorKind);
     });
   }
 
