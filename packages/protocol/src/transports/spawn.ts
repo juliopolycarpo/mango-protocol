@@ -183,6 +183,10 @@ export function spawnPort(options: SpawnOptions, spawnChild: SpawnChild = spawn)
     termination ??= escalate(child, handle, exit.promise, options);
     return termination;
   };
+  // The launcher owns the child's lifetime whichever side ended the port: a
+  // refused line or a stdout the child closed ends the session, and a child
+  // that then ignores the end of its stdin must still be escalated.
+  handle.port.onClosed(() => void terminate());
 
   return {
     port: launcherPort(handle, terminate),

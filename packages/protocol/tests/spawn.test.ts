@@ -3,6 +3,7 @@ import type { ChildProcess, SpawnOptions as ChildSpawnOptions } from 'node:child
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
+import { CLOSE_CODES } from '../src/close';
 import type { PortClosure } from '../src/port';
 import { Session } from '../src/session';
 import { CONFORMANCE_A } from '../src/testing/conformance';
@@ -184,6 +185,29 @@ describe('spawn launcher', () => {
 
     // The signal name is platform-specific; that the child is gone is not.
     expect(status.code === null || status.code !== 0).toBe(true);
+  });
+
+  it('terminates the child when the port closes on its own', async () => {
+    // A line that is not a frame makes the port refuse and close by itself;
+    // this child then ignores the end of its stdin, as a wedged peer would.
+    const peer = spawnPort({
+      argv: [
+        BUN,
+        '-e',
+        'process.stdout.write("not a frame\\n"); process.on("SIGTERM", () => undefined); setInterval(() => undefined, 1000)',
+      ],
+      terminateGraceMs: 100,
+      killGraceMs: 250,
+    });
+    const closure = await new Promise<PortClosure>((resolve) => peer.port.onClosed(resolve));
+    expect(closure.code).toBe(CLOSE_CODES.PROTOCOL_ERROR);
+
+    const outcome = await Promise.race([
+      peer.exited.then((status) => ({ exited: true, status })),
+      Bun.sleep(2_000).then(() => ({ exited: false, after: '2000 ms' })),
+    ]);
+
+    expect(outcome).toMatchObject({ exited: true });
   });
 
   it('resolves exited once, however often terminate is called', async () => {

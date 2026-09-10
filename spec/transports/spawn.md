@@ -28,6 +28,10 @@ classifier; the launcher exposes the observations and does not guess.
 
 ## Termination
 
+The sequence starts when the launcher closes the port and equally when the port closes on its
+own (a refused line, a child that ended its stdout): the launcher owns the child's lifetime
+either way.
+
 1. Close the child's stdin. A conforming peer treats end of file as the session ending and
    exits on its own.
 2. After a grace period (2 seconds reference), send `SIGTERM`.
