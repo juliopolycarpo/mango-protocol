@@ -37,6 +37,21 @@ class FakeWebSocketSink implements WebSocketSink {
   }
 }
 
+/** A socket whose `close` calls the close handler back synchronously, as Bun's does. */
+class ReentrantCloseSink implements WebSocketSink {
+  handle: WebSocketPortHandle | undefined;
+  readonly closes: number[] = [];
+
+  send(): SendOutcome {
+    return 'sent';
+  }
+
+  close(code: number, reason?: string): void {
+    this.closes.push(code);
+    this.handle?.onClose(code, reason);
+  }
+}
+
 /** A WHATWG socket whose events a test fires by hand. */
 class FakeWhatwgWebSocket implements WhatwgWebSocketLike {
   binaryType = 'nodebuffer';
@@ -328,6 +343,35 @@ describe('createWebSocketPort', () => {
     handle.onMessage('a text frame nobody should see');
 
     expect(closures).toEqual([{ kind: 'closed', code: 4000, reason: 'released' }]);
+  });
+
+  it('keeps the refusal when the socket reports its own close synchronously', () => {
+    const sink = new ReentrantCloseSink();
+    const handle = createWebSocketPort(sink);
+    sink.handle = handle;
+    const closures: PortClosure[] = [];
+    handle.port.onClosed((closure) => closures.push(closure));
+
+    handle.onMessage('{"type":"ping"}');
+
+    expect(sink.closes).toEqual([4400]);
+    expect(closures).toHaveLength(1);
+    expect(closures[0]).toMatchObject({ kind: 'protocol-error', code: 4400 });
+  });
+
+  it('holds frames that arrive before anyone subscribed and delivers them in order', async () => {
+    const sender = harness();
+    sender.handle.port.send({ type: 'ping' });
+    sender.handle.port.send({ type: 'pong' });
+
+    const receiver = harness();
+    for (const message of sender.sink.sent) receiver.handle.onMessage(message);
+    const frames: Frame[] = [];
+    receiver.handle.port.onFrame((frame) => frames.push(frame));
+
+    expect(frames).toEqual([]);
+    await Promise.resolve();
+    expect(frames).toEqual([{ type: 'ping' }, { type: 'pong' }]);
   });
 
   it('exposes the frame limit it decodes under', () => {

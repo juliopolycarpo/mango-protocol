@@ -127,6 +127,13 @@ class WebSocketPort implements Port {
   /** Chunks accepted from `send` that the socket has not taken yet, in order. */
   #queue: Uint8Array[] = [];
   #queuedBytes = 0;
+  /**
+   * Frames decoded before anyone subscribed. The socket is listening from the
+   * moment it exists, and the peer sends its `hello` as soon as the upgrade
+   * completes, so a frame can be ready before the session is constructed.
+   */
+  #arrivals: Frame[] = [];
+  #flushScheduled = false;
   #paused = false;
   #open = true;
   #ownerClosed = false;
@@ -156,7 +163,9 @@ class WebSocketPort implements Port {
   }
 
   onFrame(listener: (frame: Frame) => void): () => void {
-    return this.#frames.add(listener);
+    const detach = this.#frames.add(listener);
+    this.#scheduleArrivals();
+    return detach;
   }
 
   onClosed(listener: (closure: PortClosure) => void): () => void {
@@ -194,7 +203,7 @@ class WebSocketPort implements Port {
       this.#failReceive(asCodecError(error));
       return;
     }
-    if (frame !== null) this.#frames.emit(frame);
+    if (frame !== null) this.#deliver(frame);
   }
 
   /** Backpressure cleared: the queue may move again. */
@@ -222,6 +231,33 @@ class WebSocketPort implements Port {
   receiveError(error: Error): void {
     this.#shutdown();
     this.#report({ kind: 'closed', reason: error.message });
+  }
+
+  /**
+   * Emits one frame, or holds it until someone subscribes. Once a frame is
+   * waiting every later one queues behind it, so order survives the wait.
+   */
+  #deliver(frame: Frame): void {
+    if (this.#frames.size > 0 && this.#arrivals.length === 0) {
+      this.#frames.emit(frame);
+      return;
+    }
+    this.#arrivals.push(frame);
+    this.#scheduleArrivals();
+  }
+
+  /** Drains on a microtask, never inside `onFrame`: a subscriber may still be constructing. */
+  #scheduleArrivals(): void {
+    if (this.#flushScheduled || this.#frames.size === 0 || this.#arrivals.length === 0) return;
+    this.#flushScheduled = true;
+    queueMicrotask(() => {
+      this.#flushScheduled = false;
+      while (this.#frames.size > 0) {
+        const frame = this.#arrivals.shift();
+        if (frame === undefined) return;
+        this.#frames.emit(frame);
+      }
+    });
   }
 
   /** Appends one frame's chunks and pushes as many as the socket will take. */
@@ -273,19 +309,24 @@ class WebSocketPort implements Port {
     }
   }
 
-  /** A send the stream cannot recover from: close with `4400` and say so (§ Backpressure). */
+  /**
+   * A send the stream cannot recover from: close with `4400` and say so
+   * (§ Backpressure). The closure is reported before the socket is closed,
+   * because a socket whose `close` calls its own close handler synchronously
+   * would otherwise claim the one closure with a plain `closed`.
+   */
   #failSend(reason: string): void {
     this.#shutdown(CLOSE_CODES.PROTOCOL_ERROR);
-    this.#sink.close(CLOSE_CODES.PROTOCOL_ERROR, clampCloseReason(reason));
     this.#report({ kind: 'closed', code: CLOSE_CODES.PROTOCOL_ERROR, reason });
+    this.#sink.close(CLOSE_CODES.PROTOCOL_ERROR, clampCloseReason(reason));
   }
 
   /** A record the decoder refused: close with the code the refusal calls for (§10). */
   #failReceive(error: CodecError): void {
     const code = closeCodeForCodecError(error);
     this.#shutdown(code);
-    this.#sink.close(code, clampCloseReason(error.message));
     this.#report({ kind: 'protocol-error', error, code });
+    this.#sink.close(code, clampCloseReason(error.message));
   }
 
   #shutdown(code?: number): void {
@@ -294,6 +335,7 @@ class WebSocketPort implements Port {
     this.#paused = false;
     this.#queue = [];
     this.#queuedBytes = 0;
+    this.#arrivals = [];
     this.#closeCode = code;
     this.#reassembler.reset();
     this.#frames.clear();
