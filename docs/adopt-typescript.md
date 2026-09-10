@@ -69,7 +69,7 @@ WSL and container wrappers are argv arrays the application builds.
 ```ts
 import { connectIpc, listenIpc, ipcPath } from '@mangostudio/protocol/ipc';
 const path = ipcPath('mango-hub'); // \\.\pipe\mango-hub or $XDG_RUNTIME_DIR/mango-hub.sock
-const server = listenIpc(path, (port) => new Session(port, { peer, handlers }));
+const server = await listenIpc(path, (port) => new Session(port, { peer, handlers }));
 const client = new Session(await connectIpc(path), { peer });
 ```
 
