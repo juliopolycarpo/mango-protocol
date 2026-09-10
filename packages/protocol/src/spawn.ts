@@ -11,3 +11,4 @@ export {
   sanitizedEnv,
   spawnPort,
 } from './transports/spawn';
+export { classifySshExit, type SshArgvOptions, sshArgv } from './transports/ssh';
