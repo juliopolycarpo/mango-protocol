@@ -6,6 +6,7 @@
  */
 
 export * from './close';
+export * from './codec';
 export * from './errors';
 export * from './schemas';
 export * from './version';
