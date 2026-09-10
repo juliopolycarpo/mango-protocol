@@ -65,7 +65,9 @@ cd ../../crates/mango-protocol && cargo login && cargo publish
 ```
 
 After that, configure trusted publishing in both registries and let the workflow handle
-every later tag. No long-lived token is stored anywhere.
+every later tag. No long-lived token is stored anywhere. The tag for that first version can
+still be pushed: each publish job checks its registry before asking for a token, skips a
+version that is already there, and the GitHub release is created as usual.
 
 ## Schema files
 
@@ -79,5 +81,5 @@ document at runtime.
 
 The jobs run in order: verify, npm, crates.io, GitHub release. A failure in the npm job leaves
 nothing published. A failure in the crates.io job leaves the npm version published; fix the
-cause and re-run the workflow from the failed job (the npm job is skipped when the version is
-already on the registry). Never delete a tag that published anything; cut the next patch.
+cause and re-run the workflow from the failed job (each publish job skips a version that is
+already on its registry). Never delete a tag that published anything; cut the next patch.
