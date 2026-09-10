@@ -9,17 +9,30 @@
 import { cp, mkdir, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 
-/** Every subpath the package exports; an entry whose source is missing is skipped with a warning. */
+/**
+ * Every subpath the package exports. A missing source fails the build, so a
+ * release can never ship an exports map that points at nothing; pass
+ * `--allow-missing` while a transport is still being written locally.
+ */
 const ENTRIES = ['index', 'stdio', 'ipc', 'in-process', 'ws', 'spawn', 'testing'] as const;
 // A native path, not a URL pathname, so Windows does not see a leading slash.
 const ROOT = fileURLToPath(new URL('.', import.meta.url));
+const allowMissing = process.argv.includes('--allow-missing');
 
 const entrypoints: string[] = [];
+const missing: string[] = [];
 for (const entry of ENTRIES) {
   const path = `${ROOT}src/${entry}.ts`;
   if (await Bun.file(path).exists()) entrypoints.push(path);
-  else console.warn(`entry ${entry} has no source yet; skipping`);
+  else missing.push(entry);
 }
+if (missing.length > 0 && !allowMissing) {
+  console.error(
+    `entries without a source: ${missing.join(', ')}; expected every exported entry under src/, or pass --allow-missing`
+  );
+  process.exit(1);
+}
+for (const entry of missing) console.warn(`entry ${entry} has no source yet; skipping`);
 
 await rm(`${ROOT}dist`, { recursive: true, force: true });
 await rm(`${ROOT}schema`, { recursive: true, force: true });
