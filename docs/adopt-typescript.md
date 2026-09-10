@@ -78,21 +78,34 @@ frames. Authentication is a bearer token on the upgrade request, checked by the 
 before the port exists.
 
 ```ts
-import { connectWebSocket, webSocketPort, createWebSocketPort, WEBSOCKET_SUBPROTOCOL } from '@mangostudio/protocol/ws';
+import {
+  connectWebSocket,
+  createWebSocketPort,
+  outcomeOfBunSend,
+  WEBSOCKET_SUBPROTOCOL,
+  webSocketPort,
+} from '@mangostudio/protocol/ws';
 
 // client
 const port = await connectWebSocket('wss://hub.example/runtime', { headers: { authorization: `Bearer ${token}` } });
 
 // server, any framework: give the SDK a sink and feed it messages
-const { port, onMessage, onClose } = createWebSocketPort({
-  send: (bytes) => ws.send(bytes),
+const { port, onMessage, onDrain, onClose } = createWebSocketPort({
+  send: (bytes) => outcomeOfBunSend(ws.send(bytes)),
   close: (code, reason) => ws.close(code, reason),
 });
-// then call onMessage(bytes) for every binary message and onClose(code, reason) when the socket closes
+// then call onMessage(bytes) for every binary message, onDrain() when backpressure
+// clears, and onClose(code, reason) when the socket closes
 
 // a WHATWG WebSocket object on either side
 const port = webSocketPort(socket);
 ```
+
+The sink reports each send as sent, buffered or dropped, so the port can pause its queue under
+backpressure and close with `4400` when the socket drops a chunk; `outcomeOfBunSend` maps the
+number Bun's `ServerWebSocket.send` returns onto that vocabulary. Only runtimes whose
+`WebSocket` takes an options object can set upgrade headers: in a browser, or on Node's global
+`WebSocket`, `connectWebSocket` ignores `headers` and the token goes in the URL or a cookie.
 
 **In-process.** Two ports joined by a queue, for tests and for hosting a runtime in the same
 process:
