@@ -62,16 +62,6 @@ impl<'de> Deserialize<'de> for End {
     }
 }
 
-/// The schema of an `end` member: `{"type": "boolean", "const": true}`.
-///
-/// Used through `#[schemars(schema_with = …)]` on [`Event::end`] because
-/// schemars folds a `const` into an `enum` when it adds the `null` alternative
-/// of an `Option`, and the specification states the constant.
-#[cfg(feature = "schema")]
-fn end_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    schemars::json_schema!({ "type": "boolean", "const": true })
-}
-
 #[cfg(feature = "schema")]
 impl schemars::JsonSchema for End {
     fn inline_schema() -> bool {
@@ -86,8 +76,8 @@ impl schemars::JsonSchema for End {
         concat!(module_path!(), "::End").into()
     }
 
-    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        schemars::json_schema!({ "type": "boolean", "const": true })
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        crate::schema::constraints::end(generator)
     }
 }
 
@@ -97,10 +87,22 @@ impl schemars::JsonSchema for End {
 #[cfg_attr(feature = "schema", schemars(rename = "peer"))]
 pub struct PeerInfo {
     /// Implementation name: a product or binary name, 1 to 128 characters.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::peer_label")
+    )]
     pub name: String,
     /// The implementation's release string, opaque to the protocol, 1 to 128 characters.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::peer_label")
+    )]
     pub version: String,
     /// Lowercase label matching `^[a-z][a-z0-9-]*$`, at most 64 characters.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::role")
+    )]
     pub role: String,
 }
 
@@ -116,6 +118,10 @@ pub struct Limits {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present::option"
     )]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::max_frame_bytes")
+    )]
     pub max_frame_bytes: Option<u64>,
 }
 
@@ -129,6 +135,10 @@ pub struct Hello {
     /// Who the sender is.
     pub peer: PeerInfo,
     /// Owned by the application contract; `{}` is valid but the member is required.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::open_object")
+    )]
     pub capabilities: Map<String, Value>,
     /// Optional lower ceilings for this connection.
     #[serde(
@@ -145,8 +155,16 @@ pub struct Hello {
 #[cfg_attr(feature = "schema", schemars(rename = "req"))]
 pub struct Request {
     /// 1 to 256 characters, unique among the requester's in-flight requests.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::id")
+    )]
     pub id: String,
     /// Dot-separated lowercase name; see [`crate::validate::is_valid_method_name`].
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::method_name")
+    )]
     pub method: String,
     /// Any JSON value, including `null`. Contracts should require an object.
     pub params: Value,
@@ -158,6 +176,10 @@ pub struct Request {
 #[cfg_attr(feature = "schema", schemars(rename = "res"))]
 pub struct Response {
     /// The `id` of the request being answered.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::id")
+    )]
     pub id: String,
     /// Any JSON value, including `null`.
     pub result: Value,
@@ -169,14 +191,26 @@ pub struct Response {
 #[cfg_attr(feature = "schema", schemars(rename = "errorPayload"))]
 pub struct ErrorPayload {
     /// Matches `^[A-Z][A-Z0-9_]*$`, 1 to 64 characters. Unknown codes are preserved.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::error_code")
+    )]
     pub code: String,
     /// A non-empty sentence naming the received value and the expected shape.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::error_message")
+    )]
     pub message: String,
     /// Optional open object for typed detail.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present::option"
+    )]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::open_object")
     )]
     pub details: Option<Map<String, Value>>,
 }
@@ -187,6 +221,10 @@ pub struct ErrorPayload {
 #[cfg_attr(feature = "schema", schemars(rename = "err"))]
 pub struct ErrorResponse {
     /// The `id` of the request being answered.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::id")
+    )]
     pub id: String,
     /// Why the request failed.
     pub error: ErrorPayload,
@@ -198,8 +236,16 @@ pub struct ErrorResponse {
 #[cfg_attr(feature = "schema", schemars(rename = "evt"))]
 pub struct Event {
     /// Same grammar as a method name; `rpc.` is reserved.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::method_name")
+    )]
     pub topic: String,
     /// Non-negative counter, `0` for the first event on a stream key, `+1` per event.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::non_negative")
+    )]
     pub seq: u64,
     /// The stream key when present; the topic is the key otherwise.
     #[serde(
@@ -207,6 +253,10 @@ pub struct Event {
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present::option"
+    )]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::id")
     )]
     pub stream_id: Option<String>,
     /// Any JSON value, including `null`.
@@ -217,7 +267,10 @@ pub struct Event {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present::option"
     )]
-    #[cfg_attr(feature = "schema", schemars(schema_with = "end_schema"))]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::end")
+    )]
     pub end: Option<End>,
 }
 
@@ -227,6 +280,10 @@ pub struct Event {
 #[cfg_attr(feature = "schema", schemars(rename = "cancel"))]
 pub struct Cancel {
     /// The `id` of the request to stop.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::id")
+    )]
     pub id: String,
 }
 
@@ -236,12 +293,20 @@ pub struct Cancel {
 #[cfg_attr(feature = "schema", schemars(rename = "close"))]
 pub struct Close {
     /// An integer in `4000..=4999`; see [`crate::close::close_codes`].
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::close_code")
+    )]
     pub code: u16,
     /// At most 1024 characters.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present::option"
+    )]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::close_reason")
     )]
     pub reason: Option<String>,
 }

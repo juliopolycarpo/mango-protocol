@@ -11,8 +11,17 @@ use crate::frame::{Close, ErrorPayload, Event, Frame, Hello, Limits, Request, Re
 
 /// Longest `id` and `streamId`, in characters.
 pub const MAX_ID_CHARS: usize = 256;
+/// Shortest `method` and `topic`: two one-character segments and their dot.
+pub const MIN_NAME_CHARS: usize = 3;
 /// Longest `method`, `topic`, `peer.name` and `peer.version`, in characters.
 pub const MAX_NAME_CHARS: usize = 128;
+/// The `method` and `topic` grammar of §6.1, as the schema spells it.
+///
+/// [`is_valid_method_name`] applies it by hand; this crate takes no regex
+/// dependency, so the pattern exists to state the rule in an error message and
+/// in the JSON Schema emission.
+pub const METHOD_NAME_PATTERN: &str =
+    r"^[a-z](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z](?:[a-z0-9-]*[a-z0-9])?)+$";
 /// Longest `error.code` and `peer.role`, in characters.
 pub const MAX_CODE_CHARS: usize = 64;
 /// Longest `close.reason`, in characters.
@@ -205,8 +214,7 @@ fn check_method_name(field: &str, value: &str) -> Result<(), ValidationError> {
         describe(value),
         format!(
             "at least two dot-separated lowercase segments matching \
-             ^[a-z](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z](?:[a-z0-9-]*[a-z0-9])?)+$, \
-             at most {MAX_NAME_CHARS} characters"
+             {METHOD_NAME_PATTERN}, at most {MAX_NAME_CHARS} characters"
         ),
     ))
 }

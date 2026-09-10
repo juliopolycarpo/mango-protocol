@@ -19,8 +19,16 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(feature = "schema", schemars(rename = "protocolVersion"))]
 pub struct ProtocolVersion {
     /// Wire major. Peers on different majors refuse each other with close code `4426`.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::major")
+    )]
     pub major: u32,
     /// Wire minor. Additive only; the session runs at the lower of the two.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::non_negative")
+    )]
     pub minor: u32,
 }
 

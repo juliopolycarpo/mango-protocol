@@ -6,9 +6,119 @@
 //! needed to speak the protocol.
 
 use schemars::generate::SchemaSettings;
+use schemars::{Schema, SchemaGenerator, json_schema};
 use serde_json::{Map, Value, json};
 
+use crate::close::{MAX_CLOSE_CODE, MIN_CLOSE_CODE};
 use crate::frame::{Cancel, Close, ErrorResponse, Event, Hello, Request, Response};
+use crate::validate::{
+    MAX_ANNOUNCED_FRAME_BYTES, MAX_CODE_CHARS, MAX_ID_CHARS, MAX_NAME_CHARS, MAX_REASON_CHARS,
+    METHOD_NAME_PATTERN, MIN_ANNOUNCED_FRAME_BYTES, MIN_NAME_CHARS,
+};
+
+/// The subschemas the specification states with `pattern`, `minLength`,
+/// `maxLength`, `minimum` and `maximum`.
+///
+/// schemars derives a field's schema from its Rust type, which knows nothing of
+/// those bounds — `id` would be a bare string and `close.code` a `u16` bounded
+/// by `65535` rather than by `4999`. Each function here is attached to its
+/// field with `#[schemars(schema_with = …)]` so the emission carries the same
+/// constraints [`crate::validate`] enforces, from the same constants.
+pub(crate) mod constraints {
+    use super::{
+        MAX_ANNOUNCED_FRAME_BYTES, MAX_CLOSE_CODE, MAX_CODE_CHARS, MAX_ID_CHARS, MAX_NAME_CHARS,
+        MAX_REASON_CHARS, METHOD_NAME_PATTERN, MIN_ANNOUNCED_FRAME_BYTES, MIN_CLOSE_CODE,
+        MIN_NAME_CHARS, Schema, SchemaGenerator, json_schema,
+    };
+
+    /// `req.id`, `res.id`, `err.id`, `cancel.id` and `evt.streamId`.
+    pub(crate) fn id(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({ "type": "string", "minLength": 1, "maxLength": MAX_ID_CHARS })
+    }
+
+    /// `req.method` and `evt.topic`.
+    pub(crate) fn method_name(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "string",
+            "minLength": MIN_NAME_CHARS,
+            "maxLength": MAX_NAME_CHARS,
+            "pattern": METHOD_NAME_PATTERN,
+        })
+    }
+
+    /// `hello.peer.name` and `hello.peer.version`.
+    pub(crate) fn peer_label(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({ "type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS })
+    }
+
+    /// `hello.peer.role`.
+    pub(crate) fn role(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": MAX_CODE_CHARS,
+            "pattern": "^[a-z][a-z0-9-]*$",
+        })
+    }
+
+    /// `err.error.code`.
+    pub(crate) fn error_code(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": MAX_CODE_CHARS,
+            "pattern": "^[A-Z][A-Z0-9_]*$",
+        })
+    }
+
+    /// `err.error.message`.
+    pub(crate) fn error_message(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({ "type": "string", "minLength": 1 })
+    }
+
+    /// `hello.capabilities` and `err.error.details`: open objects.
+    pub(crate) fn open_object(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({ "type": "object" })
+    }
+
+    /// `hello.protocol.major`.
+    pub(crate) fn major(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({ "type": "integer", "minimum": 1 })
+    }
+
+    /// `hello.protocol.minor` and `evt.seq`.
+    pub(crate) fn non_negative(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({ "type": "integer", "minimum": 0 })
+    }
+
+    /// `hello.limits.maxFrameBytes`.
+    pub(crate) fn max_frame_bytes(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "integer",
+            "minimum": MIN_ANNOUNCED_FRAME_BYTES,
+            "maximum": MAX_ANNOUNCED_FRAME_BYTES,
+        })
+    }
+
+    /// `close.code`.
+    pub(crate) fn close_code(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "integer",
+            "minimum": MIN_CLOSE_CODE,
+            "maximum": MAX_CLOSE_CODE,
+        })
+    }
+
+    /// `close.reason`.
+    pub(crate) fn close_reason(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({ "type": "string", "maxLength": MAX_REASON_CHARS })
+    }
+
+    /// `evt.end`: the literal `true`.
+    pub(crate) fn end(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({ "type": "boolean", "const": true })
+    }
+}
 
 /// Frame `$defs` keys that carry a payload, in the order `protocol.json` lists them.
 const TAGGED_FRAMES: [&str; 7] = ["hello", "req", "res", "err", "evt", "cancel", "close"];
@@ -99,10 +209,114 @@ pub fn emit_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::{FRAME_ORDER, emit_schema};
-    use serde_json::Value;
+    use serde_json::{Map, Value, json};
+
+    /// `spec/schema/1/protocol.json`, the normative document this emission mirrors.
+    const SPEC: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../spec/schema/1/protocol.json"
+    ));
+
+    /// Keys a dialect adds that say nothing about the shape of a frame.
+    const NOISE: [&str; 5] = ["description", "title", "format", "$comment", "$schema"];
 
     fn definitions() -> Value {
         emit_schema()["$defs"].clone()
+    }
+
+    /// The normaliser the repository's schema-equality check applies: inline
+    /// every `$ref`, drop prose and `format`, drop `additionalProperties: true`,
+    /// and strip the `null` alternative schemars adds to an `Option`.
+    fn normalise(value: &Value, definitions: &Map<String, Value>) -> Value {
+        match value {
+            Value::Array(items) => Value::Array(
+                items
+                    .iter()
+                    .map(|item| normalise(item, definitions))
+                    .collect(),
+            ),
+            Value::Object(members) => {
+                if let Some(Value::String(reference)) = members.get("$ref") {
+                    let key = reference
+                        .strip_prefix("#/$defs/")
+                        .unwrap_or_else(|| panic!("received {reference}, expected a local $ref"));
+                    let target = definitions
+                        .get(key)
+                        .unwrap_or_else(|| panic!("received $ref to {key}, which is not defined"));
+                    return normalise(target, definitions);
+                }
+                let mut kept = Map::new();
+                for (key, member) in members {
+                    if NOISE.contains(&key.as_str()) {
+                        continue;
+                    }
+                    if key == "additionalProperties" && member == &Value::Bool(true) {
+                        continue;
+                    }
+                    kept.insert(key.clone(), normalise(member, definitions));
+                }
+                strip_null_alternative(kept)
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// `{"anyOf": [X, {"type": "null"}]}` is how schemars spells an absent member.
+    fn strip_null_alternative(object: Map<String, Value>) -> Value {
+        let Some(Value::Array(branches)) = object.get("anyOf") else {
+            return Value::Object(object);
+        };
+        if object.len() != 1 || branches.len() != 2 {
+            return Value::Object(object);
+        }
+        let null = json!({ "type": "null" });
+        if branches[1] == null {
+            return branches[0].clone();
+        }
+        if branches[0] == null {
+            return branches[1].clone();
+        }
+        Value::Object(object)
+    }
+
+    /// Resolves a document's `frame` definition into one self-contained schema.
+    fn flattened_frame(document: &Value) -> Value {
+        let definitions = document["$defs"].as_object().expect("a $defs object");
+        normalise(&definitions["frame"], definitions)
+    }
+
+    #[test]
+    fn the_emission_equals_the_specification_after_normalisation() {
+        let spec: Value = serde_json::from_str(SPEC).expect("the spec file is JSON");
+        let emitted = flattened_frame(&emit_schema());
+        let expected = flattened_frame(&spec);
+        assert_eq!(
+            emitted, expected,
+            "the emission drifted from spec/schema/1/protocol.json"
+        );
+    }
+
+    #[test]
+    fn the_normaliser_only_removes_what_it_claims_to() {
+        let definitions = Map::new();
+        let kept = normalise(
+            &json!({ "type": "string", "additionalProperties": false, "minLength": 1 }),
+            &definitions,
+        );
+        assert_eq!(
+            kept,
+            json!({ "type": "string", "additionalProperties": false, "minLength": 1 })
+        );
+        let stripped = normalise(
+            &json!({ "anyOf": [{ "type": "string" }, { "type": "null" }] }),
+            &definitions,
+        );
+        assert_eq!(stripped, json!({ "type": "string" }));
+        let two_real_branches = json!({ "anyOf": [{ "type": "string" }, { "type": "integer" }] });
+        assert_eq!(
+            normalise(&two_real_branches, &definitions),
+            two_real_branches
+        );
     }
 
     #[test]
