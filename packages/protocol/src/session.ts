@@ -604,7 +604,9 @@ export class Session {
     this.#livenessTimer = undefined;
     this.#readyDeferred.reject(
       new RemoteError(
-        RESERVED_ERROR_CODES.UNAVAILABLE,
+        closure.code === CLOSE_CODES.PROTOCOL_MISMATCH
+          ? RESERVED_ERROR_CODES.PROTOCOL_MISMATCH
+          : RESERVED_ERROR_CODES.UNAVAILABLE,
         `The session closed before the handshake completed (${closure.code}${closure.reason ? `: ${closure.reason}` : ''}).`,
         { closeCode: closure.code }
       )

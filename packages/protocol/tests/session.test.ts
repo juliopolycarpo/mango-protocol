@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { CLOSE_CODES } from '../src/close';
-import { RESERVED_ERROR_CODES, RemoteError } from '../src/errors';
-import type { Port } from '../src/port';
+import { CodecError, RESERVED_ERROR_CODES, RemoteError } from '../src/errors';
+import type { Port, PortClosure } from '../src/port';
 import type { Frame, HelloFrame } from '../src/schemas/frames';
 import { Session, type SessionOptions } from '../src/session';
 import { createInProcessPortPair } from '../src/transports/in-process';
@@ -15,6 +15,38 @@ const rawHello = (): HelloFrame => ({
   peer: RUNTIME,
   capabilities: {},
 });
+
+/** The fake keeps its listeners for the test's lifetime; nothing to detach. */
+function detachNothing(): void {
+  // Intentionally empty.
+}
+
+/** A port whose closure a test dictates, for paths no in-process pair can reach. */
+class FakePort implements Port {
+  readonly sent: Frame[] = [];
+  #closed?: (closure: PortClosure) => void;
+
+  send(frame: Frame): void {
+    this.sent.push(frame);
+  }
+
+  onFrame(): () => void {
+    return detachNothing;
+  }
+
+  onClosed(listener: (closure: PortClosure) => void): () => void {
+    this.#closed = listener;
+    return detachNothing;
+  }
+
+  close(): void {
+    // Owner-initiated close is not what these tests observe.
+  }
+
+  report(closure: PortClosure): void {
+    this.#closed?.(closure);
+  }
+}
 
 /** Collects every frame a raw port receives so a test can inspect the wire. */
 class FrameRecorder {
@@ -316,5 +348,54 @@ describe('Session events and liveness', () => {
     const late = new Promise((resolve) => hub.onClose(resolve));
     expect(await late).toMatchObject({ code: CLOSE_CODES.RELEASED });
     runtime.close();
+  });
+});
+
+describe('Session port closures', () => {
+  it('rejects ready with PROTOCOL_MISMATCH when the port refuses the peer hello with 4426', async () => {
+    const port = new FakePort();
+    const session = new Session(port, { peer: HUB, livenessIntervalMs: false });
+    const error = new CodecError('schema', 'hello does not match the wire schema', {
+      frameType: 'hello',
+    });
+    port.report({ kind: 'protocol-error', error, code: CLOSE_CODES.PROTOCOL_MISMATCH });
+
+    await expect(session.ready).rejects.toMatchObject({
+      code: RESERVED_ERROR_CODES.PROTOCOL_MISMATCH,
+      details: { closeCode: CLOSE_CODES.PROTOCOL_MISMATCH },
+    });
+    expect(session.closure).toMatchObject({
+      code: CLOSE_CODES.PROTOCOL_MISMATCH,
+      fatal: true,
+      error,
+    });
+    expect(session.state).toBe('closed');
+  });
+
+  it('carries the codec error and rejects ready with UNAVAILABLE on a 4400 refusal', async () => {
+    const port = new FakePort();
+    const session = new Session(port, { peer: HUB, livenessIntervalMs: false });
+    const error = new CodecError('invalid-json', 'line is not JSON');
+    port.report({ kind: 'protocol-error', error, code: CLOSE_CODES.PROTOCOL_ERROR });
+
+    await expect(session.ready).rejects.toMatchObject({
+      code: RESERVED_ERROR_CODES.UNAVAILABLE,
+      details: { closeCode: CLOSE_CODES.PROTOCOL_ERROR },
+    });
+    expect(session.closure).toMatchObject({
+      code: CLOSE_CODES.PROTOCOL_ERROR,
+      reason: 'line is not JSON',
+      fatal: false,
+      error,
+    });
+  });
+
+  it('treats a link that vanished as a 4000 release', async () => {
+    const port = new FakePort();
+    const session = new Session(port, { peer: HUB, livenessIntervalMs: false });
+    port.report({ kind: 'closed' });
+
+    await expect(session.ready).rejects.toMatchObject({ code: RESERVED_ERROR_CODES.UNAVAILABLE });
+    expect(session.closure).toMatchObject({ code: CLOSE_CODES.RELEASED, fatal: false });
   });
 });
