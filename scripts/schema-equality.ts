@@ -3,7 +3,8 @@
  * dialect is normalised and how two normalised schemas are diffed.
  *
  * Normaliser rules, the only tolerated differences between emitters:
- * - `$ref` to `#/$defs/<name>` is inlined (sibling keywords kept);
+ * - `$ref` to `#/$defs/<name>` is inlined (sibling keywords kept), as is a
+ *   cross-file `other.json#/$defs/<name>` when the caller merged that file in;
  * - `$schema`, `$id`, `title`, `description`, `$comment`, `examples` and
  *   `format` are dropped;
  * - `additionalProperties: true` is dropped (objects are open by default);
@@ -70,12 +71,34 @@ export function stripNullAlternative(schema: JsonObject): JsonObject {
   return { ...rest, ...only };
 }
 
+/**
+ * Resolves `#/$defs/<name>` against the local definitions, and a cross-file
+ * reference such as `protocol.json#/$defs/<name>` against a definition keyed
+ * by that full reference (the caller merges the other file's `$defs` in under
+ * such keys).
+ */
 function inlineReference(schema: JsonObject, ref: string, definitions: Definitions): JsonObject {
-  const name = ref.replace(/^#\/\$defs\//, '');
-  const target = definitions[name];
-  if (!isObject(target)) throw new Error(`unresolvable $ref ${ref}; expected a #/$defs entry`);
+  const target = definitions[ref] ?? definitions[ref.replace(/^#\/\$defs\//, '')];
+  if (!isObject(target)) {
+    throw new Error(
+      `unresolvable $ref ${ref}; expected a #/$defs entry or a merged cross-file key`
+    );
+  }
   const { $ref: _ref, ...siblings } = schema;
   return { ...target, ...siblings };
+}
+
+/**
+ * Keys another file's definitions by their cross-file reference, so a
+ * document that says `other.json#/$defs/x` can be normalised.
+ *
+ * @example
+ * crossFileDefinitions('protocol.json', spec.$defs); // { 'protocol.json#/$defs/id': …, … }
+ */
+export function crossFileDefinitions(file: string, definitions: Definitions): Definitions {
+  return Object.fromEntries(
+    Object.entries(definitions).map(([name, schema]) => [`${file}#/$defs/${name}`, schema])
+  );
 }
 
 /**

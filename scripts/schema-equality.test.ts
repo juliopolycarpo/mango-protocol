@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import {
   compareDefinitions,
+  crossFileDefinitions,
   type Definitions,
   differences,
   isConstTaggedUnion,
@@ -80,9 +81,21 @@ describe('normalise', () => {
     });
   });
 
+  it('inlines a cross-file $ref through merged definitions', () => {
+    const merged = {
+      ...crossFileDefinitions('protocol.json', definitions),
+      local: { type: 'number' },
+    };
+    expect(normalise({ $ref: 'protocol.json#/$defs/id' }, merged)).toEqual({
+      minLength: 1,
+      type: 'string',
+    });
+    expect(normalise({ $ref: '#/$defs/local' }, merged)).toEqual({ type: 'number' });
+  });
+
   it('names an unresolvable $ref', () => {
     expect(() => normalise({ $ref: '#/$defs/nope' }, definitions)).toThrow(
-      'unresolvable $ref #/$defs/nope; expected a #/$defs entry'
+      'unresolvable $ref #/$defs/nope; expected a #/$defs entry or a merged cross-file key'
     );
   });
 });

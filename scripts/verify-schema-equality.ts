@@ -17,6 +17,9 @@
 import {
   CancelFrameSchema,
   CapabilitiesSchema,
+  CatalogEventSchema,
+  CatalogMethodSchema,
+  CatalogSchema,
   CloseCodeSchema,
   CloseFrameSchema,
   ErrorCodeSchema,
@@ -36,9 +39,17 @@ import {
   ResultFrameSchema,
   TopicSchema,
 } from '../packages/protocol/src/schemas';
+import catalogSchema from '../spec/schema/1/catalog.json';
 import protocolSchema from '../spec/schema/1/protocol.json';
 import { hasCargo, hasFlag, ROOT_DIR, warnNoCargo } from './lib';
-import { compareDefinitions, type Definitions, type Json } from './schema-equality';
+import {
+  compareDefinitions,
+  crossFileDefinitions,
+  type Definitions,
+  differences,
+  type Json,
+  normalise,
+} from './schema-equality';
 
 /** The TypeScript SDK's schemas, keyed like the spec's `$defs`. */
 const TYPESCRIPT_DEFINITIONS = JSON.parse(
@@ -64,6 +75,11 @@ const TYPESCRIPT_DEFINITIONS = JSON.parse(
     close: CloseFrameSchema,
     frame: FrameSchema,
   })
+) as Definitions;
+
+/** The catalog document's `$defs`, keyed like `catalog.json`; the root is compared separately. */
+const TYPESCRIPT_CATALOG_DEFINITIONS = JSON.parse(
+  JSON.stringify({ method: CatalogMethodSchema, event: CatalogEventSchema })
 ) as Definitions;
 
 /** The `$defs` the Rust emission promises; scalar aliases are inlined there. */
@@ -102,7 +118,27 @@ async function rustDefinitions(): Promise<Definitions> {
 
 const spec = protocolSchema.$defs as Record<string, Json>;
 const failures = compareDefinitions('typescript', TYPESCRIPT_DEFINITIONS, Object.keys(spec), spec);
+failures.push(...compareCatalog());
 const compared = ['typescript'];
+
+/** The catalog document: its `method` and `event` definitions, then the root object itself. */
+function compareCatalog(): string[] {
+  const { $defs, ...root } = catalogSchema as { $defs: Record<string, Json> } & Record<
+    string,
+    Json
+  >;
+  const definitions = { ...$defs, ...crossFileDefinitions('protocol.json', spec) };
+  const catalog = ['method', 'event'];
+  const result = compareDefinitions(
+    'typescript catalog',
+    TYPESCRIPT_CATALOG_DEFINITIONS,
+    catalog,
+    definitions
+  );
+  const emittedRoot = JSON.parse(JSON.stringify(CatalogSchema)) as Json;
+  const diff = differences(normalise(root as Json, definitions), normalise(emittedRoot, {}));
+  return [...result, ...diff.map((line) => `typescript catalog: root${line}`)];
+}
 if (!hasFlag('--ts-only')) {
   if (hasCargo()) {
     failures.push(...compareDefinitions('rust', await rustDefinitions(), RUST_REQUIRED, spec));
@@ -117,4 +153,4 @@ if (failures.length > 0) {
   for (const line of failures) console.error(`  ${line}`);
   process.exit(1);
 }
-console.log(`schema equality: spec == ${compared.join(' == ')}`);
+console.log(`schema equality: protocol.json and catalog.json == ${compared.join(' == ')}`);
