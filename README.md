@@ -39,6 +39,17 @@ bun run fix       # apply formatters
 `AGENTS.md` is the contributor guide, including the contract-change procedure every wire change
 follows.
 
+## Read next
+
+- [`spec/mango-protocol-1.md`](spec/mango-protocol-1.md), the wire, and
+  [`spec/transports/`](spec/transports/) for stdio, local sockets, in-process, WebSocket and spawn
+- [`docs/build-a-contract.md`](docs/build-a-contract.md): describe methods and events once, get a
+  typed client, validated handlers and a catalog
+- [`docs/adopt-typescript.md`](docs/adopt-typescript.md) and
+  [`docs/adopt-rust.md`](docs/adopt-rust.md): from install to a working peer
+- [`docs/conformance.md`](docs/conformance.md): the fixture corpus and the transport suite
+- [`docs/versioning.md`](docs/versioning.md) and [`docs/releasing.md`](docs/releasing.md)
+
 ## License
 
 MIT
