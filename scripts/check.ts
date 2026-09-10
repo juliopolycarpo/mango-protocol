@@ -21,6 +21,7 @@ if (!rsOnly) {
   }
   tasks.push(task('tsc', ['bunx', 'tsc', '--noEmit', '-p', 'packages/protocol/tsconfig.json']));
   tasks.push(task('tsc:scripts', ['bunx', 'tsc', '--noEmit', '-p', 'scripts/tsconfig.json']));
+  tasks.push(task('versions', ['bun', './scripts/check-versions.ts']));
   tasks.push(task('verify-spec', ['bun', './scripts/verify-spec.ts']));
   tasks.push(task('fixtures:chunks', ['bun', './scripts/fixtures/generate-chunks.ts', '--check']));
 }
