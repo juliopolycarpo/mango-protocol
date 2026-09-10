@@ -7,6 +7,8 @@
  * exitWith(results);
  */
 
+import { fileURLToPath } from 'node:url';
+
 export interface TaskResult {
   readonly name: string;
   readonly ok: boolean;
@@ -19,7 +21,8 @@ export interface Task {
   readonly cwd?: string;
 }
 
-export const ROOT_DIR = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
+/** Repository root as a native path (a URL pathname would keep a leading slash on Windows). */
+export const ROOT_DIR = fileURLToPath(new URL('..', import.meta.url)).replace(/[\\/]$/, '');
 
 export function task(name: string, argv: readonly string[], cwd?: string): Task {
   return cwd === undefined ? { name, argv } : { name, argv, cwd };

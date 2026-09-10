@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'bun:test';
+import { join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as protocol from '../src';
 
-const SOURCE_DIR = new URL('../src', import.meta.url).pathname;
+const SOURCE_DIR = fileURLToPath(new URL('../src', import.meta.url));
 
 describe('package entry point', () => {
   it('re-exports the version, schema, codec, close, error, session and contract surface', () => {
@@ -70,8 +72,8 @@ async function reachableModules(entry: string): Promise<string[]> {
 }
 
 async function resolveLocal(from: string, specifier: string): Promise<string> {
-  const base = new URL(specifier, `file://${from}`).pathname;
-  for (const candidate of [base, `${base}.ts`, `${base}/index.ts`]) {
+  const base = fileURLToPath(new URL(specifier, pathToFileURL(from)));
+  for (const candidate of [base, `${base}.ts`, join(base, 'index.ts')]) {
     if (await Bun.file(candidate).exists()) return candidate;
   }
   throw new Error(`cannot resolve ${specifier} from ${from}; expected a .ts module under src`);

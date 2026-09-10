@@ -15,6 +15,9 @@ const HEADER_BYTES = 9;
 const FORMAT_VERSION = 1;
 const MIN_NONFINAL_PAYLOAD = 1024;
 const DEFAULT_MESSAGE_BYTES = 16 * 1024;
+
+import { fileURLToPath } from 'node:url';
+
 const OUTPUT = new URL('../../spec/fixtures/1/chunks.json', import.meta.url);
 
 interface Chunk {
@@ -265,5 +268,5 @@ if (process.argv.includes('--check')) {
   console.log('chunks.json is up to date');
 } else {
   await Bun.write(OUTPUT, text);
-  console.log(`wrote ${OUTPUT.pathname} (${document.cases.length} cases)`);
+  console.log(`wrote ${fileURLToPath(OUTPUT)} (${document.cases.length} cases)`);
 }

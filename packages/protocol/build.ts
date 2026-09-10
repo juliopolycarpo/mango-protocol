@@ -7,10 +7,12 @@
  */
 
 import { cp, mkdir, rm } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 
 /** Every subpath the package exports; an entry whose source is missing is skipped with a warning. */
 const ENTRIES = ['index', 'stdio', 'ipc', 'in-process', 'ws', 'spawn', 'testing'] as const;
-const ROOT = new URL('.', import.meta.url).pathname;
+// A native path, not a URL pathname, so Windows does not see a leading slash.
+const ROOT = fileURLToPath(new URL('.', import.meta.url));
 
 const entrypoints: string[] = [];
 for (const entry of ENTRIES) {
