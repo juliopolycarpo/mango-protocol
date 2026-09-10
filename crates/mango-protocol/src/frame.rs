@@ -321,8 +321,9 @@ pub struct Close {
 /// let frame: Frame = serde_json::from_str(r#"{"type":"ping"}"#).unwrap();
 /// assert_eq!(frame, Frame::Ping);
 /// ```
+// No `JsonSchema` derive here on purpose: `emit_schema` builds the spec-keyed
+// document, and a derived `schema_for!(Frame)` would describe a different shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Frame {
     /// Handshake.
