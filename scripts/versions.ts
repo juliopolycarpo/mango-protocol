@@ -23,6 +23,9 @@ export const MANIFESTS = {
 
 export const SEMVER_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 
+/** The `"version": "…"` line of a package manifest; the field may already hold the target. */
+const VERSION_FIELD = /^(\s*"version":\s*)"[^"]+"/m;
+
 /**
  * Reads the version each manifest under `root` declares.
  *
@@ -102,9 +105,8 @@ export async function writeVersions(version: string, root = ROOT_DIR): Promise<v
   for (const file of [MANIFESTS.rootPackage, MANIFESTS.protocolPackage]) {
     const path = `${root}/${file}`;
     const text = await Bun.file(path).text();
-    const next = text.replace(/^(\s*"version":\s*)"[^"]+"/m, `$1"${version}"`);
-    if (next === text) throw new Error(`${file} has no version field to rewrite.`);
-    await Bun.write(path, next);
+    if (!VERSION_FIELD.test(text)) throw new Error(`${file} has no version field to rewrite.`);
+    await Bun.write(path, text.replace(VERSION_FIELD, `$1"${version}"`));
   }
   const cargoPath = `${root}/${MANIFESTS.cargoWorkspace}`;
   const cargo = await Bun.file(cargoPath).text();

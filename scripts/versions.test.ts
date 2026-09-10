@@ -133,6 +133,12 @@ describe('writeVersions', () => {
     expect(await repo.read(MANIFESTS.cargoWorkspace)).toContain('edition = "2024"');
   });
 
+  it('keeps manifests that already carry the version', async () => {
+    await writeVersions('0.1.0', repo.root);
+    const versions = await readVersions(repo.root);
+    expect(versions.map((entry) => entry.version)).toEqual(['0.1.0', '0.1.0', '0.1.0', '0.1.0']);
+  });
+
   it('refuses a version that is not semver', async () => {
     await expect(writeVersions('v0.2.0', repo.root)).rejects.toThrow(
       'Version "v0.2.0" is not semver; expected MAJOR.MINOR.PATCH with an optional pre-release.'
