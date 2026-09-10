@@ -1,0 +1,91 @@
+{
+  "$comment": "Negotiation cases: effective minor is the lower minor when majors match; otherwise close 4426.",
+  "cases": [
+    {
+      "name": "y_equal",
+      "local": {
+        "major": 1,
+        "minor": 0
+      },
+      "remote": {
+        "major": 1,
+        "minor": 0
+      },
+      "expected": {
+        "effectiveMinor": 0
+      }
+    },
+    {
+      "name": "y_remote_newer",
+      "local": {
+        "major": 1,
+        "minor": 0
+      },
+      "remote": {
+        "major": 1,
+        "minor": 3
+      },
+      "expected": {
+        "effectiveMinor": 0
+      }
+    },
+    {
+      "name": "y_local_newer",
+      "local": {
+        "major": 1,
+        "minor": 5
+      },
+      "remote": {
+        "major": 1,
+        "minor": 2
+      },
+      "expected": {
+        "effectiveMinor": 2
+      }
+    },
+    {
+      "name": "y_both_newer_than_zero",
+      "local": {
+        "major": 1,
+        "minor": 2
+      },
+      "remote": {
+        "major": 1,
+        "minor": 5
+      },
+      "expected": {
+        "effectiveMinor": 2
+      }
+    },
+    {
+      "name": "n_major_higher",
+      "local": {
+        "major": 1,
+        "minor": 0
+      },
+      "remote": {
+        "major": 2,
+        "minor": 0
+      },
+      "expected": {
+        "mismatch": true,
+        "closeCode": 4426
+      }
+    },
+    {
+      "name": "n_major_lower",
+      "local": {
+        "major": 2,
+        "minor": 1
+      },
+      "remote": {
+        "major": 1,
+        "minor": 9
+      },
+      "expected": {
+        "mismatch": true,
+        "closeCode": 4426
+      }
+    }
+  ]
+}

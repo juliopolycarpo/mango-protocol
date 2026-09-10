@@ -1,5 +1,6 @@
 /**
- * `bun run check`: Biome, dprint, TypeScript, rustfmt and Clippy.
+ * `bun run check`: Biome, dprint, TypeScript, the spec verifier, the fixture
+ * generator's staleness check, rustfmt and Clippy.
  *
  * Flags: `--skip-format` (no Biome/dprint), `--staged` (accepted for the
  * lefthook hook; the repo is small enough to always check everything),
@@ -20,6 +21,8 @@ if (!rsOnly) {
   }
   tasks.push(task('tsc', ['bunx', 'tsc', '--noEmit', '-p', 'packages/protocol/tsconfig.json']));
   tasks.push(task('tsc:scripts', ['bunx', 'tsc', '--noEmit', '-p', 'scripts/tsconfig.json']));
+  tasks.push(task('verify-spec', ['bun', './scripts/verify-spec.ts']));
+  tasks.push(task('fixtures:chunks', ['bun', './scripts/fixtures/generate-chunks.ts', '--check']));
 }
 if (!tsOnly) {
   if (hasCargo()) {

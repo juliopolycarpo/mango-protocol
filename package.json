@@ -28,6 +28,7 @@
     "@dprint/markdown": "^0.22.1",
     "@dprint/toml": "^0.7.0",
     "@types/bun": "^1.4.1",
+    "ajv": "^8",
     "dprint": "^0.55.2",
     "git-cliff": "^2.13.1",
     "lefthook": "^2.1.10",
