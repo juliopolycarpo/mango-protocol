@@ -45,7 +45,7 @@ The SDK ships the argv for launching a peer over the system `ssh` client:
 ```text
 ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15
     -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes
-    -o ControlMaster=no -o ControlPath=none
+    -o ControlMaster=no -o ControlPath=none -o RemoteCommand=none
     [-o IdentitiesOnly=yes -i <identityFile>] [-p <port>]
     -T -- <[user@]host> '<remotePath>' <remoteArgs…>
 ```
@@ -58,6 +58,9 @@ Every option is load-bearing:
   the first trust decision belongs to a person at a terminal.
 - `ControlMaster=no`, `ControlPath=none`: multiplexing is unsupported on Windows OpenSSH and
   ambient configuration could otherwise enable it under a long-lived pipe.
+- `RemoteCommand=none`: a `RemoteCommand` in the user's ssh configuration collides with the
+  command placed after the destination (`Cannot execute command-line and remote command.`), so
+  the preset forces it off rather than inherit it.
 - `-T`: no pseudo-terminal, because stdout carries frames a tty would translate.
 - `--` ends option parsing before the destination, and the preset refuses a host or user
   beginning with `-`, so a host spelled `-oProxyCommand=…` cannot become an option.

@@ -67,6 +67,11 @@ export function sshArgv(options: SshArgvOptions): string[] {
     'ControlMaster=no',
     '-o',
     'ControlPath=none',
+    // An ambient `RemoteCommand` in the user's ssh config collides with the
+    // command placed after the destination ("Cannot execute command-line and
+    // remote command."), so it is forced off the same way multiplexing is.
+    '-o',
+    'RemoteCommand=none',
   ];
   if (options.identityFile !== undefined) {
     argv.push('-o', 'IdentitiesOnly=yes', '-i', options.identityFile);

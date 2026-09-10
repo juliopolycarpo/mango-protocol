@@ -18,6 +18,8 @@ const PRESET = [
   'ControlMaster=no',
   '-o',
   'ControlPath=none',
+  '-o',
+  'RemoteCommand=none',
 ];
 
 describe('sshArgv', () => {
@@ -48,6 +50,12 @@ describe('sshArgv', () => {
       "'--name'",
       "'it'\\''s mine'",
     ]);
+  });
+
+  it('forces an ambient RemoteCommand off so the command after the destination runs', () => {
+    const argv = sshArgv({ host: 'build-box', command: ['mango-runtime'] });
+    const options = argv.flatMap((word, index) => (word === '-o' ? [`-o ${argv[index + 1]}`] : []));
+    expect(options).toContain('-o RemoteCommand=none');
   });
 
   it('leaves a leading ~/ outside the quotes so the remote shell expands it', () => {
