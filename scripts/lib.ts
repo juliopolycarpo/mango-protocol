@@ -25,11 +25,27 @@ export function task(name: string, argv: readonly string[], cwd?: string): Task 
   return cwd === undefined ? { name, argv } : { name, argv, cwd };
 }
 
+/**
+ * Resolves the command of an argv so the spawn works on every platform:
+ * `bun` and `bunx` become the running Bun binary (`bunx` is `bun x`), and any
+ * other command is looked up on PATH, which honours PATHEXT on Windows where a
+ * bare name such as `cargo` would not spawn.
+ *
+ * @example
+ * resolveArgv(['bunx', 'biome', 'check']); // [process.execPath, 'x', 'biome', 'check']
+ */
+export function resolveArgv(argv: readonly string[]): string[] {
+  const [command = '', ...rest] = argv;
+  if (command === 'bun') return [process.execPath, ...rest];
+  if (command === 'bunx') return [process.execPath, 'x', ...rest];
+  return [Bun.which(command) ?? command, ...rest];
+}
+
 /** Runs one task to completion, inheriting stdio so output stays readable. */
 export async function runTask(item: Task): Promise<TaskResult> {
   const started = performance.now();
   console.log(`\n▶ ${item.name}: ${item.argv.join(' ')}`);
-  const child = Bun.spawn([...item.argv], {
+  const child = Bun.spawn(resolveArgv(item.argv), {
     cwd: item.cwd ?? ROOT_DIR,
     stdout: 'inherit',
     stderr: 'inherit',

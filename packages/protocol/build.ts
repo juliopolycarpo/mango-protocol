@@ -37,8 +37,17 @@ if (!result.success) {
   process.exit(1);
 }
 
+// `bun x` rather than a bare `bunx`, which Windows cannot spawn by name.
 const declarations = Bun.spawnSync(
-  ['bunx', 'tsc', '-p', `${ROOT}tsconfig.build.json`, '--emitDeclarationOnly', '--declaration'],
+  [
+    process.execPath,
+    'x',
+    'tsc',
+    '-p',
+    `${ROOT}tsconfig.build.json`,
+    '--emitDeclarationOnly',
+    '--declaration',
+  ],
   { stdout: 'inherit', stderr: 'inherit' }
 );
 if (declarations.exitCode !== 0) process.exit(declarations.exitCode);
