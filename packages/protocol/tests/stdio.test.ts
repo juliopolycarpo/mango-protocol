@@ -1,10 +1,20 @@
 import { describe, expect, it } from 'bun:test';
 import { PassThrough } from 'node:stream';
+import { fileURLToPath } from 'node:url';
 import { CLOSE_CODES } from '../src/close';
 import type { PortClosure } from '../src/port';
 import { Session, type SessionOptions } from '../src/session';
-import { type ConformanceFixture, itBehavesLikeAMangoTransport } from '../src/testing/conformance';
+import {
+  CONFORMANCE_A,
+  type ConformanceFixture,
+  itBehavesLikeAMangoTransport,
+} from '../src/testing/conformance';
+import { spawnPort } from '../src/transports/spawn';
 import { stdioPort } from '../src/transports/stdio';
+
+/** A bare `bun` does not spawn on Windows; the resolved binary always does. */
+const BUN = Bun.which('bun') ?? process.execPath;
+const ECHO_CHILD = fileURLToPath(new URL('./fixtures/stdio-echo.ts', import.meta.url));
 
 /**
  * Two stdio ports cross-wired through a pair of pipes: `a` writes what `b`
@@ -115,6 +125,26 @@ describe('stdio transport', () => {
 
     expect(() => port.send({ type: 'ping' })).toThrow(/state "failed".*not writable/);
     expect(closures).toEqual([{ kind: 'closed', reason: expect.stringContaining('not writable') }]);
+  });
+
+  it('serves a real child process over its own standard streams', async () => {
+    // The child builds its port with `stdioPort()` and no arguments, which is
+    // the only way to exercise the `process.stdin`/`process.stdout` defaults.
+    const child = spawnPort({ argv: [BUN, ECHO_CHILD] });
+    try {
+      const session = new Session(child.port, { peer: CONFORMANCE_A, livenessIntervalMs: false });
+      const remote = await session.ready;
+
+      expect(remote.peer).toEqual({ name: 'stdio-echo', version: '0.1.0', role: 'tool' });
+      expect(await session.request('test.echo', { line: 'over a real pipe · 🥭' })).toEqual({
+        line: 'over a real pipe · 🥭',
+      });
+      await expect(
+        session.request('test.refuse', { code: 'NOPE', message: 'no' })
+      ).rejects.toMatchObject({ code: 'NOPE' });
+    } finally {
+      expect(await child.terminate()).toEqual({ code: 0, signal: null });
+    }
   });
 
   it('releases the input when the port closes, so the process can exit', () => {
