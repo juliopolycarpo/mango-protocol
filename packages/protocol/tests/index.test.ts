@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'bun:test';
-import { Glob } from 'bun';
 import * as protocol from '../src';
 
 const SOURCE_DIR = new URL('../src', import.meta.url).pathname;
@@ -34,18 +33,46 @@ describe('package entry point', () => {
     }
   });
 
-  it('keeps the core browser-safe: no module under src imports node:', async () => {
-    const nodeImport = /(?:from|import|require)\s*\(?\s*['"]node:/;
-    const files: string[] = [];
+  it('keeps the core browser-safe: nothing reachable from src/index.ts imports node:', async () => {
+    const reachable = await reachableModules(`${SOURCE_DIR}/index.ts`);
+    const offenders = reachable.filter((path) => nodeImport.test(sources.get(path) ?? ''));
 
+    expect(reachable.length).toBeGreaterThan(5);
+    expect(offenders).toEqual([]);
+  });
+
+  it('still recognises a node: import, so the guard above can fail', () => {
     expect(nodeImport.test("import { Buffer } from 'node:buffer';")).toBe(true);
-
-    for await (const path of new Glob('**/*.ts').scan(SOURCE_DIR)) {
-      const text = await Bun.file(`${SOURCE_DIR}/${path}`).text();
-      expect({ path, importsNode: nodeImport.test(text) }).toEqual({ path, importsNode: false });
-      files.push(path);
-    }
-
-    expect(files.length).toBeGreaterThan(5);
+    expect(nodeImport.test("import('node:fs')")).toBe(true);
   });
 });
+
+const nodeImport = /(?:from|import|require)\s*\(?\s*['"]node:/;
+const sources = new Map<string, string>();
+const transpiler = new Bun.Transpiler({ loader: 'ts' });
+
+/** Every module under src reachable from `entry` through static imports. */
+async function reachableModules(entry: string): Promise<string[]> {
+  const seen = new Set<string>();
+  const queue = [entry];
+  while (queue.length > 0) {
+    const path = queue.shift();
+    if (path === undefined || seen.has(path)) continue;
+    seen.add(path);
+    const text = await Bun.file(path).text();
+    sources.set(path, text);
+    for (const { path: specifier } of transpiler.scanImports(text)) {
+      if (!specifier.startsWith('.')) continue;
+      queue.push(await resolveLocal(path, specifier));
+    }
+  }
+  return [...seen];
+}
+
+async function resolveLocal(from: string, specifier: string): Promise<string> {
+  const base = new URL(specifier, `file://${from}`).pathname;
+  for (const candidate of [base, `${base}.ts`, `${base}/index.ts`]) {
+    if (await Bun.file(candidate).exists()) return candidate;
+  }
+  throw new Error(`cannot resolve ${specifier} from ${from}; expected a .ts module under src`);
+}
