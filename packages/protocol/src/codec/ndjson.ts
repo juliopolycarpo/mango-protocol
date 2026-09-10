@@ -8,6 +8,7 @@
 
 import { CodecError } from '../errors';
 import { assertFrame, type Frame } from '../schemas/frames';
+import { resolveByteCeiling } from './limits';
 
 /** Frame limit when neither peer announced a lower one (§11). */
 export const DEFAULT_MAX_FRAME_BYTES = 16 * 1024 * 1024;
@@ -38,14 +39,20 @@ const encoder = new TextEncoder();
 /** `ignoreBOM` keeps a leading U+FEFF in the output, where JSON.parse refuses it. */
 const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
 
-function resolveFrameLimit(options?: FrameLimitOptions): number {
-  const limit = options?.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
-  if (!Number.isInteger(limit) || limit < MIN_MAX_FRAME_BYTES) {
-    throw new RangeError(
-      `maxFrameBytes is ${limit}; expected an integer of at least ${MIN_MAX_FRAME_BYTES}`
-    );
-  }
-  return limit;
+/**
+ * The frame limit a call works under: the option when it is an integer at or
+ * above the floor of §11, the 16 MiB default when it is absent.
+ *
+ * @example
+ * resolveFrameLimit({ maxFrameBytes: 4194304 }); // 4194304
+ */
+export function resolveFrameLimit(options?: FrameLimitOptions): number {
+  return resolveByteCeiling(
+    'maxFrameBytes',
+    options?.maxFrameBytes,
+    DEFAULT_MAX_FRAME_BYTES,
+    MIN_MAX_FRAME_BYTES
+  );
 }
 
 function reasonOf(cause: unknown): string {
