@@ -15,13 +15,17 @@ frame limit enforced per line, refused line ends the session with `4400`.
   socket with owner-only permissions (`0600`) and removes a stale file at the same path before
   binding.
 - Windows: `\\.\pipe\<name>`, spelled with backslashes. Forward slashes are not equivalent.
-  The listener creates the pipe in byte mode with an ACL that admits only the current user.
+  The listener creates the pipe in byte mode. The pipe carries no per-user ACL: the socket API
+  the reference SDK builds on cannot attach a security descriptor, so every local user may
+  connect.
 
 ## Authentication
 
-Filesystem permissions on the socket path or pipe ACL. A listener MAY additionally read the
-peer credentials the operating system offers (`SO_PEERCRED`, `getpeereid`, the pipe client's
-token) and refuse a connection with `close` `4401` before sending `hello`.
+On POSIX the socket file's permissions admit only the owner. On Windows the pipe admits every
+local user, so a listener that needs more than same-machine trust MUST authenticate the peer
+before serving requests: it reads the credentials the operating system offers (the pipe
+client's token, `SO_PEERCRED`, `getpeereid`) or requires an application credential carried in
+`hello.capabilities`, and refuses a peer with `close` `4401`. On POSIX that check is a MAY.
 
 ## Liveness
 
