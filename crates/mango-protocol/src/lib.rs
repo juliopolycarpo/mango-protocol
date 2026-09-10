@@ -3,14 +3,15 @@
 //! This crate is the Rust half of one wire contract published three ways: the
 //! normative specification under `spec/`, the TypeScript SDK
 //! `@mangostudio/protocol`, and this crate. It carries the frame types and the
-//! rules a decoder enforces; framing, the catalog document and JSON Schema
-//! emission land in the commits that follow. Sessions, transports and any async
-//! runtime are a later milestone and live outside this crate.
+//! rules a decoder enforces; the catalog document and JSON Schema emission land
+//! in the commits that follow. Sessions, transports and any async runtime are a
+//! later milestone and live outside this crate.
 //!
 //! # Example
 //!
 //! ```
-//! use mango_protocol::{Frame, Request, validate};
+//! use mango_protocol::codec::ndjson::{DEFAULT_MAX_FRAME_BYTES, decode_line, encode_line};
+//! use mango_protocol::{Frame, Request};
 //! use serde_json::json;
 //!
 //! let request = Frame::Req(Request {
@@ -18,23 +19,29 @@
 //!     method: "fs.read-file".into(),
 //!     params: json!({ "path": "/etc/hosts" }),
 //! });
-//! assert!(validate(&request).is_ok());
+//! let line = encode_line(&request, DEFAULT_MAX_FRAME_BYTES)?;
+//! assert_eq!(line.last(), Some(&b'\n'));
+//! assert_eq!(decode_line(&line[..line.len() - 1], DEFAULT_MAX_FRAME_BYTES)?, request);
+//! # Ok::<(), mango_protocol::CodecError>(())
 //! ```
 //!
 //! # Layout
 //!
 //! - [`frame`] — the eight frame types and their members.
 //! - [`mod@validate`] — the lengths, grammars and ranges serde cannot express.
+//! - [`codec`] — NDJSON lines.
 //! - [`version`] — the wire version and the negotiation rule.
 //! - [`close`] and [`error`] — the reserved close codes and error codes.
 
 pub mod close;
+pub mod codec;
 pub mod error;
 pub mod frame;
 pub mod validate;
 pub mod version;
 
 pub use close::{close_code_name, close_codes, is_fatal_close_code};
+pub use codec::ndjson::{LineDecoder, PushOutcome, decode_line, encode_frame_bytes, encode_line};
 pub use error::{CodecError, CodecErrorKind, is_reserved_error_code};
 pub use frame::{
     Cancel, Close, End, ErrorPayload, ErrorResponse, Event, Frame, Hello, Limits, PeerInfo,
