@@ -29,7 +29,7 @@
 //!
 //! - [`frame`] — the eight frame types and their members.
 //! - [`mod@validate`] — the lengths, grammars and ranges serde cannot express.
-//! - [`codec`] — NDJSON lines.
+//! - [`codec`] — NDJSON lines and WebSocket chunk messages.
 //! - [`version`] — the wire version and the negotiation rule.
 //! - [`close`] and [`error`] — the reserved close codes and error codes.
 
@@ -41,6 +41,7 @@ pub mod validate;
 pub mod version;
 
 pub use close::{close_code_name, close_codes, is_fatal_close_code};
+pub use codec::chunk::{ChunkReassembler, encode_chunks};
 pub use codec::ndjson::{LineDecoder, PushOutcome, decode_line, encode_frame_bytes, encode_line};
 pub use error::{CodecError, CodecErrorKind, is_reserved_error_code};
 pub use frame::{
