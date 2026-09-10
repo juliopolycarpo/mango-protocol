@@ -363,7 +363,9 @@ export function itBehavesLikeAMangoTransport(fixture: ConformanceFixture): void 
         raw.write(
           '{"type":"hello","protocolVersion":"1.0.1","runtimeVersion":"0.1.1","manifest":{}}\n'
         );
-        await expect(raw.a.ready).rejects.toMatchObject({ code: RESERVED_ERROR_CODES.UNAVAILABLE });
+        await expect(raw.a.ready).rejects.toMatchObject({
+          code: RESERVED_ERROR_CODES.PROTOCOL_MISMATCH,
+        });
         await settled();
         expect(raw.a.closure?.code).toBe(CLOSE_CODES.PROTOCOL_MISMATCH);
         expect(raw.a.closure?.fatal).toBe(true);
