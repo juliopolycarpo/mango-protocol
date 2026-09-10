@@ -60,6 +60,11 @@ const session = new Session(child.port, { peer });
 const remote = spawnPort({ argv: sshArgv({ host: 'build-box', command: ['mango-runtime'] }) });
 ```
 
+A child that cannot start at all (`ENOENT`, `EACCES`) is not an exception: the port reports
+`{ kind: 'closed' }`, `child.exited` resolves with `{ code: null, signal: null }`, and the spawn
+error is appended to `child.stderrTail()`, so one code path builds the message either way.
+`classifySshExit(status, tail)` turns those two observations into a sentence for an ssh launch.
+
 `spawnPort` passes only the environment you give it, keeps a tail of stderr for error reports,
 and on close sends SIGTERM then SIGKILL after a grace period. The launcher decides what to run;
 WSL and container wrappers are argv arrays the application builds.
@@ -72,6 +77,12 @@ const path = ipcPath('mango-hub'); // \\.\pipe\mango-hub or $XDG_RUNTIME_DIR/man
 const server = await listenIpc(path, (port) => new Session(port, { peer, handlers }));
 const client = new Session(await connectIpc(path), { peer });
 ```
+
+On POSIX the socket is owner-only from the moment it exists, and a stale socket
+file left by a crashed listener is replaced. On Windows the named pipe is **not**
+restricted — Node cannot set a pipe's security descriptor, so any local user may
+connect. Check the peer's credentials and close with `4401` before `hello` if the
+address alone is not enough trust there.
 
 **WebSocket.** Binary chunked messages under subprotocol `mango.v1`; the SDK never sends text
 frames. Authentication is a bearer token on the upgrade request, checked by the HTTP layer

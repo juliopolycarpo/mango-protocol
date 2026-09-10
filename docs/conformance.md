@@ -67,7 +67,7 @@ describe('my transport', () => {
       // Return { a, b, drop, close }: the two sessions, a way to sever the link
       // without a close frame, and a clean close.
     },
-    chunked: false, // true for WebSocket-style message transports
+    chunked: false, // true when frames are split across messages or stream chunks
     async connectRaw(aOptions) {
       // Optional. Open a session on one end and give the test raw write access
       // to the other end, so it can send malformed lines and a legacy hello.
@@ -96,5 +96,8 @@ What a port must do for the suite to pass:
 - Report `{ kind: 'closed', code, reason }` when the peer closes, and `{ kind: 'closed' }`
   with no code when the link vanished.
 
-The in-process, stdio, local socket, spawn and WebSocket transports in this repository all run
-this suite; `packages/protocol/tests/*.test.ts` shows each fixture.
+The in-process, stdio, local socket and WebSocket transports in this repository all run this
+suite; `packages/protocol/tests/*.test.ts` shows each fixture. The spawn launcher cannot: the
+suite drives both sessions, and one of a launcher's two sessions lives in another process. It
+hands out the same NDJSON port the stdio suite exercises, and `tests/stdio.test.ts` runs a real
+child through `spawnPort` to prove the pipes are wired the way the suite assumes.
