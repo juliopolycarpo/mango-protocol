@@ -5,7 +5,7 @@ import * as protocol from '../src';
 const SOURCE_DIR = new URL('../src', import.meta.url).pathname;
 
 describe('package entry point', () => {
-  it('re-exports the version, schema, codec, close and error surface', () => {
+  it('re-exports the version, schema, codec, close, error, session and contract surface', () => {
     const exported = Object.keys(protocol);
 
     for (const name of [
@@ -27,6 +27,8 @@ describe('package entry point', () => {
       'encodeChunks',
       'ChunkReassembler',
       'maxChunksFor',
+      'Session',
+      'defineContract',
     ]) {
       expect(exported).toContain(name);
     }
