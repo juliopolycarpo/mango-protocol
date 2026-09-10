@@ -110,7 +110,10 @@ Until a peer has received the other side's `hello`, it MUST NOT send any frame o
 On receiving the peer's `hello`:
 
 1. If `protocol.major` differs from the receiver's major, the handshake fails. The receiver
-   MUST close with code `4426` (`PROTOCOL_MISMATCH`) and MUST NOT send any request.
+   MUST close with code `4426` (`PROTOCOL_MISMATCH`) and MUST NOT send any request. A frame
+   whose `type` is `hello` but which fails the schema is treated the same way: it is a peer
+   speaking another wire version, and `4426` tells it so where `4400` would only say
+   "garbage".
 2. Otherwise the **effective minor** is the lower of the two `minor` values. Both peers derive
    the same number. A peer MUST NOT rely on any behaviour or member introduced after the
    effective minor.
