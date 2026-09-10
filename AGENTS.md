@@ -56,8 +56,11 @@ The schema-equality test (`bun run check` runs it) emits the TS and Rust schemas
 normaliser below, and deep-compares them with the spec. A change that needs a new normaliser
 rule is a review flag, not a quick fix.
 
-Normaliser rules: TypeBox `anyOf` becomes `oneOf` when every branch carries a distinct `const`
-tag; schemars `null` alternatives are stripped on non-required properties; key order is ignored.
+Normaliser rules (`scripts/schema-equality.ts`): `$ref` to `#/$defs/<name>` is inlined;
+`$schema`, `$id`, `title`, `description`, `$comment`, `examples` and `format` are dropped;
+`additionalProperties: true` is dropped; a TypeBox `anyOf` whose branches carry distinct `type`
+consts becomes `oneOf`; the `null` alternative schemars adds to an `Option` member is stripped;
+key order is ignored. Nothing else is tolerated.
 
 ## Global Rules
 
