@@ -18,3 +18,7 @@ pre-commit:
       skip:
         - merge
         - rebase
+
+output:
+  - failure
+  - summary
