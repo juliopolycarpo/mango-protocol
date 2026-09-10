@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test';
+import { fileURLToPath } from 'node:url';
 import { CHUNK_HEADER_BYTES } from '../src/codec/chunk';
 import type { PortClosure } from '../src/port';
 import type { Frame } from '../src/schemas/frames';
@@ -6,10 +7,12 @@ import {
   createWebSocketPort,
   outcomeOfBunSend,
   type SendOutcome,
+  WEBSOCKET_SUBPROTOCOL,
   type WebSocketPortHandle,
   type WebSocketPortOptions,
   type WebSocketSink,
 } from '../src/transports/websocket';
+import { type WhatwgWebSocketLike, webSocketPort } from '../src/transports/websocket-client';
 
 /** A socket that records what it was asked to do and answers a scripted outcome. */
 class FakeWebSocketSink implements WebSocketSink {
@@ -31,6 +34,36 @@ class FakeWebSocketSink implements WebSocketSink {
   close(code: number, reason?: string): void {
     this.calls.push(`close:${code}`);
     this.closes.push({ code, reason });
+  }
+}
+
+/** A WHATWG socket whose events a test fires by hand. */
+class FakeWhatwgWebSocket implements WhatwgWebSocketLike {
+  binaryType = 'nodebuffer';
+  readyState = 1;
+  protocol: string = WEBSOCKET_SUBPROTOCOL;
+  readonly sent: Uint8Array[] = [];
+  readonly closes: { code: number | undefined; reason: string | undefined }[] = [];
+  readonly #listeners = new Map<string, ((event: unknown) => void)[]>();
+
+  send(data: Uint8Array): void {
+    this.sent.push(data.slice());
+  }
+
+  close(code?: number, reason?: string): void {
+    this.readyState = 3;
+    this.closes.push({ code, reason });
+  }
+
+  addEventListener(type: string, listener: (event: never) => void): void {
+    const listeners = this.#listeners.get(type) ?? [];
+    listeners.push(listener as (event: unknown) => void);
+    this.#listeners.set(type, listeners);
+  }
+
+  /** Fires one event at every listener registered for it. */
+  emit(type: string, event?: unknown): void {
+    for (const listener of this.#listeners.get(type) ?? []) listener(event);
   }
 }
 
@@ -308,5 +341,78 @@ describe('outcomeOfBunSend', () => {
     expect(outcomeOfBunSend(0)).toBe('dropped');
     expect(outcomeOfBunSend(-1)).toBe('buffered');
     expect(outcomeOfBunSend(24)).toBe('sent');
+  });
+});
+
+describe('webSocketPort', () => {
+  it('refuses a socket that is not open, naming the readyState', () => {
+    const socket = new FakeWhatwgWebSocket();
+    socket.readyState = 0;
+
+    expect(() => webSocketPort(socket)).toThrow(/WebSocket readyState is 0; expected OPEN \(1\)/);
+  });
+
+  it('switches the socket to arraybuffer and forwards sends', () => {
+    const socket = new FakeWhatwgWebSocket();
+
+    const port = webSocketPort(socket);
+    port.send({ type: 'ping' });
+
+    expect(socket.binaryType).toBe('arraybuffer');
+    expect(JSON.parse(lineOf(socket.sent))).toEqual({ type: 'ping' });
+  });
+
+  it('wires message, close and error events to the port', () => {
+    const sender = new FakeWhatwgWebSocket();
+    webSocketPort(sender).send({ type: 'pong' });
+
+    const socket = new FakeWhatwgWebSocket();
+    const port = webSocketPort(socket);
+    const frames: Frame[] = [];
+    const closures: PortClosure[] = [];
+    port.onFrame((frame) => frames.push(frame));
+    port.onClosed((closure) => closures.push(closure));
+
+    socket.emit('message', { data: sender.sent[0] });
+    expect(frames).toEqual([{ type: 'pong' }]);
+
+    socket.emit('close', { code: 4429, reason: 'slow down' });
+    expect(closures).toEqual([{ kind: 'closed', code: 4429, reason: 'slow down' }]);
+  });
+
+  it('reports an error event as the link ending', () => {
+    const socket = new FakeWhatwgWebSocket();
+    const port = webSocketPort(socket);
+    const closures: PortClosure[] = [];
+    port.onClosed((closure) => closures.push(closure));
+
+    socket.emit('error');
+
+    expect(closures).toMatchObject([{ kind: 'closed' }]);
+  });
+
+  it('closes the socket with the code the owner chose', () => {
+    const socket = new FakeWhatwgWebSocket();
+
+    webSocketPort(socket).close(4000, 'released');
+
+    expect(socket.closes).toEqual([{ code: 4000, reason: 'released' }]);
+  });
+});
+
+describe('the ws entry', () => {
+  it('imports no node: module, so it stays browser-safe', async () => {
+    const nodeImport = /(?:from|import|require)\s*\(?\s*['"]node:/;
+    const root = fileURLToPath(new URL('../src', import.meta.url));
+    const paths = [
+      `${root}/ws.ts`,
+      `${root}/transports/websocket.ts`,
+      `${root}/transports/websocket-client.ts`,
+    ];
+
+    for (const path of paths) {
+      expect(nodeImport.test(await Bun.file(path).text())).toBe(false);
+    }
+    expect(nodeImport.test("import { Buffer } from 'node:buffer';")).toBe(true);
   });
 });
