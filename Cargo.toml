@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = ["crates/mango-protocol"]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Julio Polycarpo"]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/juliopolycarpo/mango-protocol"
+rust-version = "1.97.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = "warn"

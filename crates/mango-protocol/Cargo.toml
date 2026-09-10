@@ -1,0 +1,28 @@
+[package]
+name = "mango-protocol"
+version.workspace = true
+authors.workspace = true
+categories = ["network-programming", "encoding"]
+edition.workspace = true
+keywords = ["mangostudio", "protocol", "rpc", "json-schema", "ndjson"]
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+rust-version.workspace = true
+description = "Mango Protocol wire types and codec: one JSON-Schema contract for MangoStudio hubs, runtimes and tools"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# JSON Schema emission used by the repo's equality check; not needed to speak the protocol.
+schema = ["dep:schemars"]
+
+[dependencies]
+schemars = { version = "1.2", optional = true, features = ["derive"] }
+serde = { version = "1.0.219", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0.140", default-features = false, features = ["std"] }
+
+[package.metadata.docs.rs]
+all-features = true
