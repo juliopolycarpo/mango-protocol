@@ -19,6 +19,7 @@ interface ChunkCase {
   readonly messages: readonly string[];
   readonly expected?: unknown;
   readonly reason?: string;
+  readonly refusedAt?: number;
 }
 
 const cases = chunks.cases as readonly ChunkCase[];
@@ -40,8 +41,16 @@ function reassemble(item: ChunkCase): Frame[] {
   return frames;
 }
 
-function refusalOfCase(item: ChunkCase): CodecError {
-  return refusalOf(() => reassemble(item), item.name);
+/** The message index at which a reject case throws, and the error it throws. */
+function refusalOfCase(item: ChunkCase): { readonly index: number; readonly error: CodecError } {
+  const reassembler = new ChunkReassembler(optionsOf(item));
+  let index = 0;
+  const error = refusalOf(() => {
+    for (index = 0; index < item.messages.length; index += 1) {
+      reassembler.push(fromBase64(item.messages[index] ?? ''));
+    }
+  }, item.name);
+  return { index, error };
 }
 
 /** True when the reference chunker produced the run: every non-final message is full. */
@@ -83,7 +92,10 @@ describe('chunk corpus', () => {
 
   for (const item of cases.filter((entry) => entry.verdict === 'reject')) {
     it(`refuses ${item.name}`, () => {
-      expect(refusalOfCase(item).kind).toBe(item.reason as CodecErrorKind);
+      const { index, error } = refusalOfCase(item);
+
+      expect(error.kind).toBe(item.reason as CodecErrorKind);
+      expect(index).toBe(item.refusedAt ?? item.messages.length - 1);
     });
   }
 

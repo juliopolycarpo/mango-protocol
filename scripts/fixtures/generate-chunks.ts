@@ -64,6 +64,8 @@ interface Case {
   readonly messages: readonly string[];
   readonly expected?: unknown;
   readonly reason?: string;
+  /** Index of the message that must be refused; the last one when absent. */
+  readonly refusedAt?: number;
   readonly note?: string;
 }
 
@@ -220,9 +222,10 @@ function build(): Case[] {
       verdict: 'reject',
       maxMessageBytes: 2048,
       maxFrameBytes: 4096,
-      messages: chunkFrame(filler(5000), 2048).map(b64),
+      messages: chunkFrame(filler(7000), 2048).map(b64),
       reason: 'too-large',
-      note: 'Refused as soon as the accumulated payload passes the frame limit, before the last chunk.',
+      refusedAt: 2,
+      note: 'Four chunks of 2039 payload bytes; refused on the third, as soon as the accumulated payload passes 4096, without waiting for the last chunk.',
     },
     {
       name: 'n_reassembled_line_invalid',

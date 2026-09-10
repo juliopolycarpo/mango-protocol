@@ -382,10 +382,13 @@ fn every_chunk_case_agrees_with_the_corpus() {
                     decoded.is_none(),
                     "{case_name}: a frame came out before the refusal"
                 );
+                let expected_index = case
+                    .get("refusedAt")
+                    .and_then(Value::as_u64)
+                    .map_or(messages.len() - 1, |at| at as usize);
                 assert_eq!(
-                    index,
-                    messages.len() - 1,
-                    "{case_name}: every chunk before the last was accepted"
+                    index, expected_index,
+                    "{case_name}: refused at chunk {index}, expected chunk {expected_index}"
                 );
                 if let Some(kind) = kind_for(&text(case, "reason")) {
                     assert_eq!(error.kind, kind, "{case_name}: {error}");
