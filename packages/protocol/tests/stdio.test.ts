@@ -9,6 +9,7 @@ import {
   type ConformanceFixture,
   itBehavesLikeAMangoTransport,
 } from '../src/testing/conformance';
+import { rejectionOf } from '../src/testing/rejection';
 import { spawnPort } from '../src/transports/spawn';
 import { stdioPort } from '../src/transports/stdio';
 
@@ -139,9 +140,9 @@ describe('stdio transport', () => {
       expect(await session.request('test.echo', { line: 'over a real pipe · 🥭' })).toEqual({
         line: 'over a real pipe · 🥭',
       });
-      await expect(
-        session.request('test.refuse', { code: 'NOPE', message: 'no' })
-      ).rejects.toMatchObject({ code: 'NOPE' });
+      expect(
+        await rejectionOf(session.request('test.refuse', { code: 'NOPE', message: 'no' }))
+      ).toMatchObject({ code: 'NOPE' });
     } finally {
       expect(await child.terminate()).toEqual({ code: 0, signal: null });
     }

@@ -10,3 +10,5 @@ export {
   itBehavesLikeAMangoTransport,
   refuse,
 } from './testing/conformance';
+
+export { rejectionOf } from './testing/rejection';

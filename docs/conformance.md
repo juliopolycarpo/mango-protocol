@@ -85,6 +85,10 @@ propagation including fatal codes, `FRAME_TOO_LARGE` without ending the session,
 lower announced frame limit, and, with `connectRaw`, a schema-invalid `hello` answered with
 `4426` and unknown members ignored.
 
+Assert a rejection with `rejectionOf` from the same entry rather than Bun's `expect().rejects`:
+that matcher does not pump libuv-backed I/O on Windows while it waits, so a request whose answer
+must cross a named pipe or a child's stdio never settles under it.
+
 What a port must do for the suite to pass:
 
 - Deliver frames in order and exactly once.

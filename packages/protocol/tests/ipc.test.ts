@@ -18,6 +18,7 @@ import {
   type ConformanceFixture,
   itBehavesLikeAMangoTransport,
 } from '../src/testing/conformance';
+import { rejectionOf } from '../src/testing/rejection';
 import { connectIpc, ipcPath, ipcSocketPort, listenIpc } from '../src/transports/ipc';
 
 const WINDOWS = process.platform === 'win32';
@@ -115,7 +116,7 @@ describe('local socket transport', () => {
   itBehavesLikeAMangoTransport(fixture);
 
   it('rejects a connection to a path with no listener', async () => {
-    await expect(connectIpc(nextPath())).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await rejectionOf(connectIpc(nextPath()))).toMatchObject({ code: 'ENOENT' });
   });
 
   it('sends close 4000 to every open session before it stops listening', async () => {
@@ -158,7 +159,7 @@ describe('local socket transport', () => {
     await tick();
     socket.destroy();
 
-    await expect(pending).rejects.toMatchObject({ code: RESERVED_ERROR_CODES.UNAVAILABLE });
+    expect(await rejectionOf(pending)).toMatchObject({ code: RESERVED_ERROR_CODES.UNAVAILABLE });
     expect(host.state).toBe('closed');
     // No `close` frame crossed, so the closure is the plain 4000 release of §10.
     expect(host.closure?.code).toBe(CLOSE_CODES.RELEASED);

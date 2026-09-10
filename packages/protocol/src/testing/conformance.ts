@@ -4,6 +4,7 @@ import { DEFAULT_MAX_FRAME_BYTES } from '../codec/ndjson';
 import { RESERVED_ERROR_CODES, RemoteError } from '../errors';
 import type { EventFrame } from '../schemas/frames';
 import type { RequestHandler, Session, SessionOptions } from '../session';
+import { rejectionOf } from './rejection';
 
 /** Two sessions wired through the transport under test. */
 export interface ConformancePair {
@@ -142,10 +143,10 @@ export function itBehavesLikeAMangoTransport(fixture: ConformanceFixture): void 
       options(CONFORMANCE_B)
     );
     try {
-      await expect(pair.a.ready).rejects.toMatchObject({
+      expect(await rejectionOf(pair.a.ready)).toMatchObject({
         code: RESERVED_ERROR_CODES.PROTOCOL_MISMATCH,
       });
-      await expect(pair.b.ready).rejects.toMatchObject({
+      expect(await rejectionOf(pair.b.ready)).toMatchObject({
         code: RESERVED_ERROR_CODES.PROTOCOL_MISMATCH,
       });
       await settled();
@@ -179,7 +180,7 @@ export function itBehavesLikeAMangoTransport(fixture: ConformanceFixture): void 
 
   it('reports an unsupported method without ending the session', async () => {
     await withPair(async ({ a }) => {
-      await expect(a.request('test.absent', {})).rejects.toMatchObject({
+      expect(await rejectionOf(a.request('test.absent', {}))).toMatchObject({
         code: RESERVED_ERROR_CODES.METHOD_UNSUPPORTED,
       });
       expect(await a.request('test.echo', { ok: true })).toEqual({ ok: true });
@@ -188,9 +189,9 @@ export function itBehavesLikeAMangoTransport(fixture: ConformanceFixture): void 
 
   it('carries a handler-chosen error code and its details', async () => {
     await withPair(async ({ a }) => {
-      await expect(
-        a.request('test.refuse', { code: 'APP_REFUSED', message: 'no' })
-      ).rejects.toMatchObject({
+      expect(
+        await rejectionOf(a.request('test.refuse', { code: 'APP_REFUSED', message: 'no' }))
+      ).toMatchObject({
         code: 'APP_REFUSED',
         message: 'no',
         details: { echoed: true },
@@ -200,7 +201,7 @@ export function itBehavesLikeAMangoTransport(fixture: ConformanceFixture): void 
 
   it('refuses a reserved rpc. method before it reaches the wire', async () => {
     await withPair(async ({ a }) => {
-      await expect(a.request('rpc.discover', {})).rejects.toMatchObject({
+      expect(await rejectionOf(a.request('rpc.discover', {}))).toMatchObject({
         code: RESERVED_ERROR_CODES.INVALID_REQUEST,
       });
     });
@@ -280,13 +281,13 @@ export function itBehavesLikeAMangoTransport(fixture: ConformanceFixture): void 
       const pending = a.request('test.forever', {}, { signal: controller.signal });
       await settled();
       controller.abort();
-      await expect(pending).rejects.toMatchObject({ code: RESERVED_ERROR_CODES.CANCELLED });
+      expect(await rejectionOf(pending)).toMatchObject({ code: RESERVED_ERROR_CODES.CANCELLED });
     });
   });
 
   it('times out a request locally and ignores the late answer', async () => {
     await withPair(async ({ a }) => {
-      await expect(a.request('test.forever', {}, { timeoutMs: 50 })).rejects.toMatchObject({
+      expect(await rejectionOf(a.request('test.forever', {}, { timeoutMs: 50 }))).toMatchObject({
         code: RESERVED_ERROR_CODES.TIMEOUT,
       });
       expect(await a.request('test.echo', { still: 'alive' })).toEqual({ still: 'alive' });
@@ -298,7 +299,7 @@ export function itBehavesLikeAMangoTransport(fixture: ConformanceFixture): void 
       const pending = pair.a.request('test.forever', {});
       await settled();
       await pair.drop();
-      await expect(pending).rejects.toMatchObject({ code: RESERVED_ERROR_CODES.UNAVAILABLE });
+      expect(await rejectionOf(pending)).toMatchObject({ code: RESERVED_ERROR_CODES.UNAVAILABLE });
       await settled();
       expect(pair.a.state).toBe('closed');
     });
@@ -316,13 +317,15 @@ export function itBehavesLikeAMangoTransport(fixture: ConformanceFixture): void 
 
   it('refuses a result past the frame limit without ending the session', async () => {
     await withPair(async ({ a }) => {
-      await expect(
-        a.request(
-          'test.bulk',
-          { bytes: DEFAULT_MAX_FRAME_BYTES + 1 },
-          { timeoutMs: BULK_TIMEOUT_MS }
+      expect(
+        await rejectionOf(
+          a.request(
+            'test.bulk',
+            { bytes: DEFAULT_MAX_FRAME_BYTES + 1 },
+            { timeoutMs: BULK_TIMEOUT_MS }
+          )
         )
-      ).rejects.toMatchObject({ code: RESERVED_ERROR_CODES.FRAME_TOO_LARGE });
+      ).toMatchObject({ code: RESERVED_ERROR_CODES.FRAME_TOO_LARGE });
       expect(await a.request('test.echo', { ok: true })).toEqual({ ok: true });
     });
   });
@@ -330,7 +333,7 @@ export function itBehavesLikeAMangoTransport(fixture: ConformanceFixture): void 
   it('honours the lower announced frame limit when sending', async () => {
     await withPair(
       async ({ a }) => {
-        await expect(a.request('test.bulk', { bytes: 8192 })).rejects.toMatchObject({
+        expect(await rejectionOf(a.request('test.bulk', { bytes: 8192 }))).toMatchObject({
           code: RESERVED_ERROR_CODES.FRAME_TOO_LARGE,
         });
         expect(await a.request('test.bulk', { bytes: 1024 })).toMatchObject({
@@ -363,7 +366,7 @@ export function itBehavesLikeAMangoTransport(fixture: ConformanceFixture): void 
         raw.write(
           '{"type":"hello","protocolVersion":"1.0.1","runtimeVersion":"0.1.1","manifest":{}}\n'
         );
-        await expect(raw.a.ready).rejects.toMatchObject({
+        expect(await rejectionOf(raw.a.ready)).toMatchObject({
           code: RESERVED_ERROR_CODES.PROTOCOL_MISMATCH,
         });
         await settled();
