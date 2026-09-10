@@ -11,7 +11,7 @@ The key words MUST, MUST NOT, SHOULD and MAY are to be read as in RFC 2119.
 Mango Protocol is a message protocol between two **peers** connected by a **transport** that
 delivers ordered, reliable, bidirectional **frames**. It defines:
 
-- the frame envelope and its eight frame types,
+- the frame envelope and its nine frame types,
 - the handshake and version negotiation,
 - requests, responses, cancellation and the error model,
 - event streams,
@@ -47,7 +47,7 @@ and to each transport specification under `spec/transports/`.
 
 ## 4. Envelope and tolerance
 
-Every frame has a `type` member whose value names one of the eight frame types below. Objects in
+Every frame has a `type` member whose value names one of the nine frame types below. Objects in
 this specification are **open**:
 
 - A decoder MUST ignore members it does not know, at every level of a frame.
@@ -103,7 +103,8 @@ As soon as the transport is open, each peer MUST send exactly one `hello`:
   (see [§11](#11-limits)).
 
 Until a peer has received the other side's `hello`, it MUST NOT send any frame other than
-`hello`, `ping`, `pong` or `close`: the peer's limits and the effective minor are not known yet.
+`hello`, `ping`, `pong`, `close`, or an `err` answering a request the other side sent too
+early (§5.3): the peer's limits and the effective minor are not known yet.
 
 ### 5.2 Negotiation
 
@@ -236,16 +237,16 @@ refused; a consumer narrows them to its own known set.
 
 Reason codes:
 
-| Code   | Name                | Meaning                                                                                                | Reconnect  |
-| ------ | ------------------- | ------------------------------------------------------------------------------------------------------ | ---------- |
-| `4000` | `RELEASED`          | The sender let the connection go: shutdown, rotation, liveness timeout.                                | Yes        |
-| `4400` | `PROTOCOL_ERROR`    | A frame or chunk the decoder refused; the stream cannot be resynchronised. Also the handshake timeout. | Yes        |
-| `4401` | `UNAUTHORIZED`      | The credential presented at the transport is missing, unknown or revoked.                              | No         |
-| `4403` | `FORBIDDEN`         | The credential is valid but its subject is disabled or gone.                                           | No         |
-| `4409` | `SUPERSEDED`        | Another connection for the same subject took over.                                                     | No         |
-| `4426` | `PROTOCOL_MISMATCH` | Wire majors differ.                                                                                    | No         |
-| `4429` | `RATE_LIMITED`      | Too many connections from this source; back off further than usual.                                    | Yes, later |
-| `4500` | `INTERNAL`          | The sender failed while setting the connection up.                                                     | Yes        |
+| Code   | Name                | Meaning                                                                                                                                                                                     | Reconnect  |
+| ------ | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| `4000` | `RELEASED`          | The sender let the connection go: shutdown, rotation, liveness timeout.                                                                                                                     | Yes        |
+| `4400` | `PROTOCOL_ERROR`    | A frame or chunk the decoder refused; the stream cannot be resynchronised. Also the handshake timeout. A refused `hello` is the exception: it closes with `4426` ([§5.2](#52-negotiation)). | Yes        |
+| `4401` | `UNAUTHORIZED`      | The credential presented at the transport is missing, unknown or revoked.                                                                                                                   | No         |
+| `4403` | `FORBIDDEN`         | The credential is valid but its subject is disabled or gone.                                                                                                                                | No         |
+| `4409` | `SUPERSEDED`        | Another connection for the same subject took over.                                                                                                                                          | No         |
+| `4426` | `PROTOCOL_MISMATCH` | Wire majors differ.                                                                                                                                                                         | No         |
+| `4429` | `RATE_LIMITED`      | Too many connections from this source; back off further than usual.                                                                                                                         | Yes, later |
+| `4500` | `INTERNAL`          | The sender failed while setting the connection up.                                                                                                                                          | Yes        |
 
 The **fatal set** is `4401`, `4403`, `4409`, `4426`: redialing cannot change the outcome and a
 peer MUST NOT retry automatically after one of them. Applications add reconnect policy on top
