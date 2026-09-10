@@ -69,6 +69,8 @@ if (declarations.exitCode !== 0) process.exit(declarations.exitCode);
 
 await mkdir(`${ROOT}schema/1`, { recursive: true });
 await cp(`${ROOT}../../spec/schema/1`, `${ROOT}schema/1`, { recursive: true });
+// npm ships only what `files` lists, and the licence lives at the repository root.
+await cp(`${ROOT}../../LICENSE`, `${ROOT}LICENSE`);
 process.stdout.write(
   `built ${entrypoints.length} entries into dist/ and copied the schema files\n`
 );

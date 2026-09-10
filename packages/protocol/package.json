@@ -63,7 +63,8 @@
   "files": [
     "dist",
     "schema",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "publishConfig": {
     "access": "public"
