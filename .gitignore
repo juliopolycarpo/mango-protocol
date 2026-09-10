@@ -1,6 +1,8 @@
 # ─── Dependencies and build artifacts ─── #
 node_modules/
 dist/
+# The build copies spec/schema into the package for publishing.
+packages/protocol/schema/
 coverage/
 target/
 release-assets/
