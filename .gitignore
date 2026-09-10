@@ -1,0 +1,33 @@
+# ─── Dependencies and build artifacts ─── #
+node_modules/
+dist/
+coverage/
+target/
+release-assets/
+
+# ─── OS and logs ─── #
+.DS_Store
+*.log
+
+# ─── Local env and secrets ─── #
+.env
+.env.local
+.env.*.local
+
+# ─── Agent-local state — every user keeps their own ─── #
+.claude/**
+!.claude/CLAUDE.md
+.codex/
+.cursor/
+.agents/
+.agent/
+.opencode/
+.playwright-cli/
+
+# ─── Local scratch space ─── #
+.local/
+.scratch/
+
+# ─── Build and lint caches ─── #
+**/.tsbuildinfo
+**/node_modules/.cache/

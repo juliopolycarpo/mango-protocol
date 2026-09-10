@@ -1,0 +1,81 @@
+/**
+ * Shared runner for the root scripts: spawns one command, streams its output,
+ * and reports a named result so `check`, `test` and `fix` print one summary.
+ *
+ * @example
+ * const results = await runAll([task('biome', ['bunx', 'biome', 'check', '.'])]);
+ * exitWith(results);
+ */
+
+export interface TaskResult {
+  readonly name: string;
+  readonly ok: boolean;
+  readonly durationMs: number;
+}
+
+export interface Task {
+  readonly name: string;
+  readonly argv: readonly string[];
+  readonly cwd?: string;
+}
+
+export const ROOT_DIR = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
+
+export function task(name: string, argv: readonly string[], cwd?: string): Task {
+  return cwd === undefined ? { name, argv } : { name, argv, cwd };
+}
+
+/** Runs one task to completion, inheriting stdio so output stays readable. */
+export async function runTask(item: Task): Promise<TaskResult> {
+  const started = performance.now();
+  console.log(`\n▶ ${item.name}: ${item.argv.join(' ')}`);
+  const child = Bun.spawn([...item.argv], {
+    cwd: item.cwd ?? ROOT_DIR,
+    stdout: 'inherit',
+    stderr: 'inherit',
+    stdin: 'ignore',
+  });
+  const code = await child.exited;
+  return { name: item.name, ok: code === 0, durationMs: performance.now() - started };
+}
+
+/** Runs tasks in sequence; formatters and tests write to the same tree, so no races. */
+export async function runSequential(tasks: readonly Task[]): Promise<TaskResult[]> {
+  const results: TaskResult[] = [];
+  for (const item of tasks) results.push(await runTask(item));
+  return results;
+}
+
+/** Runs read-only tasks concurrently. */
+export function runParallel(tasks: readonly Task[]): Promise<TaskResult[]> {
+  return Promise.all(tasks.map((item) => runTask(item)));
+}
+
+export function exitWith(results: readonly TaskResult[]): never {
+  console.log('\nSummary');
+  for (const result of results) {
+    const seconds = (result.durationMs / 1000).toFixed(1);
+    console.log(`  ${result.ok ? '✔' : '✘'} ${result.name} (${seconds}s)`);
+  }
+  const failed = results.filter((result) => !result.ok);
+  if (failed.length > 0) {
+    console.error(`\n${failed.length} task(s) failed: ${failed.map((r) => r.name).join(', ')}`);
+    process.exit(1);
+  }
+  console.log('\nAll tasks passed.');
+  process.exit(0);
+}
+
+/** True when the flag is present in argv. */
+export function hasFlag(flag: string): boolean {
+  return process.argv.slice(2).includes(flag);
+}
+
+/** True when `cargo` resolves on PATH; the Rust half is skipped with a warning otherwise. */
+export function hasCargo(): boolean {
+  return Bun.which('cargo') !== null;
+}
+
+export function warnNoCargo(): void {
+  console.warn('cargo not found on PATH; skipping the Rust half. CI runs it.');
+}
