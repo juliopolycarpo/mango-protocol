@@ -1,6 +1,7 @@
 /**
  * `bun run check`: Biome, dprint, TypeScript, the spec verifier, the schema
- * equality check, the fixture generator's staleness check, rustfmt and Clippy.
+ * equality check, the fixture generator's staleness check, rustfmt, Clippy and,
+ * with both toolchains, the TypeScript/Rust round trip.
  *
  * Flags: `--skip-format` (no Biome/dprint), `--staged` (accepted for the
  * lefthook hook; the repo is small enough to always check everything),
@@ -47,6 +48,7 @@ if (!tsOnly) {
         'warnings',
       ])
     );
+    if (!tsOnly && !rsOnly) tasks.push(task('roundtrip', ['bun', './scripts/verify-roundtrip.ts']));
   } else {
     warnNoCargo();
   }

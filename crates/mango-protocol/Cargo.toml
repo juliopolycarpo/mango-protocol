@@ -28,5 +28,8 @@ serde_json = { version = "1.0.140", default-features = false, features = ["std"]
 name = "emit_schema"
 required-features = ["schema"]
 
+[[example]]
+name = "roundtrip"
+
 [package.metadata.docs.rs]
 all-features = true

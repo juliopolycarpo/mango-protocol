@@ -70,7 +70,7 @@ jobs:
       - run: bun run test --ts-only
 
   schema-equality:
-    name: Schema equality
+    name: Schema equality and round trip
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -84,6 +84,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: bun install --frozen-lockfile
       - run: bun ./scripts/verify-schema-equality.ts
+      - run: bun ./scripts/verify-roundtrip.ts
 
   gate:
     name: Gate

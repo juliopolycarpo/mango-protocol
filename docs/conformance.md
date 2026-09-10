@@ -41,6 +41,15 @@ Load each case, feed the input to your decoder, and compare against the verdict.
 tests under `packages/protocol/tests/fixtures-*.test.ts` and the Rust test
 `crates/mango-protocol/tests/fixtures.rs` are the two reference harnesses.
 
+## The round trip
+
+`bun run check` also proves the two SDKs read each other's bytes when both toolchains are
+present: every line of `frames.json` is sent to the crate's `roundtrip` example, which decodes
+it with the Rust codec and answers with its own encoding or its refusal reason, and the
+TypeScript SDK decodes the answers. Accepted lines must agree member for member and refused
+lines must name the same reason. `scripts/verify-roundtrip.ts` runs it; CI runs it on the job
+that has Bun and Cargo together.
+
 ## The transport suite
 
 A transport implements one interface, `Port`: send a frame, receive frames, learn about closure,

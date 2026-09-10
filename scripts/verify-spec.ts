@@ -17,6 +17,7 @@ import ndjson from '../spec/fixtures/1/ndjson.json';
 import negotiation from '../spec/fixtures/1/negotiation.json';
 import catalogSchema from '../spec/schema/1/catalog.json';
 import protocolSchema from '../spec/schema/1/protocol.json';
+import { isSubset } from './subset';
 
 interface FrameCase {
   readonly name: string;
@@ -37,24 +38,6 @@ const failures: string[] = [];
 const fail = (message: string): void => {
   failures.push(message);
 };
-
-/** Recursive subset match: every member of `expected` equals the value's member. */
-function isSubset(expected: unknown, actual: unknown): boolean {
-  if (Array.isArray(expected)) {
-    return (
-      Array.isArray(actual) &&
-      expected.length === actual.length &&
-      expected.every((item, index) => isSubset(item, actual[index]))
-    );
-  }
-  if (expected !== null && typeof expected === 'object') {
-    if (actual === null || typeof actual !== 'object' || Array.isArray(actual)) return false;
-    return Object.entries(expected).every(([key, value]) =>
-      isSubset(value, (actual as Record<string, unknown>)[key])
-    );
-  }
-  return Object.is(expected, actual);
-}
 
 for (const item of frames.cases as FrameCase[]) {
   let parsed: unknown;
