@@ -32,7 +32,9 @@
 //! - [`codec`] — NDJSON lines and WebSocket chunk messages.
 //! - [`version`] — the wire version and the negotiation rule.
 //! - [`close`] and [`error`] — the reserved close codes and error codes.
+//! - [`catalog`] — the catalog document that describes an application contract.
 
+pub mod catalog;
 pub mod close;
 pub mod codec;
 pub mod error;
@@ -40,6 +42,7 @@ pub mod frame;
 pub mod validate;
 pub mod version;
 
+pub use catalog::{Catalog, CatalogEvent, CatalogMethod};
 pub use close::{close_code_name, close_codes, is_fatal_close_code};
 pub use codec::chunk::{ChunkReassembler, encode_chunks};
 pub use codec::ndjson::{LineDecoder, PushOutcome, decode_line, encode_frame_bytes, encode_line};
