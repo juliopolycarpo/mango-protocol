@@ -5,9 +5,11 @@
 
 export {
   type ExitStatus,
+  type LaunchedPeer,
   type SpawnChild,
   type SpawnedPeer,
   type SpawnOptions,
+  type SpawnStartError,
   sanitizedEnv,
   spawnPort,
 } from './transports/spawn';

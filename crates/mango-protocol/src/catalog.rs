@@ -13,9 +13,13 @@ use crate::version::ProtocolVersion;
 /// One method a contract offers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[cfg_attr(feature = "schema", schemars(rename = "catalogMethod"))]
+#[cfg_attr(feature = "schema", schemars(rename = "method"))]
 pub struct CatalogMethod {
     /// The method name, in the grammar of §6.1.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::method_name")
+    )]
     pub name: String,
     /// Prose for a human reading the contract.
     #[serde(
@@ -25,23 +29,44 @@ pub struct CatalogMethod {
     )]
     pub description: Option<String>,
     /// JSON Schema 2020-12 document for `req.params`.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::open_object")
+    )]
     pub params: Value,
     /// JSON Schema 2020-12 document for `res.result`.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::open_object")
+    )]
     pub result: Value,
     /// Members of `hello.capabilities` the responder requires before serving this method.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::capability_names")
+    )]
     pub capabilities: Vec<String>,
     /// True when the contract still serves the method but callers should move off it.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default_flag")]
     pub deprecated: bool,
+}
+
+/// True when a flag is at the value the wire leaves absent rather than stating.
+fn is_default_flag(flag: &bool) -> bool {
+    !*flag
 }
 
 /// One event topic a contract emits.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[cfg_attr(feature = "schema", schemars(rename = "catalogEvent"))]
+#[cfg_attr(feature = "schema", schemars(rename = "event"))]
 pub struct CatalogEvent {
     /// The topic, in the grammar of §6.1.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::method_name")
+    )]
     pub topic: String,
     /// Prose for a human reading the contract.
     #[serde(
@@ -51,9 +76,13 @@ pub struct CatalogEvent {
     )]
     pub description: Option<String>,
     /// JSON Schema 2020-12 document for `evt.payload`.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::open_object")
+    )]
     pub payload: Value,
     /// True when events on this topic carry a `streamId` and an `end` marker.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default_flag")]
     pub stream: bool,
 }
 
@@ -76,8 +105,16 @@ pub struct CatalogEvent {
 #[cfg_attr(feature = "schema", schemars(rename = "catalog"))]
 pub struct Catalog {
     /// Contract name, 1 to 128 characters.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::peer_label")
+    )]
     pub name: String,
     /// Contract version, 1 to 128 characters, opaque to the protocol.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::peer_label")
+    )]
     pub version: String,
     /// Prose for a human reading the contract.
     #[serde(
@@ -96,13 +133,17 @@ pub struct Catalog {
     /// Every method the contract offers.
     pub methods: Vec<CatalogMethod>,
     /// Every event topic the contract emits; a missing member reads as none.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<CatalogEvent>,
     /// JSON Schema of the `hello.capabilities` object this contract expects.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present::option"
+    )]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::open_object")
     )]
     pub capabilities: Option<Value>,
 }
@@ -211,11 +252,13 @@ mod tests {
     }
 
     #[test]
-    fn events_are_serialised_even_when_empty() {
+    fn an_emptied_collection_is_not_serialised() {
         let mut catalog = sample();
         catalog.events.clear();
+        catalog.methods[0].capabilities.clear();
         let value: Value = serde_json::to_value(&catalog).expect("serialises");
-        assert_eq!(value["events"], json!([]));
+        assert!(value.get("events").is_none(), "{value}");
+        assert!(value["methods"][0].get("capabilities").is_none(), "{value}");
     }
 
     #[test]
@@ -255,6 +298,19 @@ mod tests {
         assert_eq!(
             catalog.validate().expect_err("empty name").field,
             "catalog.name"
+        );
+    }
+
+    #[test]
+    fn keeps_absent_optional_members_absent() {
+        let text =
+            r#"{"name":"c","version":"1.0.0","methods":[{"name":"a.b","params":{},"result":{}}]}"#;
+        let catalog: Catalog = serde_json::from_str(text).expect("deserialises");
+
+        assert_eq!(
+            serde_json::to_string(&catalog).expect("serialises"),
+            text,
+            "an optional member absent on the wire is absent again when re-serialised"
         );
     }
 

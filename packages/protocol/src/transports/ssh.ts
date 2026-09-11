@@ -7,6 +7,7 @@
  */
 
 import type { ExitStatus } from './spawn';
+import { lastNonEmptyLine } from './text';
 
 export interface SshArgvOptions {
   readonly host: string;
@@ -168,13 +169,4 @@ function quoteRemotePath(remotePath: string): string {
 /** POSIX single quoting: everything is literal, and a quote closes and reopens. */
 function singleQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
-}
-
-function lastNonEmptyLine(text: string): string | undefined {
-  const lines = text.split('\n');
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    const line = lines[index]?.trim();
-    if (line !== undefined && line.length > 0) return line;
-  }
-  return undefined;
 }

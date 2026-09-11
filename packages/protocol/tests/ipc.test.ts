@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test';
+import { EventEmitter } from 'node:events';
 import { statSync } from 'node:fs';
 import { rename, stat } from 'node:fs/promises';
 import {
@@ -10,6 +11,7 @@ import {
 import { CLOSE_CODES } from '../src/close';
 import { RESERVED_ERROR_CODES } from '../src/errors';
 import type { Port } from '../src/port';
+import type { Frame } from '../src/schemas/frames';
 import { Session, type SessionOptions } from '../src/session';
 import {
   CONFORMANCE_A,
@@ -117,6 +119,102 @@ describe('local socket transport', () => {
 
   it('rejects a connection to a path with no listener', async () => {
     expect(await rejectionOf(connectIpc(nextPath()))).toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('gives up on a connection nobody completes once the deadline passes', async () => {
+    const path = nextPath();
+    const connector = new StalledConnector();
+
+    const rejection = await rejectionOf(
+      connectIpc(path, { timeoutMs: 30, connect: connector.connect })
+    );
+
+    expect(rejection).toMatchObject({ name: 'TimeoutError' });
+    expect((rejection as Error).message).toBe(
+      `The connection to ${path} timed out after 30 ms; expected the peer to accept it.`
+    );
+    // A dial that gave up owns the descriptor it opened.
+    expect(connector.only.destroyed).toBe(true);
+  });
+
+  it('abandons a connection when the signal aborts, and destroys the socket', async () => {
+    const connector = new StalledConnector();
+    const controller = new AbortController();
+    const dial = connectIpc(nextPath(), {
+      signal: controller.signal,
+      connect: connector.connect,
+    });
+
+    controller.abort();
+
+    expect(await rejectionOf(dial)).toMatchObject({ name: 'AbortError' });
+    expect(connector.only.destroyed).toBe(true);
+  });
+
+  it('refuses a connection whose signal has already aborted, and dials nothing', async () => {
+    const connector = new StalledConnector();
+
+    const rejection = await rejectionOf(
+      connectIpc(nextPath(), {
+        signal: AbortSignal.abort(new Error('gone before we dialled')),
+        connect: connector.connect,
+      })
+    );
+
+    expect((rejection as Error).message).toBe('gone before we dialled');
+    expect(connector.sockets).toHaveLength(0);
+  });
+
+  it('rejects when the connector refuses the address outright', async () => {
+    const rejection = await rejectionOf(
+      connectIpc(nextPath(), { timeoutMs: 30, connect: new RefusingConnector().connect })
+    );
+
+    expect(rejection).toMatchObject({ code: 'ENOTSOCK' });
+  });
+
+  it('keeps listening for errors on a socket it gave up on and destroyed', async () => {
+    const connector = new StalledConnector();
+
+    const rejection = await rejectionOf(
+      connectIpc(nextPath(), { timeoutMs: 20, connect: connector.connect })
+    );
+
+    expect(rejection).toMatchObject({ name: 'TimeoutError' });
+    // A destroyed socket that still reports — a pipe the peer reset — reaches
+    // an `EventEmitter`, and an `error` with no listener there is rethrown as
+    // an uncaught exception rather than ignored.
+    expect(() => connector.only.emit('error', new Error('ECONNRESET'))).not.toThrow();
+  });
+
+  it('refuses a deadline that is not a positive number of milliseconds', async () => {
+    expect(await rejectionOf(connectIpc(nextPath(), { timeoutMs: 0 }))).toMatchObject({
+      message:
+        'timeoutMs is 0; expected a positive finite number of milliseconds, or none for no deadline',
+    });
+  });
+
+  it('clears the deadline of a connection that was made', async () => {
+    const path = nextPath();
+    const { accepted, accept } = acceptOne();
+    const server = await listenIpc(path, accept);
+    try {
+      const client = await connectIpc(path, { timeoutMs: 30 });
+      const host = await accepted;
+      const frames: Frame[] = [];
+      client.onFrame((frame) => frames.push(frame));
+
+      // Well past the deadline: a timer left running would have destroyed the
+      // socket under a connection that had already succeeded.
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      host.send({ type: 'ping' });
+      await tick();
+
+      expect(frames).toEqual([{ type: 'ping' }]);
+      client.close(CLOSE_CODES.RELEASED);
+    } finally {
+      await server.close();
+    }
   });
 
   it('sends close 4000 to every open session before it stops listening', async () => {
@@ -276,6 +374,45 @@ describe('ipcPath', () => {
     });
   }
 });
+
+/**
+ * A socket that never connects and never fails, the way a dial to an address
+ * whose listener accepts nothing behaves. A real listener cannot stand in for
+ * one: the kernel completes the connection into the accept queue, so
+ * `connectIpc` resolves before anybody accepts it.
+ */
+class StalledSocket extends EventEmitter {
+  destroyed = false;
+
+  destroy(): void {
+    this.destroyed = true;
+  }
+}
+
+/** A dialler that refuses the address before it opens anything, as `net.connect` does for a path that is not a socket. */
+class RefusingConnector {
+  readonly connect = (_path: string): Socket => {
+    throw Object.assign(new Error('the address is not a socket'), { code: 'ENOTSOCK' });
+  };
+}
+
+/** Hands out `StalledSocket`s and remembers them, in place of `net.connect`. */
+class StalledConnector {
+  readonly sockets: StalledSocket[] = [];
+
+  readonly connect = (_path: string): Socket => {
+    const socket = new StalledSocket();
+    this.sockets.push(socket);
+    return socket as unknown as Socket;
+  };
+
+  /** The one socket the dial opened. */
+  get only(): StalledSocket {
+    const socket = this.sockets[0];
+    if (socket === undefined) throw new Error('the dial never opened a socket');
+    return socket;
+  }
+}
 
 /** True once the far end stopped accepting bytes, meaning it let the socket go. */
 async function writesRefusedWithin(socket: Socket, timeoutMs: number): Promise<boolean> {

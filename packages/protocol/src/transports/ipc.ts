@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CLOSE_CODES } from '../close';
 import type { Port } from '../port';
+import { abortReason, type ConnectDeadlineOptions, connectDeadline } from './deadline';
 import { asError, createStreamPort } from './node-stream';
 
 /** Owner-only, the permission local-socket.md requires of a POSIX socket file. */
@@ -27,6 +28,12 @@ const WINDOWS = process.platform === 'win32';
 export interface IpcOptions {
   /** Largest line the decoder accepts; the 16 MiB default of §11 when absent. */
   readonly maxFrameBytes?: number;
+}
+
+/** How `connectIpc` dials, on top of how the port frames. */
+export interface ConnectIpcOptions extends IpcOptions, ConnectDeadlineOptions {
+  /** Injected connector, for tests and for a runtime with its own dialler. */
+  readonly connect?: (path: string) => Socket;
 }
 
 /** A listener, and the address it actually bound. */
@@ -128,22 +135,79 @@ export async function listenIpc(
  * promise rejects with the operating system's error when the path has no
  * listener.
  *
+ * An attempt nobody completes would otherwise stay in flight for as long as
+ * the process lives: a listener whose accept queue no one drains, a named pipe
+ * whose server stopped answering. `timeoutMs` and `signal` bound it — the
+ * socket is destroyed and the promise rejects with a `TimeoutError` or with
+ * the reason the caller aborted with.
+ *
  * @example
- * const session = new Session(await connectIpc(ipcPath('mango-hub')), { peer });
+ * const session = new Session(await connectIpc(ipcPath('mango-hub'), { timeoutMs: 5000 }), {
+ *   peer,
+ * });
  */
-export function connectIpc(path: string, options: IpcOptions = {}): Promise<Port> {
+export function connectIpc(path: string, options: ConnectIpcOptions = {}): Promise<Port> {
   return new Promise((resolve, reject) => {
-    const socket = connectSocket(path);
-    const onError = (error: Error): void => {
-      socket.destroy();
-      reject(error);
+    const deadline = connectDeadline(path, options);
+    if (deadline.signal.aborted) {
+      deadline.dispose();
+      reject(abortReason(path, deadline.signal));
+      return;
+    }
+
+    let socket: Socket;
+    try {
+      socket = (options.connect ?? connectSocket)(path);
+    } catch (cause) {
+      // A dialler that refuses the address before it opens anything settles
+      // here, and the deadline it was given must not outlive the attempt.
+      deadline.dispose();
+      reject(asError(cause));
+      return;
+    }
+
+    let settled = false;
+    const finish = (settleWith: () => void): void => {
+      if (settled) return;
+      settled = true;
+      socket.removeListener('error', onError);
+      deadline.signal.removeEventListener('abort', onAbort);
+      deadline.dispose();
+      settleWith();
     };
+    const onError = (error: Error): void => {
+      finish(() => {
+        discard(socket);
+        reject(error);
+      });
+    };
+    function onAbort(): void {
+      finish(() => {
+        discard(socket);
+        reject(abortReason(path, deadline.signal));
+      });
+    }
+
+    deadline.signal.addEventListener('abort', onAbort, { once: true });
     socket.once('error', onError);
     socket.once('connect', () => {
-      socket.removeListener('error', onError);
-      resolve(ipcSocketPort(socket, options));
+      finish(() => resolve(ipcSocketPort(socket, options)));
     });
   });
+}
+
+/**
+ * Lets go of a socket the attempt abandoned. `finish` has already removed the
+ * listener that settled the promise, so a socket that reports after it was
+ * destroyed — a pipe the peer reset, a dialler of the caller's own — would
+ * reach an `EventEmitter` with no `error` listener, and one of those is
+ * rethrown as an uncaught exception rather than ignored.
+ */
+function discard(socket: Socket): void {
+  socket.on('error', () => {
+    // The rejection already said why this attempt ended.
+  });
+  socket.destroy();
 }
 
 /**

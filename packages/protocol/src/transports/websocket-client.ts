@@ -9,6 +9,7 @@
 
 import { CLOSE_CODES } from '../close';
 import type { Port } from '../port';
+import { abortReason, type ConnectDeadlineOptions, connectDeadline } from './deadline';
 import {
   createWebSocketPort,
   WEBSOCKET_SUBPROTOCOL,
@@ -39,15 +40,13 @@ export interface WhatwgWebSocketLike {
 }
 
 /** How `connectWebSocket` dials, on top of how the port frames. */
-export interface ConnectWebSocketOptions extends WebSocketPortOptions {
+export interface ConnectWebSocketOptions extends WebSocketPortOptions, ConnectDeadlineOptions {
   /**
    * Upgrade request headers, the place the reference bearer token goes.
    * Browsers and Node's global `WebSocket` cannot set them; see
    * `connectWebSocket`.
    */
   readonly headers?: Readonly<Record<string, string>>;
-  /** Aborts the attempt; the socket is closed and the promise rejects. */
-  readonly signal?: AbortSignal;
   /** Injected constructor, for tests and for runtimes without a global one. */
   readonly WebSocket?: new (
     url: string,
@@ -98,9 +97,11 @@ export function connectWebSocket(
   options: ConnectWebSocketOptions = {}
 ): Promise<Port> {
   return new Promise<Port>((resolve, reject) => {
-    const signal = options.signal;
-    if (signal?.aborted === true) {
-      reject(abortError(url, signal));
+    const deadline = connectDeadline(url, options);
+    const signal = deadline.signal;
+    if (signal.aborted) {
+      deadline.dispose();
+      reject(abortReason(url, signal));
       return;
     }
 
@@ -108,6 +109,7 @@ export function connectWebSocket(
     try {
       socket = createSocket(url, options);
     } catch (cause) {
+      deadline.dispose();
       reject(new Error(`WebSocket to ${url} could not be created: ${describe(cause)}`, { cause }));
       return;
     }
@@ -117,17 +119,18 @@ export function connectWebSocket(
     const finish = (settleWith: () => void): void => {
       if (settled) return;
       settled = true;
-      signal?.removeEventListener('abort', onAbort);
+      signal.removeEventListener('abort', onAbort);
+      deadline.dispose();
       settleWith();
     };
 
     function onAbort(): void {
       finish(() => {
         socket.close(CLOSE_CODES.RELEASED, 'dial aborted');
-        reject(abortError(url, signal));
+        reject(abortReason(url, signal));
       });
     }
-    signal?.addEventListener('abort', onAbort, { once: true });
+    signal.addEventListener('abort', onAbort, { once: true });
 
     socket.addEventListener('open', () => {
       if (socket.protocol !== WEBSOCKET_SUBPROTOCOL) {
@@ -237,14 +240,6 @@ function createSocket(url: string, options: ConnectWebSocketOptions): WhatwgWebS
     protocols: readonly string[]
   ) => WhatwgWebSocketLike;
   return new withProtocols(url, settings.protocols);
-}
-
-function abortError(url: string, signal: AbortSignal | undefined): Error {
-  const reason: unknown = signal?.reason;
-  if (reason instanceof Error) return reason;
-  return Object.assign(new Error(`The WebSocket dial to ${url} was aborted.`), {
-    name: 'AbortError',
-  });
 }
 
 function describe(value: unknown): string {

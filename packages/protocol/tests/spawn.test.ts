@@ -7,7 +7,15 @@ import { CLOSE_CODES } from '../src/close';
 import type { PortClosure } from '../src/port';
 import { Session } from '../src/session';
 import { CONFORMANCE_A } from '../src/testing/conformance';
-import { type SpawnChild, sanitizedEnv, spawnPort, withErrorCode } from '../src/transports/spawn';
+import { createInProcessPortPair } from '../src/transports/in-process';
+import {
+  type ExitStatus,
+  type SpawnChild,
+  type SpawnedPeer,
+  sanitizedEnv,
+  spawnPort,
+  withErrorCode,
+} from '../src/transports/spawn';
 
 const WINDOWS = process.platform === 'win32';
 
@@ -33,6 +41,36 @@ class FakeChildProcess extends EventEmitter {
   }
 }
 
+/**
+ * A peer a caller implements themselves, carrying only what `SpawnedPeer` has
+ * always asked for. It exists to make `bun run check` fail if a member is ever
+ * added to that interface: everything this SDK learns about a launch belongs
+ * on `LaunchedPeer`, which only `spawnPort` has to satisfy.
+ */
+class InProcessPeer implements SpawnedPeer {
+  readonly port = createInProcessPortPair().a;
+  readonly pid = undefined;
+  readonly exited = Promise.resolve({ code: 0, signal: null });
+
+  stderrTail(): string {
+    return '';
+  }
+
+  async terminate(): Promise<ExitStatus> {
+    return await this.exited;
+  }
+}
+
+/**
+ * A child-process call that throws rather than returning a child, which is how
+ * Bun on Windows reports a command it cannot start.
+ */
+class RefusingSpawn {
+  readonly spawn: SpawnChild = () => {
+    throw Object.assign(new Error('Executable not found in $PATH: "runtime"'), { code: 'EACCES' });
+  };
+}
+
 /** Records what the launcher asks the child-process API for, and starts nothing. */
 class RecordingSpawn {
   readonly calls: {
@@ -56,6 +94,16 @@ class RecordingSpawn {
 }
 
 describe('spawn launcher', () => {
+  it('takes a peer a caller implemented themselves wherever a SpawnedPeer is asked for', async () => {
+    const peer: SpawnedPeer = new InProcessPeer();
+
+    expect(peer.stderrTail()).toBe('');
+    expect(await peer.terminate()).toEqual({ code: 0, signal: null });
+    // Why a launch failed is something only this launcher observes, so it sits
+    // on `LaunchedPeer` and a caller's own peer owes nothing towards it.
+    expect('startError' in peer).toBe(false);
+  });
+
   it('completes the handshake and round-trips a request with a real child', async () => {
     const peer = spawnPort({ argv: [BUN, ECHO_CHILD] });
     try {
@@ -130,6 +178,71 @@ describe('spawn launcher', () => {
     expect(await peer.exited).toEqual({ code: null, signal: null });
     expect(closures).toEqual([{ kind: 'closed', reason: expect.stringContaining('ENOENT') }]);
     expect(peer.stderrTail()).toContain('ENOENT');
+  });
+
+  it('reports a refused launch as an exit status and the last line the child wrote', async () => {
+    const peer = spawnPort({
+      argv: [
+        BUN,
+        '-e',
+        'process.stderr.write("boot failed\\nmissing config\\n"); process.exit(78)',
+      ],
+    });
+
+    expect(await peer.startError()).toEqual({
+      exit: { code: 78, signal: null },
+      spawnErrorCode: undefined,
+      stderrLine: 'missing config',
+    });
+  });
+
+  it('reports a launch whose exit has not landed yet rather than waiting for it', async () => {
+    // The pipes closing and the exit landing are not ordered: a caller that
+    // assumed the status was already there would report nothing at all.
+    const recording = new RecordingSpawn();
+    const peer = spawnPort({ argv: ['runtime'] }, recording.spawn);
+    recording.child.stderr.write('still running\n');
+    await waitFor(() => peer.stderrTail().includes('still running'));
+
+    const startError = await peer.startError(20);
+
+    expect(startError).toEqual({
+      exit: undefined,
+      spawnErrorCode: undefined,
+      stderrLine: 'still running',
+    });
+  });
+
+  it('names the spawn error code of a command that never became a process', async () => {
+    const peer = spawnPort({ argv: [MISSING_COMMAND] });
+
+    const startError = await peer.startError();
+
+    expect(startError.spawnErrorCode).toBe('ENOENT');
+    // A spawn that never produced a process has a resolved, empty status.
+    expect(startError.exit).toEqual({ code: null, signal: null });
+    expect(startError.stderrLine).toContain('ENOENT');
+  });
+
+  it('names the spawn error code when the child-process call throws instead', async () => {
+    const peer = spawnPort({ argv: ['runtime'] }, new RefusingSpawn().spawn);
+
+    expect(await peer.startError()).toEqual({
+      exit: { code: null, signal: null },
+      spawnErrorCode: 'EACCES',
+      stderrLine: 'EACCES: Executable not found in $PATH: "runtime"',
+    });
+  });
+
+  it('leaves the spawn error code unset for a child that did start', async () => {
+    const recording = new RecordingSpawn();
+    const peer = spawnPort({ argv: ['runtime'] }, recording.spawn);
+    // A remote shell that prints ENOENT for its own reasons is not a spawn
+    // failure, and the launcher knows which one it saw without reading bytes.
+    recording.child.stderr.write('bash: line 1: mango-runtime: ENOENT\n');
+    await waitFor(() => peer.stderrTail().includes('ENOENT'));
+
+    expect((await peer.startError(20)).spawnErrorCode).toBeUndefined();
   });
 
   it('gives the child exactly the environment it was handed', async () => {

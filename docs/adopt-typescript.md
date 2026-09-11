@@ -65,6 +65,12 @@ A child that cannot start at all (`ENOENT`, `EACCES`) is not an exception: the p
 error is appended to `child.stderrTail()`, so one code path builds the message either way.
 `classifySshExit(status, tail)` turns those two observations into a sentence for an ssh launch.
 
+`await child.startError()` collects the same observations in one shape for a launch that never
+reached a handshake: the exit status, the `spawnErrorCode` of a command that never became a
+process, and the last line the child wrote. It waits a short grace for the exit, because the
+pipes closing and the exit landing are not ordered, and reports `exit: undefined` rather than
+inventing a status when the grace runs out.
+
 `spawnPort` passes only the environment you give it, keeps a tail of stderr for error reports,
 and on close sends SIGTERM then SIGKILL after a grace period. The launcher decides what to run;
 WSL and container wrappers are argv arrays the application builds.
@@ -75,8 +81,14 @@ WSL and container wrappers are argv arrays the application builds.
 import { connectIpc, listenIpc, ipcPath } from '@mangostudio/protocol/ipc';
 const path = ipcPath('mango-hub'); // \\.\pipe\mango-hub or $XDG_RUNTIME_DIR/mango-hub.sock
 const server = await listenIpc(path, (port) => new Session(port, { peer, handlers }));
-const client = new Session(await connectIpc(path), { peer });
+const client = new Session(await connectIpc(path, { timeoutMs: 5000 }), { peer });
 ```
+
+`connectIpc` and `connectWebSocket` both take `timeoutMs` and `signal`. Without one, an
+attempt nobody completes — a listener whose accept queue no one drains, a pipe whose server
+stopped answering — stays in flight for as long as the process lives. A deadline that passes
+destroys what the dial opened and rejects with a `TimeoutError`; an abort rejects with the
+reason the caller gave.
 
 On POSIX the socket is owner-only from the moment it exists, and a stale socket
 file left by a crashed listener is replaced. On Windows the named pipe is **not**

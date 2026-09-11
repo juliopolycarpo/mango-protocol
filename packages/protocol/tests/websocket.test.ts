@@ -220,6 +220,17 @@ describe('websocket transport upgrade and framing', () => {
     ).rejects.toThrow(/selected subprotocol ""; expected "mango.v1"/);
   });
 
+  it('rejects the dial when the socket closes before it ever opened', async () => {
+    // A dial the acceptor hangs up on settles on the close event alone: no
+    // `open` and no `error` follow it, so a promise that waited for one of
+    // those would stay pending for the lifetime of the process.
+    await expect(
+      connectWebSocket('ws://example.invalid/hub', { WebSocket: ClosedBeforeOpenWebSocket })
+    ).rejects.toThrow(
+      'WebSocket to ws://example.invalid/hub closed with code 1006: the acceptor hung up before it opened.'
+    );
+  });
+
   it('abandons a dial when the signal aborts, and closes the socket', async () => {
     const sockets: StalledWebSocket[] = [];
     const controller = new AbortController();
@@ -237,6 +248,37 @@ describe('websocket transport upgrade and framing', () => {
 
     await expect(dial).rejects.toMatchObject({ name: 'AbortError' });
     expect(sockets[0]?.closes).toEqual([CLOSE_CODES.RELEASED]);
+  });
+
+  it('abandons a dial that never opens once the deadline passes', async () => {
+    const sockets: StalledWebSocket[] = [];
+    const dial = connectWebSocket('ws://example.invalid/hub', {
+      timeoutMs: 30,
+      WebSocket: class extends StalledWebSocket {
+        constructor(url: string) {
+          super(url);
+          sockets.push(this);
+        }
+      },
+    });
+
+    await expect(dial).rejects.toMatchObject({
+      name: 'TimeoutError',
+      message:
+        'The connection to ws://example.invalid/hub timed out after 30 ms; expected the peer to accept it.',
+    });
+    expect(sockets[0]?.closes).toEqual([CLOSE_CODES.RELEASED]);
+  });
+
+  it('refuses a deadline that is not a positive number of milliseconds', async () => {
+    await expect(
+      connectWebSocket('ws://example.invalid/hub', {
+        timeoutMs: Number.POSITIVE_INFINITY,
+        WebSocket: StalledWebSocket,
+      })
+    ).rejects.toThrow(
+      'timeoutMs is Infinity; expected a positive finite number of milliseconds, or none for no deadline'
+    );
   });
 
   it('refuses a dial whose signal has already aborted', async () => {
@@ -268,6 +310,36 @@ class StalledWebSocket implements WhatwgWebSocketLike {
 
   addEventListener(_type: string, _listener: (event: never) => void): void {
     // A stalled socket fires nothing; the test drives the signal instead.
+  }
+}
+
+/** A socket the acceptor hangs up on: `close` arrives and `open` never does. */
+class ClosedBeforeOpenWebSocket implements WhatwgWebSocketLike {
+  binaryType = 'blob';
+  readyState = 0;
+  readonly protocol = '';
+  readonly #listeners = new Map<string, ((event: never) => void)[]>();
+
+  constructor(_url: string, _settings: { readonly protocols: readonly string[] }) {
+    queueMicrotask(() => {
+      this.readyState = 3;
+      const event = { code: 1006, reason: 'the acceptor hung up' };
+      for (const listener of this.#listeners.get('close') ?? []) listener(event as never);
+    });
+  }
+
+  send(_data: Uint8Array): void {
+    throw new Error('ClosedBeforeOpenWebSocket never opens; expected no send.');
+  }
+
+  close(code?: number): void {
+    throw new Error(`ClosedBeforeOpenWebSocket is already closed; expected no close(${code}).`);
+  }
+
+  addEventListener(type: string, listener: (event: never) => void): void {
+    const listeners = this.#listeners.get(type) ?? [];
+    listeners.push(listener);
+    this.#listeners.set(type, listeners);
   }
 }
 
