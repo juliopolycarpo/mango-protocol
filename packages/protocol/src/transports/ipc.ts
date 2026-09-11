@@ -177,13 +177,13 @@ export function connectIpc(path: string, options: ConnectIpcOptions = {}): Promi
     };
     const onError = (error: Error): void => {
       finish(() => {
-        socket.destroy();
+        discard(socket);
         reject(error);
       });
     };
     function onAbort(): void {
       finish(() => {
-        socket.destroy();
+        discard(socket);
         reject(abortReason(path, deadline.signal));
       });
     }
@@ -194,6 +194,20 @@ export function connectIpc(path: string, options: ConnectIpcOptions = {}): Promi
       finish(() => resolve(ipcSocketPort(socket, options)));
     });
   });
+}
+
+/**
+ * Lets go of a socket the attempt abandoned. `finish` has already removed the
+ * listener that settled the promise, so a socket that reports after it was
+ * destroyed — a pipe the peer reset, a dialler of the caller's own — would
+ * reach an `EventEmitter` with no `error` listener, and one of those is
+ * rethrown as an uncaught exception rather than ignored.
+ */
+function discard(socket: Socket): void {
+  socket.on('error', () => {
+    // The rejection already said why this attempt ended.
+  });
+  socket.destroy();
 }
 
 /**

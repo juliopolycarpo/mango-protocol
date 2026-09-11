@@ -178,6 +178,20 @@ describe('local socket transport', () => {
     expect(rejection).toMatchObject({ code: 'ENOTSOCK' });
   });
 
+  it('keeps listening for errors on a socket it gave up on and destroyed', async () => {
+    const connector = new StalledConnector();
+
+    const rejection = await rejectionOf(
+      connectIpc(nextPath(), { timeoutMs: 20, connect: connector.connect })
+    );
+
+    expect(rejection).toMatchObject({ name: 'TimeoutError' });
+    // A destroyed socket that still reports — a pipe the peer reset — reaches
+    // an `EventEmitter`, and an `error` with no listener there is rethrown as
+    // an uncaught exception rather than ignored.
+    expect(() => connector.only.emit('error', new Error('ECONNRESET'))).not.toThrow();
+  });
+
   it('refuses a deadline that is not a positive number of milliseconds', async () => {
     expect(await rejectionOf(connectIpc(nextPath(), { timeoutMs: 0 }))).toMatchObject({
       message:
