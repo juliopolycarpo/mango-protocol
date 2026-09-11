@@ -132,6 +132,75 @@ describe('spawn launcher', () => {
     expect(peer.stderrTail()).toContain('ENOENT');
   });
 
+  it('reports a refused launch as an exit status and the last line the child wrote', async () => {
+    const peer = spawnPort({
+      argv: [
+        BUN,
+        '-e',
+        'process.stderr.write("boot failed\\nmissing config\\n"); process.exit(78)',
+      ],
+    });
+
+    expect(await peer.startError()).toEqual({
+      exit: { code: 78, signal: null },
+      spawnErrorCode: undefined,
+      stderrLine: 'missing config',
+    });
+  });
+
+  it('reports a launch whose exit has not landed yet rather than waiting for it', async () => {
+    // The pipes closing and the exit landing are not ordered: a caller that
+    // assumed the status was already there would report nothing at all.
+    const recording = new RecordingSpawn();
+    const peer = spawnPort({ argv: ['runtime'] }, recording.spawn);
+    recording.child.stderr.write('still running\n');
+    await waitFor(() => peer.stderrTail().includes('still running'));
+
+    const startError = await peer.startError(20);
+
+    expect(startError).toEqual({
+      exit: undefined,
+      spawnErrorCode: undefined,
+      stderrLine: 'still running',
+    });
+  });
+
+  it('names the spawn error code of a command that never became a process', async () => {
+    const peer = spawnPort({ argv: [MISSING_COMMAND] });
+
+    const startError = await peer.startError();
+
+    expect(startError.spawnErrorCode).toBe('ENOENT');
+    // A spawn that never produced a process has a resolved, empty status.
+    expect(startError.exit).toEqual({ code: null, signal: null });
+    expect(startError.stderrLine).toContain('ENOENT');
+  });
+
+  it('names the spawn error code when the child-process call throws instead', async () => {
+    const peer = spawnPort({ argv: ['runtime'] }, () => {
+      throw Object.assign(new Error('Executable not found in $PATH: "runtime"'), {
+        code: 'EACCES',
+      });
+    });
+
+    expect(await peer.startError()).toEqual({
+      exit: { code: null, signal: null },
+      spawnErrorCode: 'EACCES',
+      stderrLine: 'EACCES: Executable not found in $PATH: "runtime"',
+    });
+  });
+
+  it('leaves the spawn error code unset for a child that did start', async () => {
+    const recording = new RecordingSpawn();
+    const peer = spawnPort({ argv: ['runtime'] }, recording.spawn);
+    // A remote shell that prints ENOENT for its own reasons is not a spawn
+    // failure, and the launcher knows which one it saw without reading bytes.
+    recording.child.stderr.write('bash: line 1: mango-runtime: ENOENT\n');
+    await waitFor(() => peer.stderrTail().includes('ENOENT'));
+
+    expect((await peer.startError(20)).spawnErrorCode).toBeUndefined();
+  });
+
   it('gives the child exactly the environment it was handed', async () => {
     process.env.MANGO_TEST_LEAK = 'leaked';
     const chunks: string[] = [];

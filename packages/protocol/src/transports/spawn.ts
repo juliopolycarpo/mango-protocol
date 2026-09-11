@@ -26,6 +26,30 @@ export interface ExitStatus {
   readonly signal: string | null;
 }
 
+/**
+ * What a launch that never reached a handshake left behind, in the one shape a
+ * caller needs to say why: the child's status, whether it ever became a
+ * process, and the last thing it said.
+ */
+export interface SpawnStartError {
+  /**
+   * How the child ended, or **undefined** when the exit had not landed inside
+   * the grace. The pipes closing and the exit are not ordered, so "not known
+   * yet" is a state of its own rather than an exit with no code.
+   */
+  readonly exit: ExitStatus | undefined;
+  /**
+   * `code` of the spawn error when the command never became a process
+   * (`ENOENT`, `EACCES`); undefined whenever a child was created, however
+   * badly it then behaved. A remote shell that prints `ENOENT` for its own
+   * reasons never lands here: this is the launcher's own observation, not a
+   * reading of the child's bytes.
+   */
+  readonly spawnErrorCode: string | undefined;
+  /** Last non-empty line of the stderr tail; empty when the child said nothing. */
+  readonly stderrLine: string;
+}
+
 export interface SpawnOptions {
   /** The command and its arguments. Never a shell string: arguments stay data. */
   readonly argv: readonly string[];
@@ -78,6 +102,14 @@ export interface SpawnedPeer {
    * best effort, as any tail of a pipe is.
    */
   stderrTail(): string;
+  /**
+   * Why a launch that never reached a handshake failed, read once the child
+   * has had `graceMs` to report how it ended. A refused launch is nearly
+   * always gone already — a wrapper that could not start its target exits at
+   * once — but the pipe closing and the exit are not ordered, and a caller
+   * reading the status before it lands would see nothing at all.
+   */
+  startError(graceMs?: number): Promise<SpawnStartError>;
   /** Closes stdin, then escalates to `SIGTERM` and `SIGKILL`. Idempotent. */
   terminate(): Promise<ExitStatus>;
 }
@@ -88,6 +120,9 @@ const DEFAULT_STDERR_TAIL_BYTES = 16 * 1024;
 /** Reference grace periods of the termination sequence (spawn.md, Termination). */
 const DEFAULT_TERMINATE_GRACE_MS = 2000;
 const DEFAULT_KILL_GRACE_MS = 2000;
+
+/** How long `startError` waits for an exit status that has not landed yet. */
+const DEFAULT_START_ERROR_GRACE_MS = 250;
 
 const WINDOWS = process.platform === 'win32';
 
@@ -169,14 +204,15 @@ export function spawnPort(options: SpawnOptions, spawnChild: SpawnChild = spawn)
     resolveByteCeiling('stderrTailBytes', options.stderrTailBytes, DEFAULT_STDERR_TAIL_BYTES, 1)
   );
   const exit = deferredExit();
+  const launch = new LaunchRecord();
 
-  const child = start(spawnChild, command, options.argv.slice(1), options, tail, exit);
+  const child = start(spawnChild, command, options.argv.slice(1), options, tail, exit, launch);
   const limit = options.maxFrameBytes !== undefined ? { maxFrameBytes: options.maxFrameBytes } : {};
   const handle =
     child?.stdin && child.stdout
       ? createStreamPort(child.stdout, child.stdin, limit)
       : createNdjsonPort({ sink: unspawnedSink(), ...limit });
-  wire(child, handle, options, tail, exit);
+  wire(child, handle, options, tail, exit, launch);
 
   let termination: Promise<ExitStatus> | undefined;
   const terminate = (): Promise<ExitStatus> => {
@@ -193,7 +229,29 @@ export function spawnPort(options: SpawnOptions, spawnChild: SpawnChild = spawn)
     pid: child?.pid,
     exited: exit.promise,
     stderrTail: () => tail.text(),
+    startError: (graceMs = DEFAULT_START_ERROR_GRACE_MS) =>
+      observeStartError(exit.promise, tail, launch, graceMs),
     terminate,
+  };
+}
+
+/**
+ * Reads the launch failure once the exit has had its grace to land. The status
+ * is left undefined rather than invented when the grace runs out, because a
+ * caller telling somebody what to do about the failure must be able to tell
+ * "the child exited without a code" from "the child had not exited yet".
+ */
+async function observeStartError(
+  exited: Promise<ExitStatus>,
+  tail: BoundedTail,
+  launch: LaunchRecord,
+  graceMs: number
+): Promise<SpawnStartError> {
+  const landed = await settledWithin(exited, graceMs);
+  return {
+    exit: landed ? await exited : undefined,
+    spawnErrorCode: launch.spawnErrorCode,
+    stderrLine: lastNonEmptyLine(tail.text()) ?? '',
   };
 }
 
@@ -208,7 +266,8 @@ function start(
   args: readonly string[],
   options: SpawnOptions,
   tail: BoundedTail,
-  exit: DeferredExit
+  exit: DeferredExit,
+  launch: LaunchRecord
 ): ChildProcess | undefined {
   try {
     return spawnChild(command, [...args], {
@@ -218,7 +277,9 @@ function start(
       windowsHide: options.windowsHide ?? true,
     });
   } catch (cause) {
-    tail.appendText(`\n${withErrorCode(asError(cause)).message}\n`);
+    const error = withErrorCode(asError(cause));
+    launch.refused(error);
+    tail.appendText(`\n${error.message}\n`);
     exit.settle({ code: null, signal: null });
     return undefined;
   }
@@ -230,7 +291,8 @@ function wire(
   handle: NdjsonPortHandle,
   options: SpawnOptions,
   tail: BoundedTail,
-  exit: DeferredExit
+  exit: DeferredExit,
+  launch: LaunchRecord
 ): void {
   if (child === undefined) {
     // Nothing will ever drive the port, so report the closure once the caller
@@ -246,6 +308,10 @@ function wire(
   child.on('exit', (code, signal) => exit.settle({ code, signal }));
   child.on('error', (cause) => {
     const error = withErrorCode(asError(cause));
+    // `pid` is undefined exactly when no process was created, which is what
+    // separates a command that could not be started from a later failure —
+    // a signal that could not be delivered — on a child that did start.
+    if (child.pid === undefined) launch.refused(error);
     tail.appendText(`\n${error.message}\n`);
     handle.failed(error);
     exit.settle({ code: null, signal: null });
@@ -369,6 +435,24 @@ function deferredExit(): DeferredExit {
   };
 }
 
+/**
+ * What the launcher itself observed about a launch that never produced a
+ * process. Kept apart from the stderr tail on purpose: the tail is the child's
+ * account of things, and a remote shell is free to print `ENOENT` in it.
+ */
+class LaunchRecord {
+  #spawnErrorCode: string | undefined;
+
+  /** Records the error of a command that never became a process. */
+  refused(error: Error): void {
+    this.#spawnErrorCode ??= errorCode(error);
+  }
+
+  get spawnErrorCode(): string | undefined {
+    return this.#spawnErrorCode;
+  }
+}
+
 /** The last N bytes written to it, so a diagnostic never grows without bound. */
 class BoundedTail {
   readonly #limit: number;
@@ -404,9 +488,31 @@ class BoundedTail {
  * withErrorCode(Object.assign(new Error('not found'), { code: 'ENOENT' })).message; // 'ENOENT: not found'
  */
 export function withErrorCode(error: Error): Error {
-  const code = (error as { code?: unknown }).code;
-  if (typeof code !== 'string' || code.length === 0 || error.message.includes(code)) return error;
+  const code = errorCode(error);
+  if (code === undefined || error.message.includes(code)) return error;
   const named = new Error(`${code}: ${error.message}`, { cause: error });
   (named as { code?: string }).code = code;
   return named;
+}
+
+/** The `code` an operating-system error carries, when it carries one. */
+function errorCode(error: Error): string | undefined {
+  const code = (error as { code?: unknown }).code;
+  return typeof code === 'string' && code.length > 0 ? code : undefined;
+}
+
+/**
+ * The last line of a diagnostic that says anything, which is where a program
+ * that failed to start puts its reason.
+ *
+ * @example
+ * lastNonEmptyLine('starting\nconfig missing\n'); // 'config missing'
+ */
+export function lastNonEmptyLine(text: string): string | undefined {
+  const lines = text.split('\n');
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]?.trim();
+    if (line !== undefined && line.length > 0) return line;
+  }
+  return undefined;
 }

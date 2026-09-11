@@ -65,6 +65,12 @@ A child that cannot start at all (`ENOENT`, `EACCES`) is not an exception: the p
 error is appended to `child.stderrTail()`, so one code path builds the message either way.
 `classifySshExit(status, tail)` turns those two observations into a sentence for an ssh launch.
 
+`await child.startError()` collects the same observations in one shape for a launch that never
+reached a handshake: the exit status, the `spawnErrorCode` of a command that never became a
+process, and the last line the child wrote. It waits a short grace for the exit, because the
+pipes closing and the exit landing are not ordered, and reports `exit: undefined` rather than
+inventing a status when the grace runs out.
+
 `spawnPort` passes only the environment you give it, keeps a tail of stderr for error reports,
 and on close sends SIGTERM then SIGKILL after a grace period. The launcher decides what to run;
 WSL and container wrappers are argv arrays the application builds.
