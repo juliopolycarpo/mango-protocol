@@ -41,15 +41,20 @@ pub struct CatalogMethod {
     )]
     pub result: Value,
     /// Members of `hello.capabilities` the responder requires before serving this method.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(
         feature = "schema",
         schemars(schema_with = "crate::schema::constraints::capability_names")
     )]
     pub capabilities: Vec<String>,
     /// True when the contract still serves the method but callers should move off it.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default_flag")]
     pub deprecated: bool,
+}
+
+/// True when a flag is at the value the wire leaves absent rather than stating.
+fn is_default_flag(flag: &bool) -> bool {
+    !*flag
 }
 
 /// One event topic a contract emits.
@@ -77,7 +82,7 @@ pub struct CatalogEvent {
     )]
     pub payload: Value,
     /// True when events on this topic carry a `streamId` and an `end` marker.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default_flag")]
     pub stream: bool,
 }
 
@@ -128,7 +133,7 @@ pub struct Catalog {
     /// Every method the contract offers.
     pub methods: Vec<CatalogMethod>,
     /// Every event topic the contract emits; a missing member reads as none.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<CatalogEvent>,
     /// JSON Schema of the `hello.capabilities` object this contract expects.
     #[serde(
@@ -247,11 +252,13 @@ mod tests {
     }
 
     #[test]
-    fn events_are_serialised_even_when_empty() {
+    fn an_emptied_collection_is_not_serialised() {
         let mut catalog = sample();
         catalog.events.clear();
+        catalog.methods[0].capabilities.clear();
         let value: Value = serde_json::to_value(&catalog).expect("serialises");
-        assert_eq!(value["events"], json!([]));
+        assert!(value.get("events").is_none(), "{value}");
+        assert!(value["methods"][0].get("capabilities").is_none(), "{value}");
     }
 
     #[test]
@@ -291,6 +298,19 @@ mod tests {
         assert_eq!(
             catalog.validate().expect_err("empty name").field,
             "catalog.name"
+        );
+    }
+
+    #[test]
+    fn keeps_absent_optional_members_absent() {
+        let text =
+            r#"{"name":"c","version":"1.0.0","methods":[{"name":"a.b","params":{},"result":{}}]}"#;
+        let catalog: Catalog = serde_json::from_str(text).expect("deserialises");
+
+        assert_eq!(
+            serde_json::to_string(&catalog).expect("serialises"),
+            text,
+            "an optional member absent on the wire is absent again when re-serialised"
         );
     }
 
