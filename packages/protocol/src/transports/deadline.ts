@@ -55,7 +55,7 @@ export function connectDeadline(
   const timer =
     timeoutMs === undefined
       ? undefined
-      : setTimeout(() => controller.abort(timeoutError(target, timeoutMs)), timeoutMs);
+      : unref(setTimeout(() => controller.abort(timeoutError(target, timeoutMs)), timeoutMs));
 
   return {
     signal: controller.signal,
@@ -80,6 +80,16 @@ export function abortReason(target: string, signal: AbortSignal): Error {
   return Object.assign(new Error(`The connection to ${target} was aborted.`), {
     name: 'AbortError',
   });
+}
+
+/**
+ * Stops an armed deadline from being the reason a process stays alive, the way
+ * every other timer in the SDK does. A browser's `setTimeout` returns a number
+ * with no `unref`, which is why the call is optional rather than typed.
+ */
+function unref<T>(handle: T): T {
+  (handle as unknown as { unref?: () => void }).unref?.();
+  return handle;
 }
 
 function timeoutError(target: string, timeoutMs: number): Error {
