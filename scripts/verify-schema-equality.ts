@@ -78,8 +78,8 @@ const TYPESCRIPT_DEFINITIONS = JSON.parse(
   })
 ) as Definitions;
 
-/** The `$defs` the TypeScript catalog emission promises. */
-const TYPESCRIPT_CATALOG_REQUIRED = ['method', 'event'];
+/** The `$defs` a catalog emission promises, whichever emitter produced it. */
+const CATALOG_REQUIRED = ['method', 'event'];
 
 /** The catalog document's `$defs`, keyed like `catalog.json`; the root is compared separately. */
 const TYPESCRIPT_CATALOG_DEFINITIONS = JSON.parse(
@@ -103,9 +103,6 @@ const RUST_REQUIRED = [
   'close',
   'frame',
 ];
-
-/** The `$defs` the Rust catalog emission promises; the root is compared with it. */
-const RUST_CATALOG_REQUIRED = ['method', 'event'];
 
 /** Runs one of the crate's emitting examples and parses what it printed. */
 async function rustEmission(example: string): Promise<JsonObject> {
@@ -135,25 +132,34 @@ async function rustCatalog(): Promise<CatalogDocument> {
   const emitted = await rustEmission('emit_catalog_schema');
   const { $defs, ...root } = emitted;
   if ($defs === undefined) throw new Error('the Rust catalog emission has no $defs member');
-  return { root, definitions: $defs as Definitions, required: RUST_CATALOG_REQUIRED };
+  return { root, definitions: $defs as Definitions };
 }
 
 /** One emitter's catalog document: the root object, and the `$defs` it references. */
 interface CatalogDocument {
   readonly root: JsonObject;
   readonly definitions: Definitions;
-  /** The `$defs` keys this emitter promises to provide. */
-  readonly required: readonly string[];
 }
 
 const spec = protocolSchema.$defs as Record<string, Json>;
 
 /** `catalog.json` split the way an emission is, with its cross-file references resolvable. */
 const { $defs: catalogDefs, ...catalogRoot } = catalogSchema as { $defs: Definitions } & JsonObject;
+
+/**
+ * Frame definitions a catalog emission may key into its own `$defs` under a
+ * bare name: `catalog.protocol` is the one member whose type lives in
+ * `protocol.json`, and schemars names it there. The rest of the frame document
+ * stays out on purpose, so an emission that leaked a frame definition into the
+ * catalog is still reported as "not in the spec" rather than quietly compared
+ * against the frame entry of the same name.
+ */
+const CATALOG_SHARED = ['protocolVersion'];
+
 // `method` is a name pattern in protocol.json and an object in catalog.json, so
 // the catalog's own entry has to win: the cross-file keys carry the other one.
 const CATALOG_SPEC: Definitions = {
-  ...spec,
+  ...Object.fromEntries(CATALOG_SHARED.map((key) => [key, spec[key] ?? null])),
   ...catalogDefs,
   ...crossFileDefinitions('protocol.json', spec),
 };
@@ -163,7 +169,6 @@ failures.push(
   ...compareCatalog('typescript catalog', {
     root: JSON.parse(JSON.stringify(CatalogSchema)) as JsonObject,
     definitions: TYPESCRIPT_CATALOG_DEFINITIONS,
-    required: TYPESCRIPT_CATALOG_REQUIRED,
   })
 );
 const compared = ['typescript'];
@@ -173,7 +178,7 @@ const compared = ['typescript'];
  * first, then the root object, which no `$defs` entry of either file covers.
  */
 function compareCatalog(label: string, emitted: CatalogDocument): string[] {
-  const result = compareDefinitions(label, emitted.definitions, emitted.required, CATALOG_SPEC);
+  const result = compareDefinitions(label, emitted.definitions, CATALOG_REQUIRED, CATALOG_SPEC);
   const diff = differences(
     normalise(catalogRoot as Json, CATALOG_SPEC),
     normalise(emitted.root, emitted.definitions)
