@@ -9,6 +9,7 @@ use schemars::generate::SchemaSettings;
 use schemars::{Schema, SchemaGenerator, json_schema};
 use serde_json::{Map, Value, json};
 
+use crate::catalog::Catalog;
 use crate::close::{MAX_CLOSE_CODE, MIN_CLOSE_CODE};
 use crate::frame::{Cancel, Close, ErrorResponse, Event, Hello, Request, Response};
 use crate::validate::{
@@ -114,11 +115,23 @@ pub(crate) mod constraints {
         json_schema!({ "type": "string", "maxLength": MAX_REASON_CHARS })
     }
 
+    /// `catalog.method.capabilities`: the capability names a method needs.
+    pub(crate) fn capability_names(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 },
+            "uniqueItems": true,
+        })
+    }
+
     /// `evt.end`: the literal `true`.
     pub(crate) fn end(_generator: &mut SchemaGenerator) -> Schema {
         json_schema!({ "type": "boolean", "const": true })
     }
 }
+
+/// The `$defs` key the generator gives the catalog document's root type.
+const CATALOG_ROOT: &str = "catalog";
 
 /// Frame `$defs` keys that carry a payload, in the order `protocol.json` lists them.
 const TAGGED_FRAMES: [&str; 7] = ["hello", "req", "res", "err", "evt", "cancel", "close"];
@@ -206,9 +219,42 @@ pub fn emit_schema() -> Value {
     json!({ "$defs": Value::Object(definitions) })
 }
 
+/// Emits the catalog schema as one document keyed like `spec/schema/1/catalog.json`.
+///
+/// The result is the catalog object itself — `type`, `required`, `properties` —
+/// with a `$defs` member holding `method`, `event` and everything they
+/// reference. It is a second document rather than more `$defs` on
+/// [`emit_schema`]: the catalog describes a contract, not a frame, and the two
+/// specification files are separate for the same reason.
+///
+/// # Example
+///
+/// ```
+/// use mango_protocol::schema::emit_catalog_schema;
+///
+/// let schema = emit_catalog_schema();
+/// assert_eq!(schema["required"], serde_json::json!(["name", "version", "methods"]));
+/// assert_eq!(schema["$defs"]["method"]["properties"]["name"]["pattern"].is_string(), true);
+/// ```
+#[must_use]
+pub fn emit_catalog_schema() -> Value {
+    let mut generator = SchemaSettings::draft2020_12().into_generator();
+    let _ = generator.subschema_for::<Catalog>();
+
+    let mut definitions = generator.take_definitions(true);
+    let Some(root) = definitions.remove(CATALOG_ROOT) else {
+        unreachable!("the generator defines {CATALOG_ROOT}, the type it was asked for")
+    };
+    let Value::Object(mut root) = root else {
+        unreachable!("a derived schema is a JSON object")
+    };
+    root.insert("$defs".to_owned(), Value::Object(definitions));
+    Value::Object(root)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FRAME_ORDER, emit_schema};
+    use super::{FRAME_ORDER, emit_catalog_schema, emit_schema};
     use serde_json::{Map, Value, json};
 
     /// `spec/schema/1/protocol.json`, the normative document this emission mirrors.
@@ -399,6 +445,24 @@ mod tests {
         assert_eq!(
             required("hello"),
             ["type", "protocol", "peer", "capabilities"]
+        );
+    }
+
+    #[test]
+    fn the_catalog_emission_defines_its_method_and_event_and_refers_to_them() {
+        let schema = emit_catalog_schema();
+        assert!(
+            schema["$defs"]["method"].is_object(),
+            "missing $defs/method"
+        );
+        assert!(schema["$defs"]["event"].is_object(), "missing $defs/event");
+        assert_eq!(
+            schema["properties"]["methods"]["items"]["$ref"],
+            "#/$defs/method"
+        );
+        assert_eq!(
+            schema["properties"]["events"]["items"]["$ref"],
+            "#/$defs/event"
         );
     }
 

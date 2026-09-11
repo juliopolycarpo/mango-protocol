@@ -98,10 +98,12 @@ names with `Catalog::validate`, and generate its own types from the embedded JSO
 
 ```sh
 cargo run --example emit_schema --features schema
+cargo run --example emit_catalog_schema --features schema
 ```
 
-Prints a `$defs` document equivalent to `spec/schema/1/protocol.json`. The repository's
-`bun run check` compares it with the spec on every change; you will not need it at runtime.
+The first prints a `$defs` document equivalent to `spec/schema/1/protocol.json`, the second a
+catalog document equivalent to `spec/schema/1/catalog.json`. The repository's `bun run check`
+compares both with the spec on every change; you will not need either at runtime.
 
 ## What is missing, on purpose
 

@@ -29,6 +29,10 @@ name = "emit_schema"
 required-features = ["schema"]
 
 [[example]]
+name = "emit_catalog_schema"
+required-features = ["schema"]
+
+[[example]]
 name = "roundtrip"
 
 [package.metadata.docs.rs]

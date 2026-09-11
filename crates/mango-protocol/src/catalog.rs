@@ -13,9 +13,13 @@ use crate::version::ProtocolVersion;
 /// One method a contract offers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[cfg_attr(feature = "schema", schemars(rename = "catalogMethod"))]
+#[cfg_attr(feature = "schema", schemars(rename = "method"))]
 pub struct CatalogMethod {
     /// The method name, in the grammar of §6.1.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::method_name")
+    )]
     pub name: String,
     /// Prose for a human reading the contract.
     #[serde(
@@ -25,11 +29,23 @@ pub struct CatalogMethod {
     )]
     pub description: Option<String>,
     /// JSON Schema 2020-12 document for `req.params`.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::open_object")
+    )]
     pub params: Value,
     /// JSON Schema 2020-12 document for `res.result`.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::open_object")
+    )]
     pub result: Value,
     /// Members of `hello.capabilities` the responder requires before serving this method.
     #[serde(default)]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::capability_names")
+    )]
     pub capabilities: Vec<String>,
     /// True when the contract still serves the method but callers should move off it.
     #[serde(default)]
@@ -39,9 +55,13 @@ pub struct CatalogMethod {
 /// One event topic a contract emits.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[cfg_attr(feature = "schema", schemars(rename = "catalogEvent"))]
+#[cfg_attr(feature = "schema", schemars(rename = "event"))]
 pub struct CatalogEvent {
     /// The topic, in the grammar of §6.1.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::method_name")
+    )]
     pub topic: String,
     /// Prose for a human reading the contract.
     #[serde(
@@ -51,6 +71,10 @@ pub struct CatalogEvent {
     )]
     pub description: Option<String>,
     /// JSON Schema 2020-12 document for `evt.payload`.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::open_object")
+    )]
     pub payload: Value,
     /// True when events on this topic carry a `streamId` and an `end` marker.
     #[serde(default)]
@@ -76,8 +100,16 @@ pub struct CatalogEvent {
 #[cfg_attr(feature = "schema", schemars(rename = "catalog"))]
 pub struct Catalog {
     /// Contract name, 1 to 128 characters.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::peer_label")
+    )]
     pub name: String,
     /// Contract version, 1 to 128 characters, opaque to the protocol.
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::peer_label")
+    )]
     pub version: String,
     /// Prose for a human reading the contract.
     #[serde(
@@ -103,6 +135,10 @@ pub struct Catalog {
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present::option"
+    )]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::open_object")
     )]
     pub capabilities: Option<Value>,
 }
