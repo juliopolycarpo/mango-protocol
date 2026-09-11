@@ -167,12 +167,7 @@ describe('local socket transport', () => {
 
   it('rejects when the connector refuses the address outright', async () => {
     const rejection = await rejectionOf(
-      connectIpc(nextPath(), {
-        timeoutMs: 30,
-        connect: () => {
-          throw Object.assign(new Error('the address is not a socket'), { code: 'ENOTSOCK' });
-        },
-      })
+      connectIpc(nextPath(), { timeoutMs: 30, connect: new RefusingConnector().connect })
     );
 
     expect(rejection).toMatchObject({ code: 'ENOTSOCK' });
@@ -392,6 +387,13 @@ class StalledSocket extends EventEmitter {
   destroy(): void {
     this.destroyed = true;
   }
+}
+
+/** A dialler that refuses the address before it opens anything, as `net.connect` does for a path that is not a socket. */
+class RefusingConnector {
+  readonly connect = (_path: string): Socket => {
+    throw Object.assign(new Error('the address is not a socket'), { code: 'ENOTSOCK' });
+  };
 }
 
 /** Hands out `StalledSocket`s and remembers them, in place of `net.connect`. */

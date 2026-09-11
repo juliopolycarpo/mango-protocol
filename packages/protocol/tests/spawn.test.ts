@@ -33,6 +33,16 @@ class FakeChildProcess extends EventEmitter {
   }
 }
 
+/**
+ * A child-process call that throws rather than returning a child, which is how
+ * Bun on Windows reports a command it cannot start.
+ */
+class RefusingSpawn {
+  readonly spawn: SpawnChild = () => {
+    throw Object.assign(new Error('Executable not found in $PATH: "runtime"'), { code: 'EACCES' });
+  };
+}
+
 /** Records what the launcher asks the child-process API for, and starts nothing. */
 class RecordingSpawn {
   readonly calls: {
@@ -177,11 +187,7 @@ describe('spawn launcher', () => {
   });
 
   it('names the spawn error code when the child-process call throws instead', async () => {
-    const peer = spawnPort({ argv: ['runtime'] }, () => {
-      throw Object.assign(new Error('Executable not found in $PATH: "runtime"'), {
-        code: 'EACCES',
-      });
-    });
+    const peer = spawnPort({ argv: ['runtime'] }, new RefusingSpawn().spawn);
 
     expect(await peer.startError()).toEqual({
       exit: { code: null, signal: null },
