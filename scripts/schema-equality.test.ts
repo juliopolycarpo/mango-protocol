@@ -59,12 +59,6 @@ describe('normalise', () => {
     ).toEqual({ minLength: 1, type: 'string' });
   });
 
-  it('drops the default a schemars emission states for a member with a serde default', () => {
-    // `"default": false` is an annotation: the spec says the same thing in
-    // prose, and neither says anything about what validates.
-    expect(normalise({ type: 'boolean', default: false }, {})).toEqual({ type: 'boolean' });
-  });
-
   it('inlines a $ref hidden behind a schemars null alternative', () => {
     const schema = { anyOf: [{ $ref: '#/$defs/id' }, { type: 'null' }] };
     expect(normalise(schema, definitions)).toEqual({ minLength: 1, type: 'string' });

@@ -5,9 +5,8 @@
  * Normaliser rules, the only tolerated differences between emitters:
  * - `$ref` to `#/$defs/<name>` is inlined (sibling keywords kept), as is a
  *   cross-file `other.json#/$defs/<name>` when the caller merged that file in;
- * - `$schema`, `$id`, `title`, `description`, `$comment`, `examples`, `default`
- *   and `format` are dropped (`default` is an annotation: schemars states the
- *   `#[serde(default)]` of an optional member, and the spec states it in prose);
+ * - `$schema`, `$id`, `title`, `description`, `$comment`, `examples` and
+ *   `format` are dropped;
  * - `additionalProperties: true` is dropped (objects are open by default);
  * - a TypeBox `anyOf` whose branches carry distinct `type` consts becomes
  *   `oneOf`;
@@ -24,15 +23,7 @@ export type JsonObject = { [key: string]: Json };
 export type Definitions = Readonly<Record<string, Json>>;
 
 /** Annotation keywords that carry no validation meaning and differ per emitter. */
-const ANNOTATION_KEYS = new Set([
-  '$schema',
-  '$id',
-  'title',
-  'description',
-  '$comment',
-  'examples',
-  'default',
-]);
+const ANNOTATION_KEYS = new Set(['$schema', '$id', 'title', 'description', '$comment', 'examples']);
 
 /** Keys dropped during normalisation. */
 const DROPPED_KEYS = new Set([...ANNOTATION_KEYS, 'format']);
