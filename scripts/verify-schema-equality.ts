@@ -48,6 +48,7 @@ import {
   type Definitions,
   differences,
   type Json,
+  type JsonObject,
   normalise,
 } from './schema-equality';
 
@@ -77,6 +78,9 @@ const TYPESCRIPT_DEFINITIONS = JSON.parse(
   })
 ) as Definitions;
 
+/** The `$defs` the TypeScript catalog emission promises. */
+const TYPESCRIPT_CATALOG_REQUIRED = ['method', 'event'];
+
 /** The catalog document's `$defs`, keyed like `catalog.json`; the root is compared separately. */
 const TYPESCRIPT_CATALOG_DEFINITIONS = JSON.parse(
   JSON.stringify({ method: CatalogMethodSchema, event: CatalogEventSchema })
@@ -100,9 +104,13 @@ const RUST_REQUIRED = [
   'frame',
 ];
 
-async function rustDefinitions(): Promise<Definitions> {
+/** The `$defs` the Rust catalog emission promises; the root is compared with it. */
+const RUST_CATALOG_REQUIRED = ['method', 'event'];
+
+/** Runs one of the crate's emitting examples and parses what it printed. */
+async function rustEmission(example: string): Promise<JsonObject> {
   const proc = Bun.spawn(
-    ['cargo', 'run', '--quiet', '--locked', '--example', 'emit_schema', '--features', 'schema'],
+    ['cargo', 'run', '--quiet', '--locked', '--example', example, '--features', 'schema'],
     { cwd: `${ROOT_DIR}/crates/mango-protocol`, stdout: 'pipe', stderr: 'pipe' }
   );
   const [stdout, stderr, code] = await Promise.all([
@@ -110,38 +118,73 @@ async function rustDefinitions(): Promise<Definitions> {
     new Response(proc.stderr).text(),
     proc.exited,
   ]);
-  if (code !== 0) throw new Error(`cargo run --example emit_schema failed (${code}):\n${stderr}`);
-  const emitted = JSON.parse(stdout) as { $defs?: Definitions };
-  if (!emitted.$defs) throw new Error('the Rust emission has no $defs member');
-  return emitted.$defs;
+  if (code !== 0) throw new Error(`cargo run --example ${example} failed (${code}):\n${stderr}`);
+  return JSON.parse(stdout) as JsonObject;
+}
+
+/** The frame document the crate emits, as `$defs` keyed like `protocol.json`. */
+async function rustDefinitions(): Promise<Definitions> {
+  const emitted = await rustEmission('emit_schema');
+  const definitions = emitted.$defs;
+  if (definitions === undefined) throw new Error('the Rust emission has no $defs member');
+  return definitions as Definitions;
+}
+
+/** The catalog document the crate emits, split into its root and its `$defs`. */
+async function rustCatalog(): Promise<CatalogDocument> {
+  const emitted = await rustEmission('emit_catalog_schema');
+  const { $defs, ...root } = emitted;
+  if ($defs === undefined) throw new Error('the Rust catalog emission has no $defs member');
+  return { root, definitions: $defs as Definitions, required: RUST_CATALOG_REQUIRED };
+}
+
+/** One emitter's catalog document: the root object, and the `$defs` it references. */
+interface CatalogDocument {
+  readonly root: JsonObject;
+  readonly definitions: Definitions;
+  /** The `$defs` keys this emitter promises to provide. */
+  readonly required: readonly string[];
 }
 
 const spec = protocolSchema.$defs as Record<string, Json>;
+
+/** `catalog.json` split the way an emission is, with its cross-file references resolvable. */
+const { $defs: catalogDefs, ...catalogRoot } = catalogSchema as { $defs: Definitions } & JsonObject;
+// `method` is a name pattern in protocol.json and an object in catalog.json, so
+// the catalog's own entry has to win: the cross-file keys carry the other one.
+const CATALOG_SPEC: Definitions = {
+  ...spec,
+  ...catalogDefs,
+  ...crossFileDefinitions('protocol.json', spec),
+};
+
 const failures = compareDefinitions('typescript', TYPESCRIPT_DEFINITIONS, Object.keys(spec), spec);
-failures.push(...compareCatalog());
+failures.push(
+  ...compareCatalog('typescript catalog', {
+    root: JSON.parse(JSON.stringify(CatalogSchema)) as JsonObject,
+    definitions: TYPESCRIPT_CATALOG_DEFINITIONS,
+    required: TYPESCRIPT_CATALOG_REQUIRED,
+  })
+);
 const compared = ['typescript'];
 
-/** The catalog document: its `method` and `event` definitions, then the root object itself. */
-function compareCatalog(): string[] {
-  const { $defs, ...root } = catalogSchema as { $defs: Record<string, Json> } & Record<
-    string,
-    Json
-  >;
-  const definitions = { ...$defs, ...crossFileDefinitions('protocol.json', spec) };
-  const catalog = ['method', 'event'];
-  const result = compareDefinitions(
-    'typescript catalog',
-    TYPESCRIPT_CATALOG_DEFINITIONS,
-    catalog,
-    definitions
+/**
+ * Compares one emitter's catalog document with `catalog.json`: its `$defs`
+ * first, then the root object, which no `$defs` entry of either file covers.
+ */
+function compareCatalog(label: string, emitted: CatalogDocument): string[] {
+  const result = compareDefinitions(label, emitted.definitions, emitted.required, CATALOG_SPEC);
+  const diff = differences(
+    normalise(catalogRoot as Json, CATALOG_SPEC),
+    normalise(emitted.root, emitted.definitions)
   );
-  const emittedRoot = JSON.parse(JSON.stringify(CatalogSchema)) as Json;
-  const diff = differences(normalise(root as Json, definitions), normalise(emittedRoot, {}));
-  return [...result, ...diff.map((line) => `typescript catalog: root${line}`)];
+  return [...result, ...diff.map((line) => `${label}: root${line}`)];
 }
+
 if (!hasFlag('--ts-only')) {
   if (hasCargo()) {
     failures.push(...compareDefinitions('rust', await rustDefinitions(), RUST_REQUIRED, spec));
+    failures.push(...compareCatalog('rust catalog', await rustCatalog()));
     compared.push('rust');
   } else {
     warnNoCargo();
