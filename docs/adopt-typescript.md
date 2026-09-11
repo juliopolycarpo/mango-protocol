@@ -75,8 +75,14 @@ WSL and container wrappers are argv arrays the application builds.
 import { connectIpc, listenIpc, ipcPath } from '@mangostudio/protocol/ipc';
 const path = ipcPath('mango-hub'); // \\.\pipe\mango-hub or $XDG_RUNTIME_DIR/mango-hub.sock
 const server = await listenIpc(path, (port) => new Session(port, { peer, handlers }));
-const client = new Session(await connectIpc(path), { peer });
+const client = new Session(await connectIpc(path, { timeoutMs: 5000 }), { peer });
 ```
+
+`connectIpc` and `connectWebSocket` both take `timeoutMs` and `signal`. Without one, an
+attempt nobody completes — a listener whose accept queue no one drains, a pipe whose server
+stopped answering — stays in flight for as long as the process lives. A deadline that passes
+destroys what the dial opened and rejects with a `TimeoutError`; an abort rejects with the
+reason the caller gave.
 
 On POSIX the socket is owner-only from the moment it exists, and a stale socket
 file left by a crashed listener is replaced. On Windows the named pipe is **not**

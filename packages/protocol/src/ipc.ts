@@ -5,6 +5,7 @@
  */
 
 export {
+  type ConnectIpcOptions,
   connectIpc,
   type IpcOptions,
   type IpcServer,
