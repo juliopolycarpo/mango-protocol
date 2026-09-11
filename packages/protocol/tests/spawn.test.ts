@@ -7,7 +7,15 @@ import { CLOSE_CODES } from '../src/close';
 import type { PortClosure } from '../src/port';
 import { Session } from '../src/session';
 import { CONFORMANCE_A } from '../src/testing/conformance';
-import { type SpawnChild, sanitizedEnv, spawnPort, withErrorCode } from '../src/transports/spawn';
+import { createInProcessPortPair } from '../src/transports/in-process';
+import {
+  type ExitStatus,
+  type SpawnChild,
+  type SpawnedPeer,
+  sanitizedEnv,
+  spawnPort,
+  withErrorCode,
+} from '../src/transports/spawn';
 
 const WINDOWS = process.platform === 'win32';
 
@@ -30,6 +38,26 @@ class FakeChildProcess extends EventEmitter {
 
   kill(): boolean {
     return true;
+  }
+}
+
+/**
+ * A peer a caller implements themselves, carrying only what `SpawnedPeer` has
+ * always asked for. It exists to make `bun run check` fail if a member is ever
+ * added to that interface: everything this SDK learns about a launch belongs
+ * on `LaunchedPeer`, which only `spawnPort` has to satisfy.
+ */
+class InProcessPeer implements SpawnedPeer {
+  readonly port = createInProcessPortPair().a;
+  readonly pid = undefined;
+  readonly exited = Promise.resolve({ code: 0, signal: null });
+
+  stderrTail(): string {
+    return '';
+  }
+
+  async terminate(): Promise<ExitStatus> {
+    return await this.exited;
   }
 }
 
@@ -66,6 +94,16 @@ class RecordingSpawn {
 }
 
 describe('spawn launcher', () => {
+  it('takes a peer a caller implemented themselves wherever a SpawnedPeer is asked for', async () => {
+    const peer: SpawnedPeer = new InProcessPeer();
+
+    expect(peer.stderrTail()).toBe('');
+    expect(await peer.terminate()).toEqual({ code: 0, signal: null });
+    // Why a launch failed is something only this launcher observes, so it sits
+    // on `LaunchedPeer` and a caller's own peer owes nothing towards it.
+    expect('startError' in peer).toBe(false);
+  });
+
   it('completes the handshake and round-trips a request with a real child', async () => {
     const peer = spawnPort({ argv: [BUN, ECHO_CHILD] });
     try {

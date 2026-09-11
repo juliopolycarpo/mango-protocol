@@ -5,6 +5,7 @@
 
 export {
   type ExitStatus,
+  type LaunchedPeer,
   type SpawnChild,
   type SpawnedPeer,
   type SpawnOptions,

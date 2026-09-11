@@ -103,6 +103,19 @@ export interface SpawnedPeer {
    * best effort, as any tail of a pipe is.
    */
   stderrTail(): string;
+  /** Closes stdin, then escalates to `SIGTERM` and `SIGKILL`. Idempotent. */
+  terminate(): Promise<ExitStatus>;
+}
+
+/**
+ * A peer this launcher started, which knows why a launch failed as well as
+ * everything a peer of any origin exposes.
+ *
+ * The two are separate so that `SpawnedPeer` stays the shape a caller can
+ * implement — an in-process peer, a test double — and what this SDK learns by
+ * running a child lands here instead of on their side of the contract.
+ */
+export interface LaunchedPeer extends SpawnedPeer {
   /**
    * Why a launch that never reached a handshake failed, read once the child
    * has had `graceMs` to report how it ended. A refused launch is nearly
@@ -111,8 +124,6 @@ export interface SpawnedPeer {
    * reading the status before it lands would see nothing at all.
    */
   startError(graceMs?: number): Promise<SpawnStartError>;
-  /** Closes stdin, then escalates to `SIGTERM` and `SIGKILL`. Idempotent. */
-  terminate(): Promise<ExitStatus>;
 }
 
 /** Reference size of the stderr tail a launcher keeps (spawn.md, Launching). */
@@ -194,7 +205,7 @@ export function sanitizedEnv(
  * const session = new Session(peer.port, { peer: { name: 'hub', version: '1', role: 'hub' } });
  * await peer.terminate();
  */
-export function spawnPort(options: SpawnOptions, spawnChild: SpawnChild = spawn): SpawnedPeer {
+export function spawnPort(options: SpawnOptions, spawnChild: SpawnChild = spawn): LaunchedPeer {
   const command = options.argv[0];
   if (command === undefined || command.length === 0) {
     throw new Error(
