@@ -243,10 +243,12 @@ pub fn emit_catalog_schema() -> Value {
 
     let mut definitions = generator.take_definitions(true);
     let Some(root) = definitions.remove(CATALOG_ROOT) else {
-        unreachable!("the generator defines {CATALOG_ROOT}, the type it was asked for")
+        let defined: Vec<&str> = definitions.keys().map(String::as_str).collect();
+        panic!("the catalog emission defines {defined:?}; expected a {CATALOG_ROOT} entry")
     };
-    let Value::Object(mut root) = root else {
-        unreachable!("a derived schema is a JSON object")
+    let mut root = match root {
+        Value::Object(object) => object,
+        other => panic!("the {CATALOG_ROOT} definition is {other}; expected a JSON object"),
     };
     root.insert("$defs".to_owned(), Value::Object(definitions));
     Value::Object(root)
