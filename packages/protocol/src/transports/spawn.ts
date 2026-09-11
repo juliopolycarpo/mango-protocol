@@ -19,6 +19,7 @@ import type { Port, PortClosure } from '../port';
 import type { Frame } from '../schemas/frames';
 import { type ByteSink, createNdjsonPort, type NdjsonPortHandle } from './ndjson-port';
 import { asError, createStreamPort, toBytes } from './node-stream';
+import { lastNonEmptyLine } from './text';
 
 /** How the child ended: an exit code, or the signal that killed it. */
 export interface ExitStatus {
@@ -499,20 +500,4 @@ export function withErrorCode(error: Error): Error {
 function errorCode(error: Error): string | undefined {
   const code = (error as { code?: unknown }).code;
   return typeof code === 'string' && code.length > 0 ? code : undefined;
-}
-
-/**
- * The last line of a diagnostic that says anything, which is where a program
- * that failed to start puts its reason.
- *
- * @example
- * lastNonEmptyLine('starting\nconfig missing\n'); // 'config missing'
- */
-export function lastNonEmptyLine(text: string): string | undefined {
-  const lines = text.split('\n');
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    const line = lines[index]?.trim();
-    if (line !== undefined && line.length > 0) return line;
-  }
-  return undefined;
 }

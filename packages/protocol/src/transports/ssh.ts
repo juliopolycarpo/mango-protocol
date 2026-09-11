@@ -6,7 +6,8 @@
  * Nothing here spawns anything, so a caller can unit-test its launch command.
  */
 
-import { type ExitStatus, lastNonEmptyLine } from './spawn';
+import type { ExitStatus } from './spawn';
+import { lastNonEmptyLine } from './text';
 
 export interface SshArgvOptions {
   readonly host: string;
