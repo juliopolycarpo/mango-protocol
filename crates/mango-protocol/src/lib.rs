@@ -47,6 +47,8 @@ pub mod version;
 pub mod schema;
 
 #[cfg(feature = "tokio")]
+pub mod contract;
+#[cfg(feature = "tokio")]
 pub mod port;
 #[cfg(feature = "tokio")]
 pub mod session;
