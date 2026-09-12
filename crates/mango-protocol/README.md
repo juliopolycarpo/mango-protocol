@@ -32,7 +32,12 @@ What the crate covers:
   `ChunkReassembler`, both enforcing the frame limit;
 - version negotiation, the reserved error codes and the close-code table;
 - the catalog document types a TypeScript `defineContract` produces;
-- behind the `schema` feature, a JSON Schema emission the repository proves equal to the spec.
+- behind the `schema` feature, a JSON Schema emission the repository proves equal to the spec;
+- behind the `tokio` feature, a `Session` (request/response multiplexing, cancel, event streams,
+  liveness, graceful close) over any `Port`, and a `Contract` builder that validates, serves and
+  calls it — see `cargo run --example session_pair --features tokio` and `docs/adopt-rust.md`;
+- behind the `testing` feature, a reusable conformance suite a transport crate runs its own `Port`
+  against.
 
-Sessions and transports are a later, tokio-first milestone. Depends on `serde` and `serde_json`
-only. MIT.
+Transports of their own are a later milestone. The codec-only path depends on `serde` and
+`serde_json` only; `tokio`/`tokio-util`/`jsonschema` arrive only behind the `tokio` feature. MIT.

@@ -18,11 +18,21 @@ workspace = true
 default = []
 # JSON Schema emission used by the repo's equality check; not needed to speak the protocol.
 schema = ["dep:schemars"]
+# The Port trait, the session, and the contract builder (schema-validated params/results).
+tokio = ["dep:tokio", "dep:tokio-util", "dep:jsonschema"]
+# The reusable conformance suite, exercised through a Fixture, not this crate's own MemoryPort.
+testing = ["tokio"]
 
 [dependencies]
+jsonschema = { version = "0.56", optional = true, default-features = false }
 schemars = { version = "1.2", optional = true, features = ["derive"] }
 serde = { version = "1.0.219", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.140", default-features = false, features = ["std"] }
+tokio = { version = "1.53", optional = true, default-features = false, features = ["rt", "sync", "time", "macros"] }
+tokio-util = { version = "0.7", optional = true, default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1.53", features = ["macros", "rt", "rt-multi-thread", "test-util"] }
 
 [[example]]
 name = "emit_schema"
@@ -34,6 +44,10 @@ required-features = ["schema"]
 
 [[example]]
 name = "roundtrip"
+
+[[example]]
+name = "session_pair"
+required-features = ["tokio"]
 
 [package.metadata.docs.rs]
 all-features = true

@@ -18,6 +18,7 @@ if (!tsOnly) {
     tasks.push(
       task('cargo test', ['cargo', 'test', '--all-targets', '--all-features', '--locked'])
     );
+    tasks.push(task('cargo test --doc', ['cargo', 'test', '--doc', '--all-features', '--locked']));
   } else {
     warnNoCargo();
   }

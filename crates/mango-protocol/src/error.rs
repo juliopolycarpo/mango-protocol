@@ -1,6 +1,9 @@
-//! Reserved error codes (§6.3) and the codec's own refusal type.
+//! Reserved error codes (§6.3), the codec's own refusal type, and the error a
+//! requester sees.
 
 use std::fmt;
+
+use serde_json::{Map, Value};
 
 /// The error codes this specification reserves.
 ///
@@ -137,6 +140,11 @@ pub struct CodecError {
     pub kind: CodecErrorKind,
     /// The received value and the expected shape, ready to log.
     pub message: String,
+    /// The refused record's `"type"` member, when the codec could read that
+    /// much before the record failed. `None` for a record the codec could not
+    /// parse as JSON at all, or whose `"type"` member is missing or not a
+    /// string.
+    pub frame_type: Option<String>,
 }
 
 impl CodecError {
@@ -149,13 +157,32 @@ impl CodecError {
     ///
     /// let refusal = CodecError::new(CodecErrorKind::Schema, "received {}, expected a frame");
     /// assert_eq!(refusal.message, "received {}, expected a frame");
+    /// assert_eq!(refusal.frame_type, None);
     /// ```
     #[must_use]
     pub fn new(kind: CodecErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
+            frame_type: None,
         }
+    }
+
+    /// Names the frame type this refusal was about.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_protocol::error::{CodecError, CodecErrorKind};
+    ///
+    /// let refusal = CodecError::new(CodecErrorKind::Schema, "received an incomplete hello")
+    ///     .with_frame_type("hello");
+    /// assert_eq!(refusal.frame_type.as_deref(), Some("hello"));
+    /// ```
+    #[must_use]
+    pub fn with_frame_type(mut self, frame_type: impl Into<String>) -> Self {
+        self.frame_type = Some(frame_type.into());
+        self
     }
 }
 
@@ -167,9 +194,102 @@ impl fmt::Display for CodecError {
 
 impl std::error::Error for CodecError {}
 
+/// What a requester receives when its request is answered with an `err`
+/// frame, a request cannot be sent, or a session ends before it settles.
+///
+/// `code` is preserved exactly as received, including a code this crate does
+/// not know.
+///
+/// # Example
+///
+/// ```
+/// use mango_protocol::error::RemoteError;
+///
+/// let error = RemoteError::new("DENIED", "fsRead was not granted").with_detail("capability", "fsRead");
+/// assert_eq!(error.code, "DENIED");
+/// assert!(error.to_string().starts_with("DENIED:"));
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteError {
+    /// The `error.code` member: an application code, or one of [`codes`].
+    pub code: String,
+    /// A sentence naming the received value and the expected shape.
+    pub message: String,
+    /// Optional open object for typed detail.
+    pub details: Option<Map<String, Value>>,
+}
+
+impl RemoteError {
+    /// Builds an error with no details.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_protocol::error::RemoteError;
+    ///
+    /// let error = RemoteError::new("TIMEOUT", "Request \"fs.read-file\" timed out after 5000ms.");
+    /// assert_eq!(error.details, None);
+    /// ```
+    #[must_use]
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            details: None,
+        }
+    }
+
+    /// Replaces the details wholesale.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_protocol::error::RemoteError;
+    /// use serde_json::{Map, json};
+    ///
+    /// let mut details = Map::new();
+    /// details.insert("method".into(), json!("fs.read-file"));
+    /// let error = RemoteError::new("UNAVAILABLE", "closed").with_details(details);
+    /// assert_eq!(error.details.unwrap()["method"], json!("fs.read-file"));
+    /// ```
+    #[must_use]
+    pub fn with_details(mut self, details: Map<String, Value>) -> Self {
+        self.details = Some(details);
+        self
+    }
+
+    /// Sets one detail key, creating the details map if this is the first one.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_protocol::error::RemoteError;
+    /// use serde_json::json;
+    ///
+    /// let error = RemoteError::new("TIMEOUT", "timed out").with_detail("timeout_ms", 5000);
+    /// assert_eq!(error.details.unwrap()["timeout_ms"], json!(5000));
+    /// ```
+    #[must_use]
+    pub fn with_detail(mut self, key: &str, value: impl Into<Value>) -> Self {
+        self.details
+            .get_or_insert_with(Map::new)
+            .insert(key.to_string(), value.into());
+        self
+    }
+}
+
+impl fmt::Display for RemoteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for RemoteError {}
+
 #[cfg(test)]
 mod tests {
-    use super::{CodecError, CodecErrorKind, codes, is_reserved_error_code};
+    use super::{CodecError, CodecErrorKind, RemoteError, codes, is_reserved_error_code};
+    use serde_json::json;
 
     #[test]
     fn every_reserved_code_is_recognised() {
@@ -212,5 +332,37 @@ mod tests {
         reasons.sort_unstable();
         reasons.dedup();
         assert_eq!(reasons.len(), kinds.len());
+    }
+
+    #[test]
+    fn a_new_remote_error_has_no_details() {
+        let error = RemoteError::new("DENIED", "fsRead was not granted");
+        assert_eq!(error.code, "DENIED");
+        assert_eq!(error.message, "fsRead was not granted");
+        assert_eq!(error.details, None);
+    }
+
+    #[test]
+    fn with_detail_creates_the_map_on_first_use_and_extends_it_after() {
+        let error = RemoteError::new("TIMEOUT", "timed out")
+            .with_detail("method", "fs.read-file")
+            .with_detail("timeout_ms", 5000);
+        let details = error.details.expect("has details");
+        assert_eq!(details["method"], json!("fs.read-file"));
+        assert_eq!(details["timeout_ms"], json!(5000));
+    }
+
+    #[test]
+    fn with_details_replaces_whatever_was_there() {
+        let error = RemoteError::new("TIMEOUT", "timed out")
+            .with_detail("stale", true)
+            .with_details(serde_json::Map::new());
+        assert_eq!(error.details, Some(serde_json::Map::new()));
+    }
+
+    #[test]
+    fn display_names_the_code_and_the_message() {
+        let error = RemoteError::new("DENIED", "fsRead was not granted");
+        assert_eq!(error.to_string(), "DENIED: fsRead was not granted");
     }
 }

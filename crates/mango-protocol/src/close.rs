@@ -1,5 +1,7 @@
 //! Close reason codes (§10) and the fatal set.
 
+use crate::error::{CodecError, CodecErrorKind};
+
 /// The reason codes the specification names. Any other code in `4000..=4999` is valid too.
 ///
 /// # Example
@@ -81,11 +83,42 @@ pub fn close_code_name(code: u16) -> Option<&'static str> {
     }
 }
 
+/// The close code a decoder uses when it refuses a peer's bytes with `error`.
+///
+/// A `hello` frame the decoder cannot read closes with [`close_codes::PROTOCOL_MISMATCH`]
+/// rather than [`close_codes::PROTOCOL_ERROR`], since the peer likely speaks a wire major
+/// this side cannot parse at all — retrying the same connection cannot help. Every other
+/// refusal, including a schema failure on any other frame type, closes with
+/// `PROTOCOL_ERROR`.
+///
+/// # Example
+///
+/// ```
+/// use mango_protocol::close::{close_code_for_codec_error, close_codes};
+/// use mango_protocol::error::{CodecError, CodecErrorKind};
+///
+/// let unreadable_hello =
+///     CodecError::new(CodecErrorKind::Schema, "missing peer").with_frame_type("hello");
+/// assert_eq!(close_code_for_codec_error(&unreadable_hello), close_codes::PROTOCOL_MISMATCH);
+///
+/// let bad_request = CodecError::new(CodecErrorKind::Schema, "bad method name");
+/// assert_eq!(close_code_for_codec_error(&bad_request), close_codes::PROTOCOL_ERROR);
+/// ```
+#[must_use]
+pub fn close_code_for_codec_error(error: &CodecError) -> u16 {
+    if error.kind == CodecErrorKind::Schema && error.frame_type.as_deref() == Some("hello") {
+        return close_codes::PROTOCOL_MISMATCH;
+    }
+    close_codes::PROTOCOL_ERROR
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_CLOSE_CODE, MIN_CLOSE_CODE, close_code_name, close_codes, is_fatal_close_code,
+        MAX_CLOSE_CODE, MIN_CLOSE_CODE, close_code_for_codec_error, close_code_name, close_codes,
+        is_fatal_close_code,
     };
+    use crate::error::{CodecError, CodecErrorKind};
 
     #[test]
     fn the_fatal_set_is_exactly_the_four_listed_codes() {
@@ -122,5 +155,44 @@ mod tests {
     #[test]
     fn the_allowed_range_is_the_private_websocket_range() {
         assert_eq!((MIN_CLOSE_CODE, MAX_CLOSE_CODE), (4000, 4999));
+    }
+
+    #[test]
+    fn an_unreadable_hello_closes_with_protocol_mismatch() {
+        let error =
+            CodecError::new(CodecErrorKind::Schema, "missing peer").with_frame_type("hello");
+        assert_eq!(
+            close_code_for_codec_error(&error),
+            close_codes::PROTOCOL_MISMATCH
+        );
+    }
+
+    #[test]
+    fn a_schema_refusal_of_any_other_frame_type_closes_with_protocol_error() {
+        let error =
+            CodecError::new(CodecErrorKind::Schema, "bad method name").with_frame_type("req");
+        assert_eq!(
+            close_code_for_codec_error(&error),
+            close_codes::PROTOCOL_ERROR
+        );
+    }
+
+    #[test]
+    fn a_schema_refusal_with_no_frame_type_closes_with_protocol_error() {
+        let error = CodecError::new(CodecErrorKind::Schema, "not an object");
+        assert_eq!(
+            close_code_for_codec_error(&error),
+            close_codes::PROTOCOL_ERROR
+        );
+    }
+
+    #[test]
+    fn a_non_schema_refusal_of_hello_still_closes_with_protocol_error() {
+        let error =
+            CodecError::new(CodecErrorKind::InvalidJson, "not json").with_frame_type("hello");
+        assert_eq!(
+            close_code_for_codec_error(&error),
+            close_codes::PROTOCOL_ERROR
+        );
     }
 }

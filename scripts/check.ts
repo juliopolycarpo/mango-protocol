@@ -1,14 +1,25 @@
 /**
  * `bun run check`: Biome, dprint, TypeScript, the spec verifier, the schema
- * equality check, the fixture generator's staleness check, rustfmt, Clippy and,
- * with both toolchains, the TypeScript/Rust round trip.
+ * equality check, the fixture generators' staleness checks, rustfmt, Clippy,
+ * `cargo doc` with warnings denied, Clippy again over the full feature
+ * powerset (needs `cargo-hack`; skipped with a warning when it is not on
+ * PATH) and, with both toolchains, the TypeScript/Rust round trip.
  *
  * Flags: `--skip-format` (no Biome/dprint), `--staged` (accepted for the
  * lefthook hook; the repo is small enough to always check everything),
  * `--ts-only`, `--rs-only`.
  */
 
-import { exitWith, hasCargo, hasFlag, runParallel, task, warnNoCargo } from './lib';
+import {
+  exitWith,
+  hasCargo,
+  hasCargoHack,
+  hasFlag,
+  runParallel,
+  task,
+  warnNoCargo,
+  warnNoCargoHack,
+} from './lib';
 
 const skipFormat = hasFlag('--skip-format');
 const tsOnly = hasFlag('--ts-only');
@@ -32,6 +43,13 @@ if (!rsOnly) {
     ])
   );
   tasks.push(task('fixtures:chunks', ['bun', './scripts/fixtures/generate-chunks.ts', '--check']));
+  tasks.push(
+    task('fixtures:catalog-example', [
+      'bun',
+      './scripts/fixtures/generate-catalog-example.ts',
+      '--check',
+    ])
+  );
 }
 if (!tsOnly) {
   if (hasCargo()) {
@@ -48,6 +66,28 @@ if (!tsOnly) {
         'warnings',
       ])
     );
+    tasks.push(
+      task('doc', ['cargo', 'doc', '--no-deps', '--all-features', '--locked'], undefined, {
+        RUSTDOCFLAGS: '-D warnings',
+      })
+    );
+    if (hasCargoHack()) {
+      tasks.push(
+        task('feature-powerset', [
+          'cargo',
+          'hack',
+          'clippy',
+          '--feature-powerset',
+          '--all-targets',
+          '--locked',
+          '--',
+          '-D',
+          'warnings',
+        ])
+      );
+    } else {
+      warnNoCargoHack();
+    }
     if (!tsOnly && !rsOnly) tasks.push(task('roundtrip', ['bun', './scripts/verify-roundtrip.ts']));
   } else {
     warnNoCargo();

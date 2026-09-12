@@ -24,6 +24,8 @@ pub const METHOD_NAME_PATTERN: &str =
     r"^[a-z](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z](?:[a-z0-9-]*[a-z0-9])?)+$";
 /// Longest `error.code` and `peer.role`, in characters.
 pub const MAX_CODE_CHARS: usize = 64;
+/// Method names and event topics under this segment belong to the specification (§6.1).
+pub const RPC_RESERVED_PREFIX: &str = "rpc.";
 /// Longest `close.reason`, in characters.
 pub const MAX_REASON_CHARS: usize = 1024;
 /// Lowest `limits.maxFrameBytes` the schema allows; the floor under any ceiling
@@ -139,6 +141,24 @@ pub fn is_valid_method_name(name: &str) -> bool {
         count += 1;
     }
     count >= 2
+}
+
+/// True when `name` sits under the reserved `rpc.` segment.
+///
+/// Such a name is schema-valid but a session refuses it: a method answers
+/// with `INVALID_REQUEST`, since wire 1.0 defines none there.
+///
+/// # Example
+///
+/// ```
+/// use mango_protocol::validate::is_reserved_method_name;
+///
+/// assert!(is_reserved_method_name("rpc.discover"));
+/// assert!(!is_reserved_method_name("fs.read-file"));
+/// ```
+#[must_use]
+pub fn is_reserved_method_name(name: &str) -> bool {
+    name.starts_with(RPC_RESERVED_PREFIX)
 }
 
 /// True when the role matches `^[a-z][a-z0-9-]*$` and fits [`MAX_CODE_CHARS`].
@@ -334,8 +354,8 @@ pub fn validate(frame: &Frame) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_ID_CHARS, MAX_NAME_CHARS, is_valid_error_code, is_valid_method_name, is_valid_role,
-        validate,
+        MAX_ID_CHARS, MAX_NAME_CHARS, is_reserved_method_name, is_valid_error_code,
+        is_valid_method_name, is_valid_role, validate,
     };
     use crate::frame::{
         Cancel, Close, ErrorPayload, ErrorResponse, Event, Frame, Hello, Limits, PeerInfo, Request,
@@ -431,6 +451,13 @@ mod tests {
         let error = validate(&request(&"i".repeat(MAX_ID_CHARS + 1), "a.b"))
             .expect_err("257 characters is refused");
         assert!(error.received.contains("257 characters"), "{error}");
+    }
+
+    #[test]
+    fn a_reserved_method_is_schema_valid_but_flagged_reserved() {
+        assert!(is_valid_method_name("rpc.discover"));
+        assert!(is_reserved_method_name("rpc.discover"));
+        assert!(!is_reserved_method_name("fs.read-file"));
     }
 
     #[test]

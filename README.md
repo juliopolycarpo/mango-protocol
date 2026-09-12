@@ -24,7 +24,7 @@ The success test is simple: adopting the SDK must delete more code from a consum
 | ------------------------ | ---------------------------------------------------------------------------- |
 | `spec/`                  | Normative spec, JSON Schema 2020-12 files, conformance fixture corpus        |
 | `packages/protocol/`     | `@mangostudio/protocol`: types, codec, session, transports, contract helpers |
-| `crates/mango-protocol/` | `mango-protocol`: wire types and codec                                       |
+| `crates/mango-protocol/` | `mango-protocol`: types, codec, a tokio session, a contract builder, testing |
 | `docs/`                  | Guides for building contracts and adopting the SDK in TypeScript or Rust     |
 
 ## Develop

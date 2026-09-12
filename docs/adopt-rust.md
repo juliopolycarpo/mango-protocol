@@ -2,18 +2,22 @@
 
 `mango-protocol` is the wire in Rust: the frame types, their validation rules, the NDJSON line
 codec, the WebSocket chunk codec, the catalog document types and, behind the `schema` feature,
-a JSON Schema emission. It has no session and no transport; those are a later milestone. Today
-the crate is for a peer that already owns its I/O loop and wants to speak the same frames as
-the TypeScript SDK without re-deriving the rules.
+a JSON Schema emission. Behind the `tokio` feature it also has a session (request/response
+multiplexing, cancel, event streams, liveness, graceful close) over any `Port`, and a `Contract`
+builder that validates, serves and calls it — see [Use a session](#use-a-session) below. A
+transport of its own (WebSocket, stdio) is still a later milestone; today a peer opens a session
+over its own `Port` implementation, or writes its own loop over the codec directly.
 
 ```toml
 [dependencies]
-mango-protocol = "0.1"
+mango-protocol = { version = "0.1", features = ["tokio"] }
 serde_json = "1"
 ```
 
-The crate depends on `serde` and `serde_json` only. `schemars` is pulled in by the `schema`
-feature.
+The codec-only path depends on `serde` and `serde_json` only. `schemars` is pulled in by the
+`schema` feature; `tokio`, `tokio-util` and `jsonschema` are pulled in by the `tokio` feature
+(the session and the contract builder), which the "Use a session" and "Serve a contract"
+sections below need.
 
 ## Frames
 
@@ -105,9 +109,45 @@ The first prints a `$defs` document equivalent to `spec/schema/1/protocol.json`,
 catalog document equivalent to `spec/schema/1/catalog.json`. The repository's `bun run check`
 compares both with the spec on every change; you will not need either at runtime.
 
+## Use a session
+
+```rust
+use mango_protocol::frame::PeerInfo;
+use mango_protocol::port::port_pair;
+use mango_protocol::session::{Session, SessionOptions};
+
+let (port_a, port_b) = port_pair(); // swap for a real Port to speak over an actual transport
+let peer = |role: &str| PeerInfo { name: "example".into(), version: "0.1.0".into(), role: role.into() };
+let (a, _driver_a) = Session::spawn(port_a, SessionOptions::new(peer("a")));
+let (b, _driver_b) = Session::spawn(port_b, SessionOptions::new(peer("b")));
+
+a.ready().await?;
+b.handle("fs.read-file", |params, _context| async move { Ok(params) }).persist();
+let result = a.request("fs.read-file", serde_json::json!({ "path": "README.md" })).await?;
+```
+
+`cargo run --example session_pair --features tokio` runs a fuller version end to end: a request,
+an event stream and a cancelled call between two in-process sessions.
+
+## Serve a contract
+
+A `Contract` (see [Build a contract](build-a-contract.md)) wraps a session with schema
+validation, typed handlers and a policy guard, so a request never reaches your code until its
+parameters have passed the method's schema:
+
+```rust
+let guard = contract.serve(&session, handlers, ServeOptions::default())?;
+let result: MyResult = contract.client(&session).request("fs.read-file", params).await?;
+```
+
+See `Contract::client`'s own doc example for the full typed round trip through `serve` and
+`ContractHandlers`, and the `Guard` trait's doc example for the policy hook that runs between
+schema validation and the handler.
+
 ## What is missing, on purpose
 
-A session (request multiplexing, cancel, streams, liveness) and the transports are planned as a
-tokio-first milestone. Until then, a Rust peer writes its own loop over the codec, which is
-about as much code as the mangostudio runtime host had before this crate existed, minus the
-framing rules.
+Transports of the session's own (WebSocket, stdio) are a later milestone; `Port` is the seam a
+transport crate implements against, proven today only by this crate's own in-process pair.
+`rpc.discover` is deferred too, out of scope until a consumer needs it. A `tracing` feature is
+deferred as well, since no consumer reads a span yet and it would be public surface the docs
+lint and the feature powerset would have to carry for nothing.

@@ -151,9 +151,14 @@ pub struct Catalog {
 impl Catalog {
     /// Checks the rules the catalog schema states and serde cannot.
     ///
-    /// Every method name and event topic must match the grammar of §6.1, and
-    /// the contract's own name and version must be 1 to [`MAX_NAME_CHARS`]
-    /// characters.
+    /// Every method name and event topic must match the grammar of §6.1; the
+    /// contract's own name and version must be 1 to [`MAX_NAME_CHARS`]
+    /// characters; every embedded schema document (`params`, `result`,
+    /// `payload`, `capabilities`) must be an object; and a method's required
+    /// capability names must be non-empty and distinct. Each of those is a
+    /// catalog.json rule the Rust types alone cannot express, and each is
+    /// enforced by the TypeScript `assertCatalog`, so a catalog that passes
+    /// here is one both SDKs will read.
     ///
     /// # Example
     ///
@@ -171,9 +176,19 @@ impl Catalog {
         check_name("catalog.version", &self.version)?;
         for (index, method) in self.methods.iter().enumerate() {
             check_grammar(&format!("catalog.methods[{index}].name"), &method.name)?;
+            check_document(&format!("catalog.methods[{index}].params"), &method.params)?;
+            check_document(&format!("catalog.methods[{index}].result"), &method.result)?;
+            check_capabilities(
+                &format!("catalog.methods[{index}].capabilities"),
+                &method.capabilities,
+            )?;
         }
         for (index, event) in self.events.iter().enumerate() {
             check_grammar(&format!("catalog.events[{index}].topic"), &event.topic)?;
+            check_document(&format!("catalog.events[{index}].payload"), &event.payload)?;
+        }
+        if let Some(capabilities) = &self.capabilities {
+            check_document("catalog.capabilities", capabilities)?;
         }
         Ok(())
     }
@@ -189,6 +204,70 @@ fn check_name(field: &str, value: &str) -> Result<(), ValidationError> {
         received: format!("a string of {count} characters"),
         expected: format!("a string of 1 to {MAX_NAME_CHARS} characters"),
     })
+}
+
+/// Every schema document a catalog carries — `params`, `result`, `payload`,
+/// `capabilities` — is an object: `#/$defs/schema` in catalog.json says so, and
+/// serde cannot express it because the member is a bare `Value`.
+///
+/// JSON Schema itself also accepts a bare `true`/`false`, and so does the
+/// compiler behind [`crate::contract::Contract`], so this is the rule that
+/// keeps a Rust-built catalog from publishing a document the TypeScript SDK's
+/// `assertCatalog` refuses to read.
+fn check_document(field: &str, document: &Value) -> Result<(), ValidationError> {
+    if document.is_object() {
+        return Ok(());
+    }
+    Err(ValidationError {
+        field: field.to_owned(),
+        received: describe_json(document),
+        expected: "a JSON Schema 2020-12 document, which catalog.json requires to be an object"
+            .to_string(),
+    })
+}
+
+/// A method's required capability names are non-empty and distinct:
+/// `#/$defs/method.capabilities` in catalog.json is an array of `minLength: 1`
+/// strings with `uniqueItems: true`. The `schemars` helper emits that
+/// constraint for the generated schema, but nothing applies it to a catalog
+/// built or deserialised at runtime — so, like [`check_document`], this is
+/// what stops a Rust-built catalog naming a capability the TypeScript
+/// `assertCatalog` refuses.
+///
+/// The quadratic scan is deliberate: these lists are a handful of names, and a
+/// `HashSet` here would cost more than it saves while losing the index of the
+/// duplicate the error reports.
+fn check_capabilities(field: &str, names: &[String]) -> Result<(), ValidationError> {
+    for (index, name) in names.iter().enumerate() {
+        if name.is_empty() {
+            return Err(ValidationError {
+                field: format!("{field}[{index}]"),
+                received: "an empty string".to_string(),
+                expected: "a capability name of at least one character".to_string(),
+            });
+        }
+        if names[..index].contains(name) {
+            return Err(ValidationError {
+                field: format!("{field}[{index}]"),
+                received: format!("{name:?}, already named earlier in the list"),
+                expected: "a capability name distinct from every other in the list".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Names a value's JSON type for an error message, with the value itself when
+/// it is small enough to be worth quoting.
+fn describe_json(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(value) => format!("the boolean {value}"),
+        Value::Number(value) => format!("the number {value}"),
+        Value::String(_) => "a string".to_string(),
+        Value::Array(values) => format!("an array of {} items", values.len()),
+        Value::Object(_) => "an object".to_string(),
+    }
 }
 
 fn check_grammar(field: &str, value: &str) -> Result<(), ValidationError> {
@@ -289,6 +368,65 @@ mod tests {
             catalog.validate().expect_err("bad topic").field,
             "catalog.events[0].topic"
         );
+    }
+
+    /// `#/$defs/schema` in catalog.json is `{"type": "object"}`, and the
+    /// TypeScript SDK's `assertCatalog` enforces it. JSON Schema itself also
+    /// allows a bare `true`/`false`, so without this check a Rust-built
+    /// catalog could publish a document the other SDK refuses to read.
+    #[test]
+    fn a_schema_document_that_is_not_an_object_is_refused() {
+        for (field, mutate) in [
+            (
+                "catalog.methods[0].params",
+                Box::new(|catalog: &mut Catalog| catalog.methods[0].params = json!(true))
+                    as Box<dyn Fn(&mut Catalog)>,
+            ),
+            (
+                "catalog.methods[0].result",
+                Box::new(|catalog: &mut Catalog| catalog.methods[0].result = json!([])),
+            ),
+            (
+                "catalog.events[0].payload",
+                Box::new(|catalog: &mut Catalog| catalog.events[0].payload = json!("object")),
+            ),
+            (
+                "catalog.capabilities",
+                Box::new(|catalog: &mut Catalog| catalog.capabilities = Some(Value::Null)),
+            ),
+        ] {
+            let mut catalog = sample();
+            mutate(&mut catalog);
+            let Err(error) = catalog.validate() else {
+                panic!("expected {field} to be refused | received: a valid catalog")
+            };
+            assert_eq!(error.field, field);
+            assert!(
+                error.expected.contains("object"),
+                "expected the refusal to name the shape catalog.json requires | received: {}",
+                error.expected
+            );
+        }
+    }
+
+    /// `#/$defs/method.capabilities` in catalog.json is an array of non-empty
+    /// strings with `uniqueItems: true`, and the TypeBox mirror says the same.
+    /// The schemars helper emits the constraint but nothing enforced it, so a
+    /// Rust-built catalog could publish a list the TypeScript SDK refuses.
+    #[test]
+    fn an_empty_or_duplicate_capability_name_is_refused() {
+        for names in [vec![String::new()], vec!["echo".into(), "echo".into()]] {
+            let mut catalog = sample();
+            let last = names.len() - 1;
+            catalog.methods[0].capabilities = names.clone();
+            let Err(error) = catalog.validate() else {
+                panic!("expected {names:?} to be refused | received: a valid catalog")
+            };
+            assert_eq!(
+                error.field,
+                format!("catalog.methods[0].capabilities[{last}]")
+            );
+        }
     }
 
     #[test]

@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'bun:test';
 import Type from 'typebox';
+import catalogExample from '../../../spec/fixtures/1/catalog-example.json';
 import { defineContract } from '../src/contract';
 import { RESERVED_ERROR_CODES, RemoteError } from '../src/errors';
+import { assertCatalog } from '../src/schemas/catalog';
 import { Session, type SessionOptions } from '../src/session';
 import { createInProcessPortPair } from '../src/transports/in-process';
 
@@ -66,6 +68,17 @@ describe('defineContract', () => {
     expect(catalog.events?.map((event) => event.topic)).toEqual(['text.tick', 'text.stream']);
     expect(Object.getOwnPropertySymbols(catalog.methods[0]?.params ?? {})).toHaveLength(0);
     expect(JSON.parse(JSON.stringify(catalog))).toEqual(catalog);
+  });
+
+  it('reads back the shared example catalog fixture generated from docs/build-a-contract.md', () => {
+    assertCatalog(catalogExample);
+    expect(catalogExample.name).toBe('example.files');
+    expect(catalogExample.methods.map((method) => method.name)).toEqual([
+      'fs.read-file',
+      'fs.watch',
+    ]);
+    expect(catalogExample.methods[0]?.capabilities).toEqual(['fs.read']);
+    expect(catalogExample.events?.map((event) => event.topic)).toEqual(['fs.changed']);
   });
 
   it('serves typed handlers and requests through a typed client', async () => {

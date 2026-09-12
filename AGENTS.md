@@ -23,15 +23,15 @@ wire contract published three ways: the normative spec under `spec/`, the TypeSc
 
 ## Layout
 
-| Path                                                                     | Owns                                                                              |
-| ------------------------------------------------------------------------ | --------------------------------------------------------------------------------- |
-| `spec/mango-protocol-1.md`, `spec/transports/*.md`, `spec/versioning.md` | Normative text                                                                    |
-| `spec/schema/1/*.json`                                                   | Normative JSON Schema 2020-12, one file per wire shape                            |
-| `spec/fixtures/1/`                                                       | Conformance corpus consumed by both SDKs                                          |
-| `packages/protocol/`                                                     | TypeScript SDK: types, codec, session, transports, contracts, testing kit         |
-| `crates/mango-protocol/`                                                 | Rust crate: types and codec (session and transports are a later milestone)        |
-| `docs/`                                                                  | Guides: build a contract, adopt in TS or Rust, versioning, conformance, releasing |
-| `scripts/`                                                               | Root Bun scripts: check, test, fix, release preparation, schema equality          |
+| Path                                                                     | Owns                                                                                            |
+| ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------- |
+| `spec/mango-protocol-1.md`, `spec/transports/*.md`, `spec/versioning.md` | Normative text                                                                                  |
+| `spec/schema/1/*.json`                                                   | Normative JSON Schema 2020-12, one file per wire shape                                          |
+| `spec/fixtures/1/`                                                       | Conformance corpus consumed by both SDKs                                                        |
+| `packages/protocol/`                                                     | TypeScript SDK: types, codec, session, transports, contracts, testing kit                       |
+| `crates/mango-protocol/`                                                 | Rust crate: types, codec, a tokio session, a contract builder, a testing kit (transports later) |
+| `docs/`                                                                  | Guides: build a contract, adopt in TS or Rust, versioning, conformance, releasing               |
+| `scripts/`                                                               | Root Bun scripts: check, test, fix, release preparation, schema equality                        |
 
 ## Contract-change procedure
 
