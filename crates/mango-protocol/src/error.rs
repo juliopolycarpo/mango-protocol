@@ -137,6 +137,11 @@ pub struct CodecError {
     pub kind: CodecErrorKind,
     /// The received value and the expected shape, ready to log.
     pub message: String,
+    /// The refused record's `"type"` member, when the codec could read that
+    /// much before the record failed. `None` for a record the codec could not
+    /// parse as JSON at all, or whose `"type"` member is missing or not a
+    /// string.
+    pub frame_type: Option<String>,
 }
 
 impl CodecError {
@@ -149,13 +154,32 @@ impl CodecError {
     ///
     /// let refusal = CodecError::new(CodecErrorKind::Schema, "received {}, expected a frame");
     /// assert_eq!(refusal.message, "received {}, expected a frame");
+    /// assert_eq!(refusal.frame_type, None);
     /// ```
     #[must_use]
     pub fn new(kind: CodecErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
+            frame_type: None,
         }
+    }
+
+    /// Names the frame type this refusal was about.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_protocol::error::{CodecError, CodecErrorKind};
+    ///
+    /// let refusal = CodecError::new(CodecErrorKind::Schema, "received an incomplete hello")
+    ///     .with_frame_type("hello");
+    /// assert_eq!(refusal.frame_type.as_deref(), Some("hello"));
+    /// ```
+    #[must_use]
+    pub fn with_frame_type(mut self, frame_type: impl Into<String>) -> Self {
+        self.frame_type = Some(frame_type.into());
+        self
     }
 }
 

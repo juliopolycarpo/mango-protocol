@@ -36,6 +36,17 @@ fn too_large(length: usize, max_frame_bytes: usize) -> CodecError {
     )
 }
 
+/// The `"type"` member of a line that parses as a JSON object, if it has a
+/// string one. Used only to name the frame type of a record that failed
+/// deserialisation entirely, mirroring the TypeScript SDK's `frameTypeOf`.
+fn frame_type_of(line: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(line).ok()?;
+    match value.as_object()?.get("type")? {
+        serde_json::Value::String(frame_type) => Some(frame_type.clone()),
+        _ => None,
+    }
+}
+
 /// Drops one `\r` immediately before the line terminator.
 fn strip_carriage_return(line: &[u8]) -> &[u8] {
     match line.split_last() {
@@ -133,15 +144,24 @@ pub fn decode_line(bytes: &[u8], max_frame_bytes: usize) -> Result<Frame, CodecE
             Category::Syntax | Category::Eof | Category::Io => CodecErrorKind::InvalidJson,
             Category::Data => CodecErrorKind::Schema,
         };
-        CodecError::new(
+        let refusal = CodecError::new(
             kind,
             format!(
                 "received {}, expected one Mango Protocol frame: {error}",
                 preview(line)
             ),
-        )
+        );
+        match frame_type_of(line) {
+            Some(frame_type) if kind == CodecErrorKind::Schema => {
+                refusal.with_frame_type(frame_type)
+            }
+            _ => refusal,
+        }
     })?;
-    validate(&frame).map_err(|error| CodecError::new(CodecErrorKind::Schema, error.to_string()))?;
+    validate(&frame).map_err(|error| {
+        CodecError::new(CodecErrorKind::Schema, error.to_string())
+            .with_frame_type(frame.type_name())
+    })?;
     Ok(frame)
 }
 
@@ -492,5 +512,35 @@ mod tests {
         let line = encode_line(&frame, DEFAULT_MAX_FRAME_BYTES).expect("encodes");
         let mut decoder = LineDecoder::new(DEFAULT_MAX_FRAME_BYTES);
         assert_eq!(decoder.push(&line).frames, vec![frame]);
+    }
+
+    #[test]
+    fn a_structurally_incomplete_hello_names_the_frame_type() {
+        let line = br#"{"type":"hello","protocol":{"major":1,"minor":0}}"#;
+        let error = decode_line(line, DEFAULT_MAX_FRAME_BYTES).expect_err("missing peer");
+        assert_eq!(error.kind, CodecErrorKind::Schema);
+        assert_eq!(error.frame_type.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn a_hello_that_fails_value_validation_names_the_frame_type() {
+        let line = br#"{"type":"hello","protocol":{"major":1,"minor":0},"peer":{"name":"","version":"1.0.0","role":"hub"},"capabilities":{}}"#;
+        let error = decode_line(line, DEFAULT_MAX_FRAME_BYTES).expect_err("blank peer name");
+        assert_eq!(error.kind, CodecErrorKind::Schema);
+        assert_eq!(error.frame_type.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn invalid_json_never_names_a_frame_type() {
+        let error = decode_line(b"{\"type\":\"hello\"", DEFAULT_MAX_FRAME_BYTES).expect_err("eof");
+        assert_eq!(error.kind, CodecErrorKind::InvalidJson);
+        assert_eq!(error.frame_type, None);
+    }
+
+    #[test]
+    fn a_schema_refusal_of_a_non_hello_frame_names_that_frame_type() {
+        let error = decode_line(b"{\"type\":\"nope\"}", DEFAULT_MAX_FRAME_BYTES).expect_err("data");
+        assert_eq!(error.kind, CodecErrorKind::Schema);
+        assert_eq!(error.frame_type.as_deref(), Some("nope"));
     }
 }
