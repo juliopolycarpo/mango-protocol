@@ -466,16 +466,20 @@ pub fn spawn_port(options: SpawnOptions) -> Result<(SpawnPort, LaunchedPeer), Sp
             // something to say, and the tail carries the launcher's own words.
             append_line(&tail, &format!("{error}"));
             let _ = exit_tx.send(Some(ExitStatus::default()));
+            // One terminator for the launch, not one each: the port and the
+            // peer run the same sequence, and for a child that never started
+            // that sequence is "nothing to escalate against".
+            let terminator = Arc::new(Terminator::unspawned());
             let peer = LaunchedPeer {
                 pid: None,
                 exit: exit_rx,
                 tail,
                 spawn_error: Some(error.kind()),
                 kill: kill_tx,
-                terminator: Arc::new(Terminator::unspawned()),
+                terminator: Arc::clone(&terminator),
             };
             let why = peer.stderr_tail().trim().to_owned();
-            return Ok((SpawnPort::unspawned(why), peer));
+            return Ok((SpawnPort::unspawned(why, terminator), peer));
         }
     };
 
@@ -922,14 +926,14 @@ impl SpawnPort {
         }
     }
 
-    fn unspawned(why: String) -> Self {
+    fn unspawned(why: String, terminator: Arc<Terminator>) -> Self {
         Self {
             kind: PortKind::Unspawned(if why.is_empty() {
                 "the child process never started".to_owned()
             } else {
                 why
             }),
-            terminator: Arc::new(Terminator::unspawned()),
+            terminator,
         }
     }
 }
