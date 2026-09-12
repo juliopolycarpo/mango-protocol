@@ -114,6 +114,11 @@ with its parameter and result schema, every event with its payload schema, the c
 and version. Serve it from an HTTP route, print it in a CLI, or check it into a repository so
 a peer in another language can generate types from it.
 
+This exact `example.files` contract is committed as `spec/fixtures/1/catalog-example.json`,
+generated from this document by `scripts/fixtures/generate-catalog-example.ts` — both the
+TypeScript and Rust test suites read it back, so they test against one real, non-drifting
+catalog.
+
 ## Version the contract
 
 The contract `version` is yours. Announce it in `hello.capabilities` from both sides:

@@ -45,5 +45,9 @@ required-features = ["schema"]
 [[example]]
 name = "roundtrip"
 
+[[example]]
+name = "session_pair"
+required-features = ["tokio"]
+
 [package.metadata.docs.rs]
 all-features = true

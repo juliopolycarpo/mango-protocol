@@ -4,8 +4,10 @@
 //! normative specification under `spec/`, the TypeScript SDK
 //! `@mangostudio/protocol`, and this crate. It carries the frame types, the
 //! rules a decoder enforces, the two framings a transport needs, and the
-//! catalog document. Sessions, transports and any async runtime are a later
-//! milestone and live outside this crate.
+//! catalog document. Behind the `tokio` feature it also carries a session
+//! (request/response multiplexing, cancel, event streams, liveness, close)
+//! over any `port::Port`, and a `contract` builder that validates, serves
+//! and calls it. Transports of their own remain a later milestone.
 //!
 //! # Example
 //!
@@ -34,6 +36,10 @@
 //! - [`close`] and [`error`] — the reserved close codes and error codes.
 //! - [`catalog`] — the catalog document that describes an application contract.
 //! - `schema` — JSON Schema emission, behind the `schema` feature.
+//! - `port` — the transport seam and an in-process pair, behind the `tokio` feature.
+//! - `session` — request/response multiplexing, cancel, events, liveness, close; behind `tokio`.
+//! - `contract` — catalog-driven validation, `serve`, typed handlers, a guard; behind `tokio`.
+//! - `testing` — the reusable conformance suite, behind the `testing` feature.
 
 pub mod catalog;
 pub mod close;

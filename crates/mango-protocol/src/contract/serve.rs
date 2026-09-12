@@ -124,6 +124,42 @@ impl ContractHandlers {
 /// handler. Throw (return `Err`) a [`RemoteError`] (typically `DENIED`) to
 /// refuse; the SDK adds no policy of its own, since consent, authorisation
 /// and their audit belong to the application.
+///
+/// # Example
+///
+/// The `'a` bound on every argument (not just `&'a self`) is what lets the
+/// returned future borrow `method`/`capabilities`/`context`, as here, instead
+/// of cloning them first.
+///
+/// ```
+/// use std::future::Future;
+/// use std::pin::Pin;
+///
+/// use mango_protocol::contract::Guard;
+/// use mango_protocol::error::codes;
+/// use mango_protocol::session::CallContext;
+/// use mango_protocol::RemoteError;
+/// use serde_json::Value;
+///
+/// struct RequiresCapability;
+///
+/// impl Guard for RequiresCapability {
+///     fn check<'a>(
+///         &'a self,
+///         method: &'a str,
+///         _params: &'a Value,
+///         capabilities: &'a [String],
+///         _context: &'a CallContext,
+///     ) -> Pin<Box<dyn Future<Output = Result<(), RemoteError>> + Send + 'a>> {
+///         Box::pin(async move {
+///             if capabilities.is_empty() {
+///                 return Ok(());
+///             }
+///             Err(RemoteError::new(codes::DENIED, format!("{method} needs {capabilities:?}")))
+///         })
+///     }
+/// }
+/// ```
 pub trait Guard: Send + Sync + 'static {
     /// Checks one request. `context` gives access to the in-flight count
     /// ([`CallContext::in_flight`]) and everything else a policy might need.
@@ -137,6 +173,15 @@ pub trait Guard: Send + Sync + 'static {
 }
 
 /// Tunes one [`Contract::serve`] call.
+///
+/// # Example
+///
+/// ```
+/// use mango_protocol::contract::ServeOptions;
+///
+/// let options = ServeOptions { validate_results: true, ..Default::default() };
+/// assert!(options.guard.is_none());
+/// ```
 #[derive(Default)]
 pub struct ServeOptions {
     /// Runs after schema validation, before the handler.

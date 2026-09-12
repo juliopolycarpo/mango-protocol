@@ -75,6 +75,62 @@ impl RawConnection for NoRawConnection {
 
 /// A transport [`run_conformance_suite`] can exercise: connects a pair, and
 /// optionally a raw-bytes half-connection, over whatever carries the frames.
+///
+/// # Example
+///
+/// This crate's own in-process pair, implementing [`Fixture`] the same way
+/// `tests/conformance.rs` does, then running the full suite against it.
+///
+/// ```
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() {
+/// use mango_protocol::port::port_pair;
+/// use mango_protocol::session::{Session, SessionClosure, SessionOptions};
+/// use mango_protocol::testing::{ConformancePair, Fixture, NoRawConnection, run_conformance_suite};
+/// use tokio::task::JoinHandle;
+///
+/// struct Pair {
+///     a: Session,
+///     b: Session,
+///     driver_a: Option<JoinHandle<SessionClosure>>,
+///     driver_b: Option<JoinHandle<SessionClosure>>,
+/// }
+///
+/// impl ConformancePair for Pair {
+///     fn a(&self) -> &Session { &self.a }
+///     fn b(&self) -> &Session { &self.b }
+///
+///     async fn sever(&mut self) {
+///         if let Some(driver_b) = self.driver_b.take() {
+///             driver_b.abort();
+///         }
+///     }
+///
+///     async fn close(&mut self) {
+///         self.a.close_now(mango_protocol::close_codes::RELEASED, None);
+///         self.b.close_now(mango_protocol::close_codes::RELEASED, None);
+///         if let Some(driver_a) = self.driver_a.take() { let _ = driver_a.await; }
+///         if let Some(driver_b) = self.driver_b.take() { let _ = driver_b.await; }
+///     }
+/// }
+///
+/// struct InProcess;
+///
+/// impl Fixture for InProcess {
+///     type Pair = Pair;
+///     type Raw = NoRawConnection;
+///
+///     async fn connect(&self, a: SessionOptions, b: SessionOptions) -> Pair {
+///         let (port_a, port_b) = port_pair();
+///         let (session_a, driver_a) = Session::spawn(port_a, a);
+///         let (session_b, driver_b) = Session::spawn(port_b, b);
+///         Pair { a: session_a, b: session_b, driver_a: Some(driver_a), driver_b: Some(driver_b) }
+///     }
+/// }
+///
+/// run_conformance_suite(&InProcess).await;
+/// # }
+/// ```
 pub trait Fixture: Send + Sync {
     /// The pair this fixture produces.
     type Pair: ConformancePair;
@@ -116,6 +172,14 @@ pub trait Fixture: Send + Sync {
 }
 
 /// Side `a`'s identity in every conformance case.
+///
+/// # Example
+///
+/// ```
+/// use mango_protocol::testing::conformance_a;
+///
+/// assert_eq!(conformance_a().role, "hub");
+/// ```
 #[must_use]
 pub fn conformance_a() -> PeerInfo {
     PeerInfo {
@@ -141,6 +205,15 @@ pub fn conformance_b() -> PeerInfo {
 /// have their own timing, not this session's ping cadence). A case that
 /// needs a different protocol version or frame ceiling chains a further
 /// `with_*` call on the result.
+///
+/// # Example
+///
+/// ```
+/// use mango_protocol::testing::{conformance_a, conformance_options};
+///
+/// let options = conformance_options(conformance_a());
+/// assert!(options.liveness_interval.is_none());
+/// ```
 #[must_use]
 pub fn conformance_options(peer: PeerInfo) -> SessionOptions {
     SessionOptions::new(peer)
@@ -205,6 +278,14 @@ async fn settled() {
 /// asserts this list, not the runner's control flow, matches that file's own
 /// `it(...)` names verbatim; [`run_conformance_suite`] asserts its own control
 /// flow matches this list, so the two checks cannot silently drift apart.
+///
+/// # Example
+///
+/// ```
+/// use mango_protocol::testing::CONFORMANCE_CASES;
+///
+/// assert_eq!(CONFORMANCE_CASES.len(), 20);
+/// ```
 pub const CONFORMANCE_CASES: [&str; 20] = [
     "completes the handshake in both directions and exposes the peers",
     "negotiates the effective minor downward",

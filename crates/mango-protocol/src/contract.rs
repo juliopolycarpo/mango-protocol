@@ -90,6 +90,25 @@ impl Contract {
     /// # Errors
     /// Returns [`ValidationError`] for the same reasons
     /// [`ContractBuilder::build`] does.
+    ///
+    /// # Example
+    ///
+    /// Reads back `spec/fixtures/1/catalog-example.json`, the same document
+    /// `packages/protocol/tests/contract.test.ts` reads on the TypeScript
+    /// side, so both SDKs agree on one real catalog.
+    ///
+    /// ```
+    /// use mango_protocol::Catalog;
+    /// use mango_protocol::contract::Contract;
+    ///
+    /// let text = include_str!(concat!(
+    ///     env!("CARGO_MANIFEST_DIR"),
+    ///     "/../../spec/fixtures/1/catalog-example.json"
+    /// ));
+    /// let catalog: Catalog = serde_json::from_str(text).expect("the fixture is a valid catalog");
+    /// let contract = Contract::from_catalog(catalog).expect("the fixture compiles");
+    /// assert_eq!(contract.catalog().name, "example.files");
+    /// ```
     pub fn from_catalog(catalog: Catalog) -> Result<Self, ValidationError> {
         compile(catalog)
     }
@@ -166,6 +185,62 @@ impl Contract {
     /// sending — the peer's own dispatch is the check, exactly as the
     /// TypeScript SDK's `ContractClient` relies purely on its compile-time
     /// method-name type, not a runtime one.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
+    /// use mango_protocol::catalog::CatalogMethod;
+    /// use mango_protocol::contract::{Contract, ContractHandlers};
+    /// use mango_protocol::frame::PeerInfo;
+    /// use mango_protocol::port::port_pair;
+    /// use mango_protocol::session::{Session, SessionOptions};
+    /// use serde::{Deserialize, Serialize};
+    /// use serde_json::json;
+    ///
+    /// #[derive(Deserialize)]
+    /// struct EchoParams { text: String }
+    /// #[derive(Serialize, Deserialize)]
+    /// struct EchoResult { text: String }
+    ///
+    /// let contract = Contract::builder("example", "1.0.0")
+    ///     .method(CatalogMethod {
+    ///         name: "text.echo".into(),
+    ///         description: None,
+    ///         params: json!({ "type": "object", "properties": { "text": { "type": "string" } }, "required": ["text"] }),
+    ///         result: json!({ "type": "object", "properties": { "text": { "type": "string" } }, "required": ["text"] }),
+    ///         capabilities: vec![],
+    ///         deprecated: false,
+    ///     })
+    ///     .build()
+    ///     .expect("a valid contract");
+    ///
+    /// let (port_a, port_b) = port_pair();
+    /// let peer = |role: &str| PeerInfo { name: "e".into(), version: "0.1.0".into(), role: role.into() };
+    /// let (a, _driver_a) = Session::spawn(port_a, SessionOptions::new(peer("a")));
+    /// let (b, _driver_b) = Session::spawn(port_b, SessionOptions::new(peer("b")));
+    ///
+    /// let handlers = ContractHandlers::new().on(
+    ///     "text.echo",
+    ///     |params: EchoParams, _context| async move {
+    ///         Ok::<_, mango_protocol::RemoteError>(EchoResult { text: params.text })
+    ///     },
+    /// );
+    /// contract
+    ///     .serve(&b, handlers, Default::default())
+    ///     .expect("methods match")
+    ///     .persist();
+    ///
+    /// a.ready().await.expect("handshake succeeds");
+    /// let result: EchoResult = contract
+    ///     .client(&a)
+    ///     .request("text.echo", json!({ "text": "hi" }))
+    ///     .await
+    ///     .expect("the round trip succeeds");
+    /// assert_eq!(result.text, "hi");
+    /// # }
+    /// ```
     #[must_use]
     pub fn client<'s>(&self, session: &'s Session) -> ContractClient<'s> {
         ContractClient::new(session)
@@ -174,6 +249,52 @@ impl Contract {
     /// Typed event emission and subscription over `session`. Neither `emit`
     /// nor `subscribe` checks `topic` against this contract locally — same
     /// as [`Contract::client`], the peer's own dispatch is the check.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
+    /// use mango_protocol::catalog::CatalogEvent;
+    /// use mango_protocol::contract::Contract;
+    /// use mango_protocol::frame::PeerInfo;
+    /// use mango_protocol::port::port_pair;
+    /// use mango_protocol::session::{Session, SessionOptions};
+    /// use serde::{Deserialize, Serialize};
+    /// use serde_json::json;
+    ///
+    /// #[derive(Debug, Serialize, Deserialize)]
+    /// struct Tick { at: u64 }
+    ///
+    /// let contract = Contract::builder("example", "1.0.0")
+    ///     .event(CatalogEvent {
+    ///         topic: "text.tick".into(),
+    ///         description: None,
+    ///         payload: json!({ "type": "object" }),
+    ///         stream: false,
+    ///     })
+    ///     .build()
+    ///     .expect("a valid contract");
+    ///
+    /// let (port_a, port_b) = port_pair();
+    /// let peer = |role: &str| PeerInfo { name: "e".into(), version: "0.1.0".into(), role: role.into() };
+    /// let (a, _driver_a) = Session::spawn(port_a, SessionOptions::new(peer("a")));
+    /// let (b, _driver_b) = Session::spawn(port_b, SessionOptions::new(peer("b")));
+    ///
+    /// // Both sides must be ready before the first `emit`, or it silently
+    /// // no-ops (`Ok(false)`) and `recv` below waits forever.
+    /// a.ready().await.expect("a is ready");
+    /// b.ready().await.expect("b is ready");
+    ///
+    /// let mut ticks = contract.events(&a).subscribe::<Tick>("text.tick");
+    /// contract
+    ///     .events(&b)
+    ///     .emit("text.tick", Tick { at: 1 }, Default::default())
+    ///     .expect("emits");
+    /// let tick = ticks.recv().await.expect("the stream stays open").expect("decodes as Tick");
+    /// assert_eq!(tick.payload.at, 1);
+    /// # }
+    /// ```
     #[must_use]
     pub fn events<'s>(&self, session: &'s Session) -> ContractEvents<'s> {
         ContractEvents::new(session)
@@ -196,6 +317,45 @@ impl Contract {
     /// # Errors
     /// Returns [`ValidationError`] when `handlers` names a method this
     /// contract does not declare.
+    ///
+    /// # Example
+    ///
+    /// See [`Contract::client`] for a full round trip through the typed
+    /// client this registers against.
+    ///
+    /// ```
+    /// use mango_protocol::catalog::CatalogMethod;
+    /// use mango_protocol::contract::{Contract, ContractHandlers};
+    /// use mango_protocol::frame::PeerInfo;
+    /// use mango_protocol::port::port_pair;
+    /// use mango_protocol::session::{Session, SessionOptions};
+    /// use serde_json::{Value, json};
+    ///
+    /// let contract = Contract::builder("example", "1.0.0")
+    ///     .method(CatalogMethod {
+    ///         name: "text.echo".into(),
+    ///         description: None,
+    ///         params: json!({ "type": "object" }),
+    ///         result: json!({ "type": "object" }),
+    ///         capabilities: vec![],
+    ///         deprecated: false,
+    ///     })
+    ///     .build()
+    ///     .expect("a valid contract");
+    ///
+    /// let (port_a, _port_b) = port_pair();
+    /// let peer = PeerInfo { name: "e".into(), version: "0.1.0".into(), role: "runtime".into() };
+    /// let (session, _driver) = Session::open(port_a, SessionOptions::new(peer));
+    ///
+    /// let handlers = ContractHandlers::new().on(
+    ///     "text.echo",
+    ///     |params: Value, _context| async move { Ok::<_, mango_protocol::RemoteError>(params) },
+    /// );
+    /// let guard = contract
+    ///     .serve(&session, handlers, Default::default())
+    ///     .expect("every handler names a declared method");
+    /// guard.persist(); // keep the registration for the session's life
+    /// ```
     pub fn serve(
         &self,
         session: &Session,
