@@ -205,13 +205,17 @@ impl Session {
     /// The peer's announcement. Fails with `UNAVAILABLE` before the handshake
     /// completes.
     pub fn remote(&self) -> Result<RemotePeer, RemoteError> {
-        lock(&self.shared.inner).remote.clone().ok_or_else(|| {
-            RemoteError::new(
-                codes::UNAVAILABLE,
-                "The session handshake has not completed; expected a ready session, received \
+        lock(&self.shared.inner)
+            .remote
+            .as_deref()
+            .cloned()
+            .ok_or_else(|| {
+                RemoteError::new(
+                    codes::UNAVAILABLE,
+                    "The session handshake has not completed; expected a ready session, received \
                  one still handshaking.",
-            )
-        })
+                )
+            })
     }
 
     /// Why the session closed, once it has. `None` until teardown finishes.

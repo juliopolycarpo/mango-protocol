@@ -357,19 +357,19 @@ fn on_hello(shared: &Shared, hello: Hello) -> Option<Teardown> {
             })
         }
         Negotiation::Compatible { effective_minor } => {
-            let remote = RemotePeer {
+            let remote = Arc::new(RemotePeer {
                 peer: hello.peer,
                 protocol: hello.protocol,
                 capabilities: hello.capabilities,
                 limits: hello.limits,
                 effective_minor,
-            };
+            });
             {
                 let mut guard = lock(&shared.inner);
                 guard.state = SessionState::Ready;
-                guard.remote = Some(remote.clone());
+                guard.remote = Some(Arc::clone(&remote));
             }
-            shared.settle_ready(Ok(remote));
+            shared.settle_ready(Ok((*remote).clone()));
             None
         }
     }

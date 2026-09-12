@@ -56,7 +56,7 @@ pub struct CallContext {
     pub(super) id: String,
     pub(super) method: String,
     pub(super) cancel: CancellationToken,
-    pub(super) remote: RemotePeer,
+    pub(super) remote: Arc<RemotePeer>,
     pub(super) session: Session,
 }
 

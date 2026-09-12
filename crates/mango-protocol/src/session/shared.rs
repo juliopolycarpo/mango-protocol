@@ -32,7 +32,10 @@ pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// lock so a reader never observes a half-updated combination.
 pub(super) struct Inner {
     pub(super) state: SessionState,
-    pub(super) remote: Option<RemotePeer>,
+    /// `Arc`-wrapped so a hot-path reader (`dispatch::on_request`, once per
+    /// inbound request) clones a refcount, not the peer's announced
+    /// capability object.
+    pub(super) remote: Option<Arc<RemotePeer>>,
 }
 
 /// A method's handler, and the generation it was registered under (so a
