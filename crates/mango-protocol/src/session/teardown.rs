@@ -111,13 +111,11 @@ pub(super) async fn teardown<Tx: PortTx>(
         .as_deref()
         .map(|text| format!(": {text}"))
         .unwrap_or_default();
-    shared.fail_ready(
-        RemoteError::new(
-            ready_code,
-            format!("The session closed before the handshake completed ({code}{why})."),
-        )
-        .with_detail("close_code", code),
-    );
+    shared.settle_ready(Err(RemoteError::new(
+        ready_code,
+        format!("The session closed before the handshake completed ({code}{why})."),
+    )
+    .with_detail("close_code", code)));
 
     // Step 5: fail every pending (outbound) request with UNAVAILABLE.
     for (id, request) in pending.drain() {

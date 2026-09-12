@@ -133,7 +133,7 @@ impl<Tx: PortTx, Rx: PortRx> SessionDriver<Tx, Rx> {
             Ok(()) => refused_hello(self.tx.send(hello).await),
         };
         if let Some(error) = refusal {
-            self.shared.fail_ready(error);
+            self.shared.settle_ready(Err(error));
             let (writer, _) = Writer::spawn(self.tx);
             return teardown::teardown(
                 self.shared,
@@ -341,18 +341,16 @@ fn on_hello(shared: &Shared, hello: Hello) -> Option<Teardown> {
     }
     match negotiate(shared.local_protocol, hello.protocol) {
         Negotiation::Mismatch { close_code } => {
-            shared.fail_ready(
-                RemoteError::new(
-                    codes::PROTOCOL_MISMATCH,
-                    format!(
-                        "Peer \"{}\" speaks wire major {}; this session speaks major {}.",
-                        hello.peer.name, hello.protocol.major, shared.local_protocol.major
-                    ),
-                )
-                .with_detail("local_major", shared.local_protocol.major)
-                .with_detail("remote_major", hello.protocol.major)
-                .with_detail("close_code", close_code),
-            );
+            shared.settle_ready(Err(RemoteError::new(
+                codes::PROTOCOL_MISMATCH,
+                format!(
+                    "Peer \"{}\" speaks wire major {}; this session speaks major {}.",
+                    hello.peer.name, hello.protocol.major, shared.local_protocol.major
+                ),
+            )
+            .with_detail("local_major", shared.local_protocol.major)
+            .with_detail("remote_major", hello.protocol.major)
+            .with_detail("close_code", close_code)));
             Some(Teardown::Local {
                 code: close_code,
                 reason: Some("protocol version unsupported".into()),
@@ -371,7 +369,7 @@ fn on_hello(shared: &Shared, hello: Hello) -> Option<Teardown> {
                 guard.state = SessionState::Ready;
                 guard.remote = Some(remote.clone());
             }
-            shared.succeed_ready(remote);
+            shared.settle_ready(Ok(remote));
             None
         }
     }
@@ -452,13 +450,11 @@ fn on_liveness_tick<Tx: PortTx>(awaiting_pong: &mut bool, writer: &Writer<Tx>) -
 
 fn on_handshake_timeout(shared: &Shared, handshake_timeout: Duration) -> Teardown {
     let millis = u64::try_from(handshake_timeout.as_millis()).unwrap_or(u64::MAX);
-    shared.fail_ready(
-        RemoteError::new(
-            codes::UNAVAILABLE,
-            format!("The peer did not send hello within {millis}ms."),
-        )
-        .with_detail("timeout_ms", millis),
-    );
+    shared.settle_ready(Err(RemoteError::new(
+        codes::UNAVAILABLE,
+        format!("The peer did not send hello within {millis}ms."),
+    )
+    .with_detail("timeout_ms", millis)));
     Teardown::Local {
         code: close_codes::PROTOCOL_ERROR,
         reason: Some("handshake timeout".into()),

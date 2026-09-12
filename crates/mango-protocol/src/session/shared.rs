@@ -109,28 +109,17 @@ impl Shared {
         }
     }
 
-    /// Settles the ready watch with `Ok(remote)`, unless something already
-    /// settled it (never overwrites an earlier outcome).
-    pub(super) fn succeed_ready(&self, remote: RemotePeer) {
+    /// Settles the ready watch with `outcome`, unless something already
+    /// settled it (never overwrites an earlier outcome). A specific failure
+    /// (a version mismatch, a handshake timeout) calls this directly;
+    /// teardown's own generic failure is a no-op whenever a specific one
+    /// already ran.
+    pub(super) fn settle_ready(&self, outcome: Result<RemotePeer, RemoteError>) {
         let _ = self.ready.send_if_modified(|current| {
             if current.is_some() {
                 return false;
             }
-            *current = Some(Ok(remote));
-            true
-        });
-    }
-
-    /// Settles the ready watch with `Err(error)`, unless something already
-    /// settled it. A specific failure (a version mismatch, a handshake
-    /// timeout) calls this directly; teardown's own generic failure is a
-    /// no-op whenever a specific one already ran.
-    pub(super) fn fail_ready(&self, error: RemoteError) {
-        let _ = self.ready.send_if_modified(|current| {
-            if current.is_some() {
-                return false;
-            }
-            *current = Some(Err(error));
+            *current = Some(outcome);
             true
         });
     }
