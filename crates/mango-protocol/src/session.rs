@@ -7,23 +7,27 @@
 //! handshake and everything after it only happens while that driver future is
 //! being polled — a [`Session`] handle alone is inert.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::codec::ndjson::DEFAULT_MAX_FRAME_BYTES;
 use crate::port::Port;
 
 mod command;
+mod dispatch;
 mod driver;
 mod handle;
+mod handler;
 mod options;
 mod shared;
 mod teardown;
 
 pub use driver::SessionDriver;
-pub use handle::{RemotePeer, Session, SessionState};
+pub use handle::{RemotePeer, RequestOptions, Session, SessionState};
+pub use handler::{CallContext, Handler, HandlerFuture, HandlerGuard};
 pub use options::SessionOptions;
 pub use teardown::SessionClosure;
 
@@ -72,7 +76,16 @@ impl Session {
             ready,
             closure,
             commands: commands_tx,
+            request_id_prefix: options.request_id_prefix,
+            request_sequence: std::sync::atomic::AtomicU64::new(0),
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            handlers: Mutex::new(HashMap::new()),
+            next_generation: std::sync::atomic::AtomicU64::new(0),
+            handler_grace: options.handler_grace,
         });
+        for (method, handler) in options.handlers {
+            shared.register_handler(method, handler);
+        }
         let session = Session {
             shared: Arc::clone(&shared),
         };
@@ -82,6 +95,10 @@ impl Session {
             rx,
             commands: commands_rx,
             handshake_timeout: options.handshake_timeout,
+            pending: HashMap::new(),
+            tasks: JoinSet::new(),
+            active: HashMap::new(),
+            by_task_id: HashMap::new(),
         };
         (session, driver)
     }

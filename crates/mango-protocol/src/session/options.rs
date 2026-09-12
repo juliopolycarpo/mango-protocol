@@ -1,11 +1,14 @@
 //! [`SessionOptions`] and its builder methods.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Map, Value};
 
 use crate::frame::PeerInfo;
 use crate::version::{PROTOCOL_VERSION, ProtocolVersion};
+
+use super::handler::Handler;
 
 /// 15 seconds: the default [`SessionOptions::handshake_timeout`].
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -34,7 +37,7 @@ pub const DEFAULT_REQUEST_ID_PREFIX: &str = "r";
 /// assert_eq!(options.request_id_prefix, "call");
 /// ```
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SessionOptions {
     /// Who this side is: name, release string, role label.
     pub peer: PeerInfo,
@@ -56,6 +59,27 @@ pub struct SessionOptions {
     /// abandoning them. Rust-only; the TypeScript SDK has no equivalent since
     /// it never awaits its own teardown.
     pub handler_grace: Duration,
+    pub(super) handlers: Vec<(String, Arc<dyn Handler>)>,
+}
+
+impl std::fmt::Debug for SessionOptions {
+    /// `Arc<dyn Handler>` cannot derive `Debug` (the trait has no such bound,
+    /// and adding one would burden every implementor for a diagnostics-only
+    /// need), so this counts pre-registered handlers rather than naming them.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionOptions")
+            .field("peer", &self.peer)
+            .field("capabilities", &self.capabilities)
+            .field("protocol", &self.protocol)
+            .field("max_frame_bytes", &self.max_frame_bytes)
+            .field("handshake_timeout", &self.handshake_timeout)
+            .field("liveness_interval", &self.liveness_interval)
+            .field("request_id_prefix", &self.request_id_prefix)
+            .field("handler_grace", &self.handler_grace)
+            .field("handlers", &self.handlers.len())
+            .finish()
+    }
 }
 
 impl SessionOptions {
@@ -82,6 +106,7 @@ impl SessionOptions {
             liveness_interval: Some(DEFAULT_LIVENESS_INTERVAL),
             request_id_prefix: DEFAULT_REQUEST_ID_PREFIX.to_string(),
             handler_grace: DEFAULT_HANDLER_GRACE,
+            handlers: Vec::new(),
         }
     }
 
@@ -142,6 +167,27 @@ impl SessionOptions {
     #[must_use]
     pub fn with_handler_grace(mut self, handler_grace: Duration) -> Self {
         self.handler_grace = handler_grace;
+        self
+    }
+
+    /// Registers a handler before the session opens; equivalent to calling
+    /// [`crate::session::Session::handle`] immediately after
+    /// [`crate::session::Session::open`], except the handler is already in
+    /// place for the very first frame the driver reads.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_protocol::frame::PeerInfo;
+    /// use mango_protocol::session::SessionOptions;
+    ///
+    /// let peer = PeerInfo { name: "hub".into(), version: "1.0.0".into(), role: "hub".into() };
+    /// let options =
+    ///     SessionOptions::new(peer).handle("text.echo", |params, _context| async move { Ok(params) });
+    /// ```
+    #[must_use]
+    pub fn handle(mut self, method: impl Into<String>, handler: impl Handler) -> Self {
+        self.handlers.push((method.into(), Arc::new(handler)));
         self
     }
 }

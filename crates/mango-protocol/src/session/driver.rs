@@ -1,28 +1,30 @@
 //! `SessionDriver::run` — the `select!` loop that drives one session.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use serde_json::Value;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::{Id, JoinHandle, JoinSet};
 
 use crate::close::close_codes;
 use crate::codec::ndjson::DEFAULT_MAX_FRAME_BYTES;
 use crate::error::{RemoteError, codes};
-use crate::frame::{Frame, Hello, Limits};
+use crate::frame::{Cancel, Frame, Hello, Limits};
 use crate::port::{Inbound, PortClosure, PortRx, PortTx, SendOutcome};
 use crate::version::{Negotiation, negotiate};
 
 use super::command::Command;
+use super::dispatch::{self, ActiveRequest, HandlerOutcome};
 use super::handle::{RemotePeer, SessionState};
 use super::shared::{Shared, lock};
 use super::teardown::{self, SessionClosure, Teardown};
 
 /// One outbound item handed to the [`Writer`] task.
-///
-/// Only `Shutdown` is produced yet; a `Frame` variant joins it once ping/pong
-/// and events need to enqueue a frame after the handshake.
 enum Outbound {
+    /// A frame to send over the port.
+    Frame(Frame),
     /// Finish whatever is queued, then stop and hand the port back.
     Shutdown,
 }
@@ -36,15 +38,25 @@ pub(super) struct Writer<Tx> {
 
 impl<Tx: PortTx> Writer<Tx> {
     /// Spawns the writer task, which owns `tx` until [`Writer::shut_down`].
-    pub(super) fn spawn(tx: Tx) -> Self {
+    pub(super) fn spawn(mut tx: Tx) -> Self {
         let (sender, mut receiver) = mpsc::unbounded_channel::<Outbound>();
         let task = tokio::spawn(async move {
-            // Only `Shutdown` exists yet, so one recv is the whole job: it
-            // arrives, or the sender drops (`None`) — either way, stop.
-            let _ = receiver.recv().await;
+            while let Some(message) = receiver.recv().await {
+                match message {
+                    Outbound::Frame(frame) => {
+                        let _ = tx.send(frame).await;
+                    }
+                    Outbound::Shutdown => break,
+                }
+            }
             tx
         });
         Self { sender, task }
+    }
+
+    /// Queues a frame; never blocks the caller.
+    pub(super) fn enqueue(&self, frame: Frame) {
+        let _ = self.sender.send(Outbound::Frame(frame));
     }
 
     /// Flushes whatever is queued, then returns the port's send half, or
@@ -57,8 +69,14 @@ impl<Tx: PortTx> Writer<Tx> {
     }
 }
 
-/// Drives one session: owns the port, the command inbox, and (starting with
-/// later commits) the in-flight handler tasks.
+/// An outbound request this session is waiting on a `res`/`err` for.
+pub(super) struct PendingRequest {
+    pub(super) method: String,
+    pub(super) reply: oneshot::Sender<Result<Value, RemoteError>>,
+}
+
+/// Drives one session: owns the port, the command inbox, the outbound
+/// requests awaiting an answer, and the inbound requests it is answering.
 ///
 /// Built by [`super::Session::open`]; nothing progresses until this future is
 /// polled, typically via [`super::Session::spawn`] or `tokio::spawn(driver.run())`.
@@ -68,6 +86,10 @@ pub struct SessionDriver<Tx, Rx> {
     pub(super) rx: Rx,
     pub(super) commands: mpsc::UnboundedReceiver<Command>,
     pub(super) handshake_timeout: Duration,
+    pub(super) pending: HashMap<String, PendingRequest>,
+    pub(super) tasks: JoinSet<HandlerOutcome>,
+    pub(super) active: HashMap<String, ActiveRequest>,
+    pub(super) by_task_id: HashMap<Id, String>,
 }
 
 impl<Tx: PortTx, Rx: PortRx> SessionDriver<Tx, Rx> {
@@ -92,6 +114,9 @@ impl<Tx: PortTx, Rx: PortRx> SessionDriver<Tx, Rx> {
             let writer = Writer::spawn(self.tx);
             return teardown::teardown(
                 self.shared,
+                self.pending,
+                self.active,
+                self.tasks,
                 Teardown::Local {
                     code: close_codes::RELEASED,
                     reason: Some("hello could not be sent".into()),
@@ -106,15 +131,23 @@ impl<Tx: PortTx, Rx: PortRx> SessionDriver<Tx, Rx> {
         tokio::pin!(sleep);
 
         // self.tx has been moved into the writer, so the rest of this loop
-        // only ever borrows individual fields (self.shared, self.rx,
-        // self.commands) rather than `self` as a whole.
+        // only ever borrows individual fields (self.shared, self.rx, ...)
+        // rather than `self` as a whole.
         let reason = loop {
             let handshaking = lock(&self.shared.inner).state == SessionState::Handshaking;
             tokio::select! {
                 biased;
                 inbound = self.rx.recv() => match inbound {
                     Some(Inbound::Frame(frame)) => {
-                        if let Some(reason) = on_frame(&self.shared, frame) {
+                        if let Some(reason) = on_frame(
+                            &self.shared,
+                            &mut self.tasks,
+                            &mut self.active,
+                            &mut self.by_task_id,
+                            &mut self.pending,
+                            &writer,
+                            frame,
+                        ) {
                             break reason;
                         }
                     }
@@ -122,9 +155,18 @@ impl<Tx: PortTx, Rx: PortRx> SessionDriver<Tx, Rx> {
                     None => break Teardown::Port(PortClosure::Closed { code: None, reason: None }),
                 },
                 Some(command) = self.commands.recv() => {
-                    if let Some(reason) = on_command(command) {
+                    if let Some(reason) = on_command(command, &mut self.pending, &writer) {
                         break reason;
                     }
+                }
+                Some(settled) = self.tasks.join_next_with_id(), if !self.tasks.is_empty() => {
+                    dispatch::on_handler_settled(
+                        &self.shared,
+                        &mut self.active,
+                        &mut self.by_task_id,
+                        &writer,
+                        settled,
+                    );
                 }
                 () = &mut sleep, if handshaking => {
                     break on_handshake_timeout(&self.shared, self.handshake_timeout);
@@ -132,7 +174,15 @@ impl<Tx: PortTx, Rx: PortRx> SessionDriver<Tx, Rx> {
             }
         };
 
-        teardown::teardown(self.shared, reason, writer).await
+        teardown::teardown(
+            self.shared,
+            self.pending,
+            self.active,
+            self.tasks,
+            reason,
+            writer,
+        )
+        .await
     }
 
     fn build_hello(&self) -> Hello {
@@ -149,19 +199,47 @@ impl<Tx: PortTx, Rx: PortRx> SessionDriver<Tx, Rx> {
 
 /// Routes one inbound frame. `Some` breaks the main loop with that reason.
 ///
-/// A free function, rather than a method, so it only ever borrows `shared`:
-/// by the time the main loop runs, `SessionDriver::tx` has already moved into
-/// the `Writer` task, and a `&self`-taking method would need every field,
-/// `tx` included, to still be there.
-fn on_frame(shared: &Shared, frame: Frame) -> Option<Teardown> {
+/// A free function, rather than a method, so it only ever borrows individual
+/// fields: by the time the main loop runs, `SessionDriver::tx` has already
+/// moved into the `Writer` task, and a `&self`-taking method would need every
+/// field, `tx` included, to still be there.
+fn on_frame<Tx: PortTx>(
+    shared: &Arc<Shared>,
+    tasks: &mut JoinSet<HandlerOutcome>,
+    active: &mut HashMap<String, ActiveRequest>,
+    by_task_id: &mut HashMap<Id, String>,
+    pending: &mut HashMap<String, PendingRequest>,
+    writer: &Writer<Tx>,
+    frame: Frame,
+) -> Option<Teardown> {
     match frame {
         Frame::Hello(hello) => on_hello(shared, hello),
         Frame::Close(close) => Some(Teardown::PeerFrame {
             code: close.code,
             reason: close.reason,
         }),
-        // Req/Res/Err/Evt/Cancel/Ping/Pong: handled starting with the commits
-        // that add request dispatch and event/liveness support.
+        Frame::Req(request) => {
+            dispatch::on_request(shared, tasks, active, by_task_id, writer, request);
+            None
+        }
+        Frame::Res(response) => {
+            on_response(pending, response.id, Ok(response.result));
+            None
+        }
+        Frame::Err(error_response) => {
+            let mut error =
+                RemoteError::new(error_response.error.code, error_response.error.message);
+            if let Some(details) = error_response.error.details {
+                error = error.with_details(details);
+            }
+            on_response(pending, error_response.id, Err(error));
+            None
+        }
+        Frame::Cancel(cancel) => {
+            dispatch::on_cancel(active, &cancel.id);
+            None
+        }
+        // Evt/Ping/Pong: handled once events and liveness land.
         _ => None,
     }
 }
@@ -211,9 +289,45 @@ fn on_hello(shared: &Shared, hello: Hello) -> Option<Teardown> {
     }
 }
 
-fn on_command(command: Command) -> Option<Teardown> {
+/// Settles an outbound request's pending reply. A response for an id nobody
+/// is waiting on (already settled, or never sent) is silently ignored.
+fn on_response(
+    pending: &mut HashMap<String, PendingRequest>,
+    id: String,
+    result: Result<Value, RemoteError>,
+) {
+    if let Some(request) = pending.remove(&id) {
+        let _ = request.reply.send(result);
+    }
+}
+
+fn on_command<Tx: PortTx>(
+    command: Command,
+    pending: &mut HashMap<String, PendingRequest>,
+    writer: &Writer<Tx>,
+) -> Option<Teardown> {
     match command {
         Command::Close { code, reason } => Some(Teardown::Local { code, reason }),
+        Command::Request { frame, reply } => {
+            if let Frame::Req(request) = &frame {
+                pending.insert(
+                    request.id.clone(),
+                    PendingRequest {
+                        method: request.method.clone(),
+                        reply,
+                    },
+                );
+            }
+            writer.enqueue(frame);
+            None
+        }
+        Command::Cancel { id, forget } => {
+            if !forget {
+                pending.remove(&id);
+            }
+            writer.enqueue(Frame::Cancel(Cancel { id }));
+            None
+        }
     }
 }
 

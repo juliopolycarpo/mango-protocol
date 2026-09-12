@@ -1,12 +1,14 @@
 //! [`SessionClosure`] and the teardown every path funnels through.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::close::{close_codes, is_fatal_close_code};
 use crate::error::{CodecError, RemoteError, codes};
 use crate::port::{PortClosure, PortTx};
 
-use super::driver::Writer;
+use super::dispatch::{ActiveRequest, HandlerOutcome};
+use super::driver::{PendingRequest, Writer};
 use super::handle::SessionState;
 use super::shared::{Shared, lock};
 
@@ -69,6 +71,9 @@ pub struct SessionClosure {
 /// — only its remaining individual fields (here, just `shared`) can be.
 pub(super) async fn teardown<Tx: PortTx>(
     shared: Arc<Shared>,
+    mut pending: HashMap<String, PendingRequest>,
+    active: HashMap<String, ActiveRequest>,
+    mut tasks: tokio::task::JoinSet<HandlerOutcome>,
     reason: Teardown,
     writer: Writer<Tx>,
 ) -> SessionClosure {
@@ -115,12 +120,53 @@ pub(super) async fn teardown<Tx: PortTx>(
         .with_detail("close_code", code),
     );
 
-    // Steps 5 (fail pending requests), 6 (cancel active handlers' tokens) and
-    // 8 (grace-drain outstanding handler tasks) have nothing to do until a
-    // later commit gives the driver a handler registry and a JoinSet to
-    // populate them. Step 7 (clear event/pong subscribers) is the same until
-    // events exist.
-    let unfinished_handlers = 0;
+    // Step 5: fail every pending (outbound) request with UNAVAILABLE.
+    for (id, request) in pending.drain() {
+        let error = RemoteError::new(
+            codes::UNAVAILABLE,
+            format!(
+                "Request \"{}\" cannot complete: the session is closed ({code}{why}).",
+                request.method
+            ),
+        )
+        .with_detail("method", request.method)
+        .with_detail("id", id)
+        .with_detail("close_code", code);
+        let _ = request.reply.send(Err(error));
+    }
+
+    // Step 6: cancel every active (inbound) handler's token; the task itself
+    // is never aborted (it keeps running to completion on its own), it just
+    // stops producing a frame once step 3 has already shut the writer down.
+    for request in active.into_values() {
+        request.cancel.cancel();
+    }
+
+    // Step 8: grace-drain outstanding handler tasks. A join_next loop, not
+    // JoinSet::join_all, since join_all re-raises a panic instead of
+    // recovering it the way dispatch's own join_next_with_id handling does.
+    let outstanding = tasks.len();
+    let mut drained = 0;
+    if outstanding > 0 {
+        let grace = tokio::time::sleep(shared.handler_grace);
+        tokio::pin!(grace);
+        loop {
+            tokio::select! {
+                biased;
+                joined = tasks.join_next() => {
+                    if joined.is_none() {
+                        break;
+                    }
+                    drained += 1;
+                    if drained == outstanding {
+                        break;
+                    }
+                }
+                () = &mut grace => break,
+            }
+        }
+    }
+    let unfinished_handlers = outstanding - drained;
 
     let closure = SessionClosure {
         code,
