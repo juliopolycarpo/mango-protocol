@@ -286,9 +286,28 @@ async fn stage(staging: &Staging) -> io::Result<UnixListener> {
 /// Removes what a staging attempt leaves behind, best effort: the socket is
 /// gone already when publishing renamed rather than linked, and the directory
 /// only goes when it is this attempt's and empty.
+///
+/// Nothing is removed unless a directory in its own right sits at the staging
+/// name. The name is derived from this process's id, and the directory an
+/// address usually sits in can be the world-writable system temporary one, so
+/// a symlink somebody else planted there first would otherwise turn this
+/// cleanup into an unlink inside a directory of their choosing. Anything that
+/// is not a directory is left where it is and reported by the `create` that
+/// follows.
 async fn discard(staging: &Staging) {
+    if !is_directory(&staging.directory).await {
+        return;
+    }
     let _ = tokio::fs::remove_file(&staging.socket).await;
     let _ = tokio::fs::remove_dir(&staging.directory).await;
+}
+
+/// True when a directory — never a symlink to one — sits at `path`.
+async fn is_directory(path: &Path) -> bool {
+    matches!(
+        tokio::fs::symlink_metadata(path).await,
+        Ok(metadata) if metadata.file_type().is_dir()
+    )
 }
 
 /// Moves the bound socket onto the address it is published at.
@@ -474,6 +493,34 @@ mod tests {
 
         drop(listener);
         discard(&staging).await;
+    }
+
+    #[tokio::test]
+    async fn a_symlink_planted_at_the_staging_name_is_not_followed() {
+        // The staging name is this process's id, and the directory an address
+        // falls back to is one every local user may write to. Clearing what a
+        // crashed attempt of ours left behind must not follow a name somebody
+        // else got there first with: that would unlink a file inside a
+        // directory of their choosing, as this process's user.
+        let address = Address::new();
+        let elsewhere = address.0.join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("a directory somebody else owns");
+        let bait = elsewhere.join("s");
+        std::fs::write(&bait, b"not this listener's file").expect("a file behind the symlink");
+
+        let staging = staging_path(&address.path());
+        std::os::unix::fs::symlink(&elsewhere, &staging.directory).expect("the planted symlink");
+
+        let error = stage(&staging)
+            .await
+            .expect_err("a name this attempt did not create is not its to clear");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(
+            bait.exists(),
+            "{} was unlinked through the planted symlink",
+            bait.display()
+        );
     }
 
     #[tokio::test]
