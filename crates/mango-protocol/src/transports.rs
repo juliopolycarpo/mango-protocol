@@ -11,6 +11,12 @@
 //! | --- | --- |
 //! | [`ndjson`] | any pair of byte streams |
 //! | [`stdio`] | standard input and standard output |
+//!
+//! [`deadline`] is not a transport but the bound every dialling one connects
+//! under, and the one error type they all fail with.
 
+pub mod deadline;
 pub mod ndjson;
 pub mod stdio;
+
+pub use deadline::{ConnectDeadline, ConnectError};
