@@ -19,7 +19,13 @@ default = []
 # JSON Schema emission used by the repo's equality check; not needed to speak the protocol.
 schema = ["dep:schemars"]
 # The Port trait, the session, and the contract builder (schema-validated params/results).
-tokio = ["dep:tokio", "dep:tokio-util", "dep:jsonschema"]
+tokio = [
+  "dep:tokio",
+  "dep:tokio-util",
+  "dep:jsonschema",
+  "tokio/io-std",
+  "tokio/io-util",
+]
 # The reusable conformance suite, exercised through a Fixture, not this crate's own MemoryPort.
 testing = ["tokio"]
 
