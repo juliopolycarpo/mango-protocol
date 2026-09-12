@@ -252,31 +252,35 @@ where
     /// a record without its terminator is an incomplete frame, not a refusal
     /// (stdio.md, Streams).
     async fn on_eof(&mut self) {
-        self.writer.shut_down().await;
+        // Recorded before the await, never after: `recv` is cancel-safe, and a
+        // closure written on the far side of an await is one a caller that
+        // lost a `select!` race would never be told about.
         self.closure = Some(PortClosure::Closed {
             code: None,
             reason: None,
         });
+        self.writer.shut_down().await;
     }
 
     /// The transport itself broke. The message is the only thing that tells an
     /// operator a broken pipe apart from a peer that left politely; both are a
     /// `4000` release to the session.
     async fn on_failure(&mut self, error: &std::io::Error) {
-        self.writer.shut_down().await;
         self.closure = Some(PortClosure::Closed {
             code: None,
             reason: Some(error.to_string()),
         });
+        self.writer.shut_down().await;
     }
 
     async fn refuse(&mut self, error: CodecError) {
         let code = close_code_for_codec_error(&error);
+        let reason = error.to_string();
+        self.closure = Some(PortClosure::ProtocolError { error, code });
         self.writer
-            .write_close(code, Some(error.to_string()), self.max_frame_bytes)
+            .write_close(code, Some(reason), self.max_frame_bytes)
             .await;
         self.writer.shut_down().await;
-        self.closure = Some(PortClosure::ProtocolError { error, code });
     }
 }
 
@@ -392,6 +396,7 @@ mod tests {
     use crate::port::{Inbound, Port, PortClosure, PortRx, PortTx, SendOutcome};
     use crate::validate::MAX_REASON_CHARS;
     use serde_json::Value;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf, duplex};
 
     type DuplexRead = ReadHalf<DuplexStream>;
@@ -611,6 +616,39 @@ mod tests {
             other => panic!("expected Refused, got {other:?}"),
         }
         drop(theirs);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_survives_a_recv_the_caller_cancelled_mid_farewell() {
+        // The session driver polls `recv` inside a `select!`, so a call can be
+        // dropped at any await. Here the farewell stalls on a peer that is not
+        // reading, which is the await most likely to be interrupted; the
+        // refusal must still be the next thing the port hands out.
+        let (mut peer_writer, port_reader) = duplex(1024);
+        // Nobody reads this half, and it holds less than one close frame.
+        let (port_writer, _unread) = duplex(8);
+        let (_tx, mut rx) = NdjsonPort::new(port_reader, port_writer).split();
+
+        peer_writer
+            .write_all(b"{\"type\":\"nope\"}\n")
+            .await
+            .expect("the peer half takes the line");
+
+        let cancelled = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(
+            cancelled.is_err(),
+            "expected the farewell to stall, so this call is dropped part-way"
+        );
+
+        let reported = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the refusal is not lost with the cancelled call");
+        match reported {
+            Some(Inbound::Closed(PortClosure::ProtocolError { code, .. })) => {
+                assert_eq!(code, close_codes::PROTOCOL_ERROR);
+            }
+            other => panic!("expected the refusal, got {other:?}"),
+        }
     }
 
     #[test]
