@@ -48,12 +48,14 @@ pub mod schema;
 
 #[cfg(feature = "tokio")]
 pub mod port;
+#[cfg(feature = "tokio")]
+pub mod session;
 
 pub use catalog::{Catalog, CatalogEvent, CatalogMethod};
 pub use close::{close_code_name, close_codes, is_fatal_close_code};
 pub use codec::chunk::{ChunkReassembler, encode_chunks};
 pub use codec::ndjson::{LineDecoder, PushOutcome, decode_line, encode_frame_bytes, encode_line};
-pub use error::{CodecError, CodecErrorKind, is_reserved_error_code};
+pub use error::{CodecError, CodecErrorKind, RemoteError, is_reserved_error_code};
 pub use frame::{
     Cancel, Close, End, ErrorPayload, ErrorResponse, Event, Frame, Hello, Limits, PeerInfo,
     Request, Response,

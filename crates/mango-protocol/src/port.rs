@@ -65,6 +65,11 @@ pub trait PortRx: Send + 'static {
     /// `None` once the stream is terminal; [`Inbound::Closed`] is always the
     /// last item before that point, so a caller that stops at the first
     /// `Closed` never misses a frame that arrived just before it.
+    ///
+    /// Must be cancel-safe: a session driver polls this inside `tokio::select!`
+    /// alongside its command channel and its timers, so a call dropped without
+    /// completing (because another branch won the race) must not lose a frame
+    /// that was already fully received.
     fn recv(&mut self) -> impl Future<Output = Option<Inbound>> + Send;
 }
 
