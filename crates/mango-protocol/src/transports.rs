@@ -19,6 +19,18 @@
 //! under, and the one error type they all fail with; [`ssh`] is not one
 //! either, but the argv that puts [`spawn`] on the far end of a network.
 
+use std::time::Duration;
+
+/// How long a closing port's farewell has to reach a peer before the port ends
+/// anyway.
+///
+/// Every transport here has the same problem and gives it the same answer: the
+/// write that carries a farewell is not bounded — a pipe whose peer stopped
+/// reading holds it for as long as it likes, and so does a socket that is not
+/// draining — while ending a port is not something a session may be held on.
+/// The farewell is best effort, and this is how long "best" lasts.
+pub(crate) const CLOSE_FLUSH_GRACE: Duration = Duration::from_secs(2);
+
 pub mod deadline;
 pub mod ipc;
 pub mod ndjson;

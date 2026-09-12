@@ -13,7 +13,6 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
@@ -34,6 +33,8 @@ use crate::error::{CodecError, CodecErrorKind};
 use crate::frame::Frame;
 use crate::port::{Inbound, Port, PortClosure, PortRx, PortTx, SendOutcome};
 
+use super::CLOSE_FLUSH_GRACE;
+
 pub mod client;
 pub mod server;
 
@@ -43,10 +44,6 @@ pub const WEBSOCKET_SUBPROTOCOL: &str = "mango.v1";
 /// RFC 6455 caps the close reason at 123 UTF-8 bytes; the `close` frame
 /// carries the full one.
 const MAX_CLOSE_REASON_BYTES: usize = 123;
-
-/// How long a close waits for the socket to take it. Immediate on a healthy
-/// connection; a peer that stopped reading must not hold up a teardown.
-const CLOSE_FLUSH_GRACE: Duration = Duration::from_secs(2);
 
 /// How this transport frames, and how much it will hold for a socket that is
 /// not draining.

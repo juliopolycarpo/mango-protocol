@@ -31,8 +31,6 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
 
-use std::time::Duration;
-
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, watch};
 
@@ -43,21 +41,14 @@ use crate::frame::{Close, Frame};
 use crate::port::{Inbound, Port, PortClosure, PortRx, PortTx, SendOutcome};
 use crate::validate::MAX_REASON_CHARS;
 
+use super::CLOSE_FLUSH_GRACE;
+
 /// How much of the byte stream one read may take. The operating-system pipe
 /// buffer is this transport's only flow control (stdio.md, Backpressure), so
 /// the number only trades syscalls against per-port memory. The buffer lives
 /// on the receive half rather than on the stack of `recv`, whose future the
 /// session driver holds inside its `select!` for the life of the session.
 const READ_CHUNK_BYTES: usize = 64 * 1024;
-
-/// How long the farewell of §10 has to reach a peer before the port ends
-/// anyway, the same bound the WebSocket port puts on its own close flush.
-///
-/// A pipe write is the only flow control this transport has, so a peer that
-/// stopped reading blocks the write for as long as it likes. Ending a port is
-/// not something a session may be held on: the farewell is best effort, and
-/// this is how long "best" lasts.
-const CLOSE_FLUSH_GRACE: Duration = Duration::from_secs(2);
 
 /// One NDJSON port over a pair of byte streams.
 ///
