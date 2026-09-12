@@ -20,6 +20,8 @@ default = []
 schema = ["dep:schemars"]
 # The Port trait, the session, and the contract builder (schema-validated params/results).
 tokio = ["dep:tokio", "dep:tokio-util", "dep:jsonschema"]
+# The reusable conformance suite, exercised through a Fixture, not this crate's own MemoryPort.
+testing = ["tokio"]
 
 [dependencies]
 jsonschema = { version = "0.56", optional = true, default-features = false }

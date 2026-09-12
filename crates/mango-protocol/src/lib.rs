@@ -52,6 +52,8 @@ pub mod contract;
 pub mod port;
 #[cfg(feature = "tokio")]
 pub mod session;
+#[cfg(feature = "testing")]
+pub mod testing;
 
 pub use catalog::{Catalog, CatalogEvent, CatalogMethod};
 pub use close::{close_code_name, close_codes, is_fatal_close_code};
