@@ -475,12 +475,13 @@ impl ContractBuilder {
     }
 
     /// Checks every method's and event topic's name, then compiles every
-    /// `params`/`result` schema.
+    /// schema the catalog embeds.
     ///
     /// # Errors
     /// Returns [`ValidationError`] for an out-of-range `name`/`version`, an
-    /// invalid or reserved method name or event topic, or a `params`/
-    /// `result` document that is not valid JSON Schema 2020-12.
+    /// invalid or reserved method name or event topic, or a `params`,
+    /// `result`, `payload` or `capabilities` document that is not an object
+    /// holding valid JSON Schema 2020-12.
     ///
     /// # Example
     ///
@@ -495,12 +496,13 @@ impl ContractBuilder {
     }
 }
 
-/// Checks names — [`Catalog::validate`]'s grammar and length rules, plus the
-/// reserved `rpc.` segment it does not know about, since that is a
-/// contract-level rule, not a wire-schema one — then compiles every method's
-/// schemas. The single path [`ContractBuilder::build`] and
-/// [`Contract::from_catalog`] both funnel through, so declare-then-compile
-/// and deserialise-then-compile cannot drift apart.
+/// Checks names — [`Catalog::validate`]'s grammar, length and
+/// schema-document-shape rules, plus the reserved `rpc.` segment it does not
+/// know about, since that is a contract-level rule, not a wire-schema one —
+/// then compiles every schema the catalog embeds. The single path
+/// [`ContractBuilder::build`] and [`Contract::from_catalog`] both funnel
+/// through, so declare-then-compile and deserialise-then-compile cannot drift
+/// apart.
 fn compile(catalog: Catalog) -> Result<Contract, ValidationError> {
     catalog.validate()?;
     for (index, method) in catalog.methods.iter().enumerate() {
@@ -527,6 +529,17 @@ fn compile(catalog: Catalog) -> Result<Contract, ValidationError> {
             })
         })
         .collect::<Result<Vec<_>, ValidationError>>()?;
+    // Event payloads and the capability document are compiled for their
+    // validity alone, not kept: nothing validates an outbound event against
+    // its payload schema yet, but `catalog()` publishes all of them as
+    // checked documents, so a malformed one has to fail here rather than
+    // reach a peer.
+    for (index, event) in catalog.events.iter().enumerate() {
+        params::compile(&format!("catalog.events[{index}].payload"), &event.payload)?;
+    }
+    if let Some(capabilities) = &catalog.capabilities {
+        params::compile("catalog.capabilities", capabilities)?;
+    }
     Ok(Contract { catalog, methods })
 }
 
@@ -608,6 +621,32 @@ mod tests {
             error.details.as_ref().and_then(|d| d.get("path")),
             Some(&json!("/a"))
         );
+    }
+
+    /// A contract's `catalog()` is published as a validated document, so every
+    /// schema it embeds has to compile — not just the method ones. An event
+    /// payload or a capability schema that only looks like JSON Schema would
+    /// otherwise reach a peer as a supposedly checked document.
+    #[test]
+    fn every_embedded_schema_must_compile() {
+        let malformed = json!({ "type": "not-a-type" });
+
+        let error = Contract::builder("x", "1")
+            .event(CatalogEvent {
+                topic: "text.tick".into(),
+                description: None,
+                payload: malformed.clone(),
+                stream: false,
+            })
+            .build()
+            .expect_err("an event payload that is not a schema");
+        assert_eq!(error.field, "catalog.events[0].payload");
+
+        let error = Contract::builder("x", "1")
+            .capabilities(malformed)
+            .build()
+            .expect_err("a capability document that is not a schema");
+        assert_eq!(error.field, "catalog.capabilities");
     }
 
     #[test]

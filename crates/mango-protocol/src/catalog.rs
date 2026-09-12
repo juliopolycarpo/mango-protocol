@@ -171,9 +171,15 @@ impl Catalog {
         check_name("catalog.version", &self.version)?;
         for (index, method) in self.methods.iter().enumerate() {
             check_grammar(&format!("catalog.methods[{index}].name"), &method.name)?;
+            check_document(&format!("catalog.methods[{index}].params"), &method.params)?;
+            check_document(&format!("catalog.methods[{index}].result"), &method.result)?;
         }
         for (index, event) in self.events.iter().enumerate() {
             check_grammar(&format!("catalog.events[{index}].topic"), &event.topic)?;
+            check_document(&format!("catalog.events[{index}].payload"), &event.payload)?;
+        }
+        if let Some(capabilities) = &self.capabilities {
+            check_document("catalog.capabilities", capabilities)?;
         }
         Ok(())
     }
@@ -189,6 +195,39 @@ fn check_name(field: &str, value: &str) -> Result<(), ValidationError> {
         received: format!("a string of {count} characters"),
         expected: format!("a string of 1 to {MAX_NAME_CHARS} characters"),
     })
+}
+
+/// Every schema document a catalog carries — `params`, `result`, `payload`,
+/// `capabilities` — is an object: `#/$defs/schema` in catalog.json says so, and
+/// serde cannot express it because the member is a bare `Value`.
+///
+/// JSON Schema itself also accepts a bare `true`/`false`, and so does the
+/// compiler behind [`crate::contract::Contract`], so this is the rule that
+/// keeps a Rust-built catalog from publishing a document the TypeScript SDK's
+/// `assertCatalog` refuses to read.
+fn check_document(field: &str, document: &Value) -> Result<(), ValidationError> {
+    if document.is_object() {
+        return Ok(());
+    }
+    Err(ValidationError {
+        field: field.to_owned(),
+        received: describe_json(document),
+        expected: "a JSON Schema 2020-12 document, which catalog.json requires to be an object"
+            .to_string(),
+    })
+}
+
+/// Names a value's JSON type for an error message, with the value itself when
+/// it is small enough to be worth quoting.
+fn describe_json(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(value) => format!("the boolean {value}"),
+        Value::Number(value) => format!("the number {value}"),
+        Value::String(_) => "a string".to_string(),
+        Value::Array(values) => format!("an array of {} items", values.len()),
+        Value::Object(_) => "an object".to_string(),
+    }
 }
 
 fn check_grammar(field: &str, value: &str) -> Result<(), ValidationError> {
@@ -289,6 +328,45 @@ mod tests {
             catalog.validate().expect_err("bad topic").field,
             "catalog.events[0].topic"
         );
+    }
+
+    /// `#/$defs/schema` in catalog.json is `{"type": "object"}`, and the
+    /// TypeScript SDK's `assertCatalog` enforces it. JSON Schema itself also
+    /// allows a bare `true`/`false`, so without this check a Rust-built
+    /// catalog could publish a document the other SDK refuses to read.
+    #[test]
+    fn a_schema_document_that_is_not_an_object_is_refused() {
+        for (field, mutate) in [
+            (
+                "catalog.methods[0].params",
+                Box::new(|catalog: &mut Catalog| catalog.methods[0].params = json!(true))
+                    as Box<dyn Fn(&mut Catalog)>,
+            ),
+            (
+                "catalog.methods[0].result",
+                Box::new(|catalog: &mut Catalog| catalog.methods[0].result = json!([])),
+            ),
+            (
+                "catalog.events[0].payload",
+                Box::new(|catalog: &mut Catalog| catalog.events[0].payload = json!("object")),
+            ),
+            (
+                "catalog.capabilities",
+                Box::new(|catalog: &mut Catalog| catalog.capabilities = Some(Value::Null)),
+            ),
+        ] {
+            let mut catalog = sample();
+            mutate(&mut catalog);
+            let Err(error) = catalog.validate() else {
+                panic!("expected {field} to be refused | received: a valid catalog")
+            };
+            assert_eq!(error.field, field);
+            assert!(
+                error.expected.contains("object"),
+                "expected the refusal to name the shape catalog.json requires | received: {}",
+                error.expected
+            );
+        }
     }
 
     #[test]
