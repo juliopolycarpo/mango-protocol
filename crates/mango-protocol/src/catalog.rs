@@ -151,9 +151,14 @@ pub struct Catalog {
 impl Catalog {
     /// Checks the rules the catalog schema states and serde cannot.
     ///
-    /// Every method name and event topic must match the grammar of §6.1, and
-    /// the contract's own name and version must be 1 to [`MAX_NAME_CHARS`]
-    /// characters.
+    /// Every method name and event topic must match the grammar of §6.1; the
+    /// contract's own name and version must be 1 to [`MAX_NAME_CHARS`]
+    /// characters; every embedded schema document (`params`, `result`,
+    /// `payload`, `capabilities`) must be an object; and a method's required
+    /// capability names must be non-empty and distinct. Each of those is a
+    /// catalog.json rule the Rust types alone cannot express, and each is
+    /// enforced by the TypeScript `assertCatalog`, so a catalog that passes
+    /// here is one both SDKs will read.
     ///
     /// # Example
     ///
@@ -173,6 +178,10 @@ impl Catalog {
             check_grammar(&format!("catalog.methods[{index}].name"), &method.name)?;
             check_document(&format!("catalog.methods[{index}].params"), &method.params)?;
             check_document(&format!("catalog.methods[{index}].result"), &method.result)?;
+            check_capabilities(
+                &format!("catalog.methods[{index}].capabilities"),
+                &method.capabilities,
+            )?;
         }
         for (index, event) in self.events.iter().enumerate() {
             check_grammar(&format!("catalog.events[{index}].topic"), &event.topic)?;
@@ -215,6 +224,37 @@ fn check_document(field: &str, document: &Value) -> Result<(), ValidationError> 
         expected: "a JSON Schema 2020-12 document, which catalog.json requires to be an object"
             .to_string(),
     })
+}
+
+/// A method's required capability names are non-empty and distinct:
+/// `#/$defs/method.capabilities` in catalog.json is an array of `minLength: 1`
+/// strings with `uniqueItems: true`. The `schemars` helper emits that
+/// constraint for the generated schema, but nothing applies it to a catalog
+/// built or deserialised at runtime — so, like [`check_document`], this is
+/// what stops a Rust-built catalog naming a capability the TypeScript
+/// `assertCatalog` refuses.
+///
+/// The quadratic scan is deliberate: these lists are a handful of names, and a
+/// `HashSet` here would cost more than it saves while losing the index of the
+/// duplicate the error reports.
+fn check_capabilities(field: &str, names: &[String]) -> Result<(), ValidationError> {
+    for (index, name) in names.iter().enumerate() {
+        if name.is_empty() {
+            return Err(ValidationError {
+                field: format!("{field}[{index}]"),
+                received: "an empty string".to_string(),
+                expected: "a capability name of at least one character".to_string(),
+            });
+        }
+        if names[..index].contains(name) {
+            return Err(ValidationError {
+                field: format!("{field}[{index}]"),
+                received: format!("{name:?}, already named earlier in the list"),
+                expected: "a capability name distinct from every other in the list".to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Names a value's JSON type for an error message, with the value itself when
@@ -365,6 +405,26 @@ mod tests {
                 error.expected.contains("object"),
                 "expected the refusal to name the shape catalog.json requires | received: {}",
                 error.expected
+            );
+        }
+    }
+
+    /// `#/$defs/method.capabilities` in catalog.json is an array of non-empty
+    /// strings with `uniqueItems: true`, and the TypeBox mirror says the same.
+    /// The schemars helper emits the constraint but nothing enforced it, so a
+    /// Rust-built catalog could publish a list the TypeScript SDK refuses.
+    #[test]
+    fn an_empty_or_duplicate_capability_name_is_refused() {
+        for names in [vec![String::new()], vec!["echo".into(), "echo".into()]] {
+            let mut catalog = sample();
+            let last = names.len() - 1;
+            catalog.methods[0].capabilities = names.clone();
+            let Err(error) = catalog.validate() else {
+                panic!("expected {names:?} to be refused | received: a valid catalog")
+            };
+            assert_eq!(
+                error.field,
+                format!("catalog.methods[0].capabilities[{last}]")
             );
         }
     }
