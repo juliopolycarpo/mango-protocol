@@ -19,6 +19,10 @@ use super::{PeerIdentity, PeerUser};
 /// Owner-only, the permission local-socket.md requires of a POSIX socket file.
 const SOCKET_MODE: u32 = 0o600;
 
+/// Owner-only and not searchable by anyone else, which is what keeps a socket
+/// staged inside it out of reach before its own mode is set.
+const STAGING_DIRECTORY_MODE: u32 = 0o700;
+
 /// The port a dialled connection produces.
 pub type IpcPort = NdjsonPort<OwnedReadHalf, OwnedWriteHalf>;
 
@@ -144,13 +148,13 @@ impl IpcListener {
 
 /// Listens on a local socket, owner-only from the instant the address exists.
 ///
-/// The socket is bound at a temporary name beside `path`, restricted to
-/// `0600` while only this process knows about it, and then published at
-/// `path`. `bind` takes its mode from the umask, so binding straight onto the
-/// address would publish a world-connectable socket for as long as a `chmod`
-/// takes; the TypeScript SDK closes that window by setting the process-wide
-/// umask, which a library cannot do without reaching into every other thread.
-/// Publishing afterwards is local to this call and costs no such thing.
+/// The socket is bound inside an owner-only directory beside `path`,
+/// restricted to `0600` there, and then published at `path`. `bind` takes its
+/// mode from the umask, so binding straight onto the address would publish a
+/// world-connectable socket for as long as a `chmod` takes; the TypeScript SDK
+/// closes that window by setting the process-wide umask, which a library
+/// cannot do without reaching into every other thread. Staging inside a
+/// directory nobody else may enter closes it without leaving this call.
 ///
 /// A stale socket file left by a previous process is removed first. Anything
 /// else at the address is refused rather than replaced: a regular file there
@@ -167,20 +171,9 @@ pub async fn listen_ipc(path: impl AsRef<Path>) -> io::Result<IpcListener> {
     remove_stale_socket(&path).await?;
 
     let staging = staging_path(&path);
-    // A crash between these two steps leaves the staging name behind, where
-    // the next bind's own staging path (this process's id) will not collide
-    // with it and the stale-socket removal never looks. Cheap to clean up by
-    // hand, and never mistaken for the published address.
-    let _ = tokio::fs::remove_file(&staging).await;
-    let listener = UnixListener::bind(&staging)?;
-    if let Err(error) = restrict(&staging).await {
-        let _ = tokio::fs::remove_file(&staging).await;
-        return Err(error);
-    }
-    if let Err(error) = publish(&staging, &path).await {
-        let _ = tokio::fs::remove_file(&staging).await;
-        return Err(error);
-    }
+    let staged = stage_and_publish(&staging, &path).await;
+    discard(&staging).await;
+    let listener = staged?;
 
     Ok(IpcListener {
         listener,
@@ -234,19 +227,68 @@ fn identity_of(stream: &UnixStream) -> PeerIdentity {
     }
 }
 
-/// Where a listener binds before it publishes: in the address's own directory,
-/// so the link onto it stays within one filesystem, and unique per attempt, so
-/// two listeners racing for the same address do not stage over each other.
+/// Where a listener binds before it publishes: a directory of its own beside
+/// the address, so the link onto the address stays within one filesystem, and
+/// unique per attempt, so two listeners racing for the same address do not
+/// stage over each other.
 ///
-/// A short name of its own rather than the address plus a suffix, because this
-/// is the path `bind` actually sees and `sun_path` is 104 bytes on macOS. An
-/// address close to that limit would otherwise fail to bind at a staging name
-/// longer than itself.
-fn staging_path(path: &Path) -> PathBuf {
+/// A directory rather than a bare name, because the name is not a secret. It
+/// is derived from this process's id, and the directory an address usually
+/// sits in — the fallback system temporary directory — is searchable by every
+/// local user. `bind` takes the socket's mode from the umask, so between it
+/// and [`restrict`] the only thing that can refuse a stranger is the
+/// directory the socket sits in.
+///
+/// Short names, because these are the paths `bind` actually sees and
+/// `sun_path` is 104 bytes on macOS. An address close to that limit would
+/// otherwise fail to bind at a staging name longer than itself.
+fn staging_path(path: &Path) -> Staging {
     static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(0);
     let attempt = NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed);
-    let directory = path.parent().unwrap_or_else(|| Path::new("."));
-    directory.join(format!(".mango-{}-{attempt}", std::process::id()))
+    let beside = path.parent().unwrap_or_else(|| Path::new("."));
+    let directory = beside.join(format!(".m{}-{attempt}", std::process::id()));
+    let socket = directory.join("s");
+    Staging { directory, socket }
+}
+
+/// The two paths one staging attempt owns.
+#[derive(Debug)]
+struct Staging {
+    directory: PathBuf,
+    socket: PathBuf,
+}
+
+/// Binds inside a fresh owner-only directory, restricts the socket, and links
+/// it onto the address. Whatever this fails at, [`discard`] cleans up after.
+async fn stage_and_publish(staging: &Staging, path: &Path) -> io::Result<UnixListener> {
+    let listener = stage(staging).await?;
+    publish(&staging.socket, path).await?;
+    Ok(listener)
+}
+
+/// Binds the socket somewhere no other user may reach it.
+async fn stage(staging: &Staging) -> io::Result<UnixListener> {
+    // A crash between staging and publishing leaves the directory behind, and
+    // a later process with the same id reaches the same name. Removing it is
+    // never recursive: this only ever clears what a staging attempt of ours
+    // would have left, and a directory somebody else planted at the name is
+    // reported rather than deleted.
+    discard(staging).await;
+    tokio::fs::DirBuilder::new()
+        .mode(STAGING_DIRECTORY_MODE)
+        .create(&staging.directory)
+        .await?;
+    let listener = UnixListener::bind(&staging.socket)?;
+    restrict(&staging.socket).await?;
+    Ok(listener)
+}
+
+/// Removes what a staging attempt leaves behind, best effort: the socket is
+/// gone already when publishing renamed rather than linked, and the directory
+/// only goes when it is this attempt's and empty.
+async fn discard(staging: &Staging) {
+    let _ = tokio::fs::remove_file(&staging.socket).await;
+    let _ = tokio::fs::remove_dir(&staging.directory).await;
 }
 
 /// Moves the bound socket onto the address it is published at.
@@ -262,10 +304,9 @@ fn staging_path(path: &Path) -> PathBuf {
 /// which is still atomic and still owner-only — it only loses the refusal.
 async fn publish(staging: &Path, path: &Path) -> io::Result<()> {
     match tokio::fs::hard_link(staging, path).await {
-        Ok(()) => {
-            // The link is the address now; the staging name has done its job.
-            tokio::fs::remove_file(staging).await
-        }
+        // The link is the address now; the staging name is the caller's to
+        // clear, along with the directory holding it.
+        Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!(
@@ -309,7 +350,8 @@ async fn remove_stale_socket(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnectDeadline, IpcListener, SOCKET_MODE, connect_ipc, listen_ipc, publish, staging_path,
+        ConnectDeadline, IpcListener, SOCKET_MODE, STAGING_DIRECTORY_MODE, connect_ipc, discard,
+        listen_ipc, publish, stage, staging_path,
     };
     use crate::close::close_codes;
     use crate::frame::Frame;
@@ -396,11 +438,42 @@ mod tests {
         let long = format!("/tmp/{}.sock", "a".repeat(80));
         let staging = staging_path(Path::new(&long));
         assert!(
-            staging.as_os_str().len() < long.len(),
+            staging.socket.as_os_str().len() < long.len(),
             "{} is not shorter than {long}",
-            staging.display()
+            staging.socket.display()
         );
-        assert_eq!(staging.parent(), Path::new(&long).parent());
+        assert_eq!(staging.directory.parent(), Path::new(&long).parent());
+    }
+
+    #[tokio::test]
+    async fn a_staged_socket_sits_where_no_other_user_may_reach_it() {
+        // `bind` takes its mode from the umask, so between it and the `chmod`
+        // the socket is whatever the umask allows — usually world-connectable.
+        // Nothing about the name protects it: it is this process's id, in a
+        // directory every local user may search. The directory it is staged
+        // inside is what refuses them.
+        let address = Address::new();
+        let staging = staging_path(&address.path());
+        let listener = stage(&staging).await.expect("a staged socket");
+
+        let containing = staging
+            .socket
+            .parent()
+            .expect("the socket is staged inside a directory of its own");
+        let mode = std::fs::metadata(containing)
+            .expect("the staging directory exists while the socket does")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode,
+            STAGING_DIRECTORY_MODE,
+            "expected {STAGING_DIRECTORY_MODE:o} on {}, got {mode:o}",
+            containing.display()
+        );
+
+        drop(listener);
+        discard(&staging).await;
     }
 
     #[tokio::test]
