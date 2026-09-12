@@ -142,7 +142,7 @@ pub async fn connect_websocket(
 ) -> Result<DialledWebSocketPort, ConnectError> {
     let request = build_request(url, options)?;
     let config = options.websocket.socket_config();
-    let connector = tls_connector()?;
+    let connector = tls_connector(url)?;
 
     let (stream, response) = connect_within(url, deadline, async move {
         connect_async_tls_with_config(request, Some(config), false, Some(connector))
@@ -212,13 +212,15 @@ fn build_request(
 
 /// The TLS client configuration `wss://` dials under: the webpki root set and
 /// the `ring` provider, built once for the process.
-fn tls_connector() -> Result<Connector, ConnectError> {
+fn tls_connector(target: &str) -> Result<Connector, ConnectError> {
     static CONNECTOR: OnceLock<Result<Connector, String>> = OnceLock::new();
     CONNECTOR
         .get_or_init(build_tls_connector)
         .clone()
         .map_err(|detail| ConnectError::Refused {
-            target: "wss://".to_owned(),
+            // The URL that was dialled, not the scheme it might have used: a
+            // refusal names the target a caller passed in.
+            target: target.to_owned(),
             detail,
         })
 }
@@ -322,6 +324,7 @@ mod tests {
     fn the_tls_configuration_builds_with_the_ring_provider() {
         // A provider that would not build is a `wss://` dial that fails at
         // run time on exactly the platforms the CI matrix covers.
-        tls_connector().expect("the ring provider and the webpki roots agree");
+        tls_connector("wss://hub.example/runtime")
+            .expect("the ring provider and the webpki roots agree");
     }
 }
