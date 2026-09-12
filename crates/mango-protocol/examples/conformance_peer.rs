@@ -50,8 +50,10 @@ enum Mode {
 struct Arguments {
     mode: Mode,
     token: Option<String>,
-    /// Serve the session but never read stdin, so a launcher's termination
-    /// sequence has to escalate past the end of file it starts with.
+    /// Never read stdin, and never start a session over it, so a launcher's
+    /// termination sequence has to escalate past the end of file it starts
+    /// with. A child that answered frames would leave on that end of file,
+    /// which is the case the other mode already covers.
     ignore_stdin: bool,
 }
 
