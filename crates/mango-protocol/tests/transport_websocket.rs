@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use mango_protocol::close::close_codes;
 use mango_protocol::session::{Session, SessionClosure, SessionOptions};
 use mango_protocol::testing::{ConformancePair, Fixture, RawConnection, run_conformance_suite};
@@ -299,7 +299,21 @@ async fn a_dialler_that_does_not_offer_the_subprotocol_is_closed_with_4400() {
         .await
         .expect_err("a connection without mango.v1 is not a session");
     assert!(matches!(refusal, AcceptError::Subprotocol), "{refusal}");
-    let _ = dialling.await;
+
+    // The upgrade completed, so the dialler is owed a code it can read rather
+    // than a socket that simply stopped.
+    let (mut dialled, _response) = dialling
+        .await
+        .expect("the dial task runs")
+        .expect("the upgrade itself succeeds");
+    let mut code = None;
+    while let Some(Ok(message)) = dialled.next().await {
+        if let tokio_tungstenite::tungstenite::Message::Close(frame) = message {
+            code = frame.map(|frame| u16::from(frame.code));
+            break;
+        }
+    }
+    assert_eq!(code, Some(close_codes::PROTOCOL_ERROR));
 }
 
 #[tokio::test]
