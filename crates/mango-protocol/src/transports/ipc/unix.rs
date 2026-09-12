@@ -133,12 +133,12 @@ impl IpcListener {
 /// Listens on a local socket, owner-only from the instant the address exists.
 ///
 /// The socket is bound at a temporary name beside `path`, restricted to
-/// `0600` while only this process knows about it, and then renamed onto
+/// `0600` while only this process knows about it, and then published at
 /// `path`. `bind` takes its mode from the umask, so binding straight onto the
 /// address would publish a world-connectable socket for as long as a `chmod`
 /// takes; the TypeScript SDK closes that window by setting the process-wide
 /// umask, which a library cannot do without reaching into every other thread.
-/// A rename is atomic and local to this call.
+/// Publishing afterwards is local to this call and costs no such thing.
 ///
 /// A stale socket file left by a previous process is removed first. Anything
 /// else at the address is refused rather than replaced: a regular file there
@@ -148,7 +148,8 @@ impl IpcListener {
 ///
 /// Whatever binding, restricting or publishing the address failed with, and
 /// [`io::ErrorKind::AlreadyExists`] when something that is not a socket
-/// already holds the address.
+/// already holds the address, or when another listener took it while this one
+/// was binding.
 pub async fn listen_ipc(path: impl AsRef<Path>) -> io::Result<IpcListener> {
     let path = path.as_ref().to_path_buf();
     remove_stale_socket(&path).await?;
@@ -164,7 +165,7 @@ pub async fn listen_ipc(path: impl AsRef<Path>) -> io::Result<IpcListener> {
         let _ = tokio::fs::remove_file(&staging).await;
         return Err(error);
     }
-    if let Err(error) = tokio::fs::rename(&staging, &path).await {
+    if let Err(error) = publish(&staging, &path).await {
         let _ = tokio::fs::remove_file(&staging).await;
         return Err(error);
     }
@@ -232,6 +233,35 @@ fn staging_path(path: &Path) -> PathBuf {
     PathBuf::from(staging)
 }
 
+/// Moves the bound socket onto the address it is published at.
+///
+/// A hard link, not a rename, because it is the one of the two that refuses
+/// rather than replaces: a second listener that bound the same address while
+/// this one was setting up gets [`io::ErrorKind::AlreadyExists`], which is the
+/// `EADDRINUSE` a plain `bind` onto the address would have produced. A rename
+/// would silently take the address over and leave that listener bound to an
+/// inode no client can reach.
+///
+/// A filesystem that will not hard-link a socket falls back to the rename,
+/// which is still atomic and still owner-only — it only loses the refusal.
+async fn publish(staging: &Path, path: &Path) -> io::Result<()> {
+    match tokio::fs::hard_link(staging, path).await {
+        Ok(()) => {
+            // The link is the address now; the staging name has done its job.
+            tokio::fs::remove_file(staging).await
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "{} was taken by another listener while this one was binding; \
+                 expected the address to be free",
+                path.display()
+            ),
+        )),
+        Err(_) => tokio::fs::rename(staging, path).await,
+    }
+}
+
 /// Makes the socket file readable and writable by its owner alone.
 async fn restrict(path: &Path) -> io::Result<()> {
     tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_MODE)).await
@@ -262,7 +292,9 @@ async fn remove_stale_socket(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConnectDeadline, IpcListener, SOCKET_MODE, connect_ipc, listen_ipc, staging_path};
+    use super::{
+        ConnectDeadline, IpcListener, SOCKET_MODE, connect_ipc, listen_ipc, publish, staging_path,
+    };
     use crate::frame::Frame;
     use crate::port::{Inbound, Port, PortRx, PortTx};
     use crate::transports::deadline::ConnectError;
@@ -374,6 +406,34 @@ mod tests {
         assert!(
             !address.path().exists(),
             "a closed listener leaves no address behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn publishing_onto_an_address_that_appeared_meanwhile_is_refused() {
+        // The window this closes is between the stale-socket check and the
+        // publish, which no test can open on purpose; what can be checked is
+        // that the step itself refuses rather than replaces. A rename would
+        // have taken the address over and left its listener on an inode no
+        // client can reach.
+        let address = Address::new();
+        let staging = address.0.join("staging.sock");
+        let taken = address.path();
+        std::fs::write(&staging, b"the socket this listener bound").expect("a staging file");
+        std::fs::write(&taken, b"what another listener published").expect("an occupied address");
+
+        let error = publish(&staging, &taken)
+            .await
+            .expect_err("the address is no longer free");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(
+            error.to_string().contains("while this one was binding"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(&taken).expect("the address is untouched"),
+            b"what another listener published"
         );
     }
 
