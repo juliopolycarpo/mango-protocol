@@ -961,7 +961,7 @@ mod tests {
             .port
             .take()
             .expect("the port is split once")
-            .with_max_frame_bytes(512)
+            .with_max_frame_bytes(4096)
             .split();
         drop(rx);
 
