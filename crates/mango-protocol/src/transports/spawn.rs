@@ -9,6 +9,7 @@
 //! with those observations.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -318,6 +319,12 @@ impl SpawnOptions {
 /// in mixed case (`Path`, `SystemRoot`); the original spelling is what the
 /// child receives.
 ///
+/// A variable this process cannot spell as UTF-8 is dropped rather than
+/// repaired. POSIX environments are bytes, and a lossy `PATH` is a `PATH` that
+/// resolves somewhere else: a child that is told nothing fails visibly, where
+/// a child handed a mangled one may run the wrong program. The caller's own
+/// entries are unaffected — they are already strings.
+///
 /// # Example
 ///
 /// ```
@@ -333,7 +340,21 @@ pub fn sanitized_env<I>(extra: I) -> BTreeMap<String, String>
 where
     I: IntoIterator<Item = (String, String)>,
 {
-    sanitized_env_from(std::env::vars(), extra)
+    sanitized_env_from(utf8_vars(std::env::vars_os()), extra)
+}
+
+/// The variables of an environment that can be spelled as UTF-8.
+///
+/// [`std::env::vars`] would do this by panicking on the first byte sequence
+/// that cannot: one unrelated variable, set by something else entirely, would
+/// take down a launch that never wanted to read it.
+fn utf8_vars<I>(source: I) -> impl Iterator<Item = (String, String)>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    source
+        .into_iter()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
 }
 
 /// [`sanitized_env`] over an explicit source, so a test can see what the rule
@@ -1161,5 +1182,31 @@ mod tests {
             !why.stderr_line.is_empty(),
             "the launcher's own observation is in the tail"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_variable_that_is_not_utf8_is_dropped_rather_than_read() {
+        // POSIX environments are bytes. `std::env::vars` panics on the first
+        // one that is not UTF-8, so a variable nothing here would have kept —
+        // set by something else entirely — used to take the launch with it.
+        use super::utf8_vars;
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let source = [
+            (OsString::from("PATH"), OsString::from("/usr/bin")),
+            (
+                OsString::from("EDITOR"),
+                OsString::from_vec(vec![0xff, 0xfe]),
+            ),
+            (
+                OsString::from_vec(vec![0xff, 0xfe]),
+                OsString::from("anything"),
+            ),
+        ];
+
+        let kept: Vec<_> = utf8_vars(source).collect();
+        assert_eq!(kept, vec![("PATH".to_owned(), "/usr/bin".to_owned())]);
     }
 }
