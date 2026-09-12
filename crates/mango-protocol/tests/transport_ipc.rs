@@ -7,9 +7,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use mango_protocol::close::close_codes;
 use mango_protocol::session::{Session, SessionClosure, SessionOptions};
-use mango_protocol::testing::{ConformancePair, Fixture, NoRawConnection, run_conformance_suite};
+use mango_protocol::testing::{ConformancePair, Fixture, RawConnection, run_conformance_suite};
 use mango_protocol::transports::deadline::ConnectDeadline;
 use mango_protocol::transports::ipc::{IpcListener, connect_ipc, listen_ipc};
+use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
 
 static NEXT_ADDRESS: AtomicU64 = AtomicU64::new(0);
@@ -70,11 +71,71 @@ impl ConformancePair for SocketPair {
     }
 }
 
+/// A bare client on the same address, with no port over it: the far end of a
+/// raw fixture is bytes a test writes by hand.
+#[cfg(unix)]
+async fn raw_client(path: &str) -> tokio::net::UnixStream {
+    tokio::net::UnixStream::connect(path)
+        .await
+        .expect("the listener accepts")
+}
+
+#[cfg(windows)]
+async fn raw_client(path: &str) -> tokio::net::windows::named_pipe::NamedPipeClient {
+    tokio::net::windows::named_pipe::ClientOptions::new()
+        .open(path)
+        .expect("the listener accepts")
+}
+
+#[cfg(unix)]
+type RawClient = tokio::net::UnixStream;
+#[cfg(windows)]
+type RawClient = tokio::net::windows::named_pipe::NamedPipeClient;
+
+/// Side `a` is the accepted connection; its peer is a socket this test writes
+/// lines into directly.
+struct RawSocket {
+    a: Session,
+    driver: Option<JoinHandle<SessionClosure>>,
+    peer: Option<RawClient>,
+    listener: Option<IpcListener>,
+}
+
+impl RawConnection for RawSocket {
+    fn a(&self) -> &Session {
+        &self.a
+    }
+
+    async fn write(&mut self, line: &str) {
+        let peer = self.peer.as_mut().expect("the raw client is still open");
+        peer.write_all(line.as_bytes())
+            .await
+            .expect("the socket takes the line");
+        peer.write_all(b"\n")
+            .await
+            .expect("the socket takes the terminator");
+        peer.flush().await.expect("the socket flushes");
+    }
+
+    async fn close(&mut self) {
+        self.a.close_now(close_codes::RELEASED, None);
+        // Dropping the raw client is the peer hanging up, which is what lets
+        // a's driver finish rather than block on a read nobody will answer.
+        self.peer.take();
+        if let Some(driver) = self.driver.take() {
+            let _ = driver.await;
+        }
+        if let Some(listener) = self.listener.take() {
+            listener.close().await;
+        }
+    }
+}
+
 struct IpcFixture;
 
 impl Fixture for IpcFixture {
     type Pair = SocketPair;
-    type Raw = NoRawConnection;
+    type Raw = RawSocket;
 
     async fn connect(&self, a: SessionOptions, b: SessionOptions) -> SocketPair {
         let path = address();
@@ -108,6 +169,29 @@ impl Fixture for IpcFixture {
     /// stdio.
     fn chunked(&self) -> bool {
         true
+    }
+
+    fn supports_raw(&self) -> bool {
+        true
+    }
+
+    async fn connect_raw(&self, a: SessionOptions) -> RawSocket {
+        let path = address();
+        let mut listener = listen_ipc(&path).await.expect("the address is free");
+        let dialling = tokio::spawn({
+            let path = path.clone();
+            async move { raw_client(&path).await }
+        });
+        let (accepted, _identity) = listener.accept().await.expect("a connection arrives");
+        let peer = dialling.await.expect("the dial task runs");
+
+        let (session, driver) = Session::spawn(accepted, a);
+        RawSocket {
+            a: session,
+            driver: Some(driver),
+            peer: Some(peer),
+            listener: Some(listener),
+        }
     }
 }
 

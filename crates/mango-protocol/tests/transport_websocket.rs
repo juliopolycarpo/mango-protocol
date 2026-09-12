@@ -9,9 +9,10 @@
 
 use std::time::Duration;
 
+use futures_util::SinkExt;
 use mango_protocol::close::close_codes;
 use mango_protocol::session::{Session, SessionClosure, SessionOptions};
-use mango_protocol::testing::{ConformancePair, Fixture, NoRawConnection, run_conformance_suite};
+use mango_protocol::testing::{ConformancePair, Fixture, RawConnection, run_conformance_suite};
 use mango_protocol::transports::deadline::{ConnectDeadline, ConnectError};
 use mango_protocol::transports::websocket::client::{WebSocketConnectOptions, connect_websocket};
 use mango_protocol::transports::websocket::server::{AcceptError, accept_websocket};
@@ -107,13 +108,52 @@ impl ConformancePair for SocketPair {
     }
 }
 
+/// The nine-byte chunk header of a frame that fits in one message: format
+/// version 1, chunk index 0, chunk count 1.
+const SINGLE_CHUNK_HEADER: [u8; 9] = [1, 0, 0, 0, 0, 0, 0, 0, 1];
+
+/// Side `a` is the accepted connection; its peer is a socket this test sends
+/// hand-built chunk messages on.
+struct RawSocket {
+    a: Session,
+    driver: Option<JoinHandle<SessionClosure>>,
+    peer: Option<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>>,
+}
+
+impl RawConnection for RawSocket {
+    fn a(&self) -> &Session {
+        &self.a
+    }
+
+    async fn write(&mut self, line: &str) {
+        let peer = self.peer.as_mut().expect("the raw socket is still open");
+        let mut message = SINGLE_CHUNK_HEADER.to_vec();
+        message.extend_from_slice(line.as_bytes());
+        peer.send(tokio_tungstenite::tungstenite::Message::Binary(
+            message.into(),
+        ))
+        .await
+        .expect("the socket takes the message");
+    }
+
+    async fn close(&mut self) {
+        self.a.close_now(close_codes::RELEASED, None);
+        if let Some(mut peer) = self.peer.take() {
+            let _ = peer.close(None).await;
+        }
+        if let Some(driver) = self.driver.take() {
+            let _ = driver.await;
+        }
+    }
+}
+
 struct WebSocketFixture {
     options: WebSocketOptions,
 }
 
 impl Fixture for WebSocketFixture {
     type Pair = SocketPair;
-    type Raw = NoRawConnection;
+    type Raw = RawSocket;
 
     async fn connect(&self, a: SessionOptions, b: SessionOptions) -> SocketPair {
         let acceptor = Acceptor::bind(self.options).await;
@@ -142,6 +182,47 @@ impl Fixture for WebSocketFixture {
     /// are an interleaving test the suite knows how to run.
     fn chunked(&self) -> bool {
         true
+    }
+
+    fn supports_raw(&self) -> bool {
+        true
+    }
+
+    async fn connect_raw(&self, a: SessionOptions) -> RawSocket {
+        let acceptor = Acceptor::bind(self.options).await;
+        let address = acceptor.listener.local_addr().expect("a bound address");
+        // A bare tungstenite dial that offers the subprotocol but puts no port
+        // over the socket: the messages are this test's to build.
+        let dialling = tokio::spawn(async move {
+            let mut request =
+                tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
+                    format!("ws://{address}/conformance"),
+                )
+                .expect("a ws URL");
+            request.headers_mut().insert(
+                "sec-websocket-protocol",
+                tokio_tungstenite::tungstenite::http::HeaderValue::from_static("mango.v1"),
+            );
+            request.headers_mut().insert(
+                "authorization",
+                tokio_tungstenite::tungstenite::http::HeaderValue::from_static(
+                    "Bearer conformance-token",
+                ),
+            );
+            tokio_tungstenite::connect_async(request)
+                .await
+                .expect("the acceptor selects mango.v1")
+                .0
+        });
+        let accepted = acceptor.accept().await.expect("the credential is known");
+        let peer = dialling.await.expect("the dial task runs");
+
+        let (session, driver) = Session::spawn(accepted, a);
+        RawSocket {
+            a: session,
+            driver: Some(driver),
+            peer: Some(peer),
+        }
     }
 }
 
