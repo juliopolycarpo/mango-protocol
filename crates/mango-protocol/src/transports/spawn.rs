@@ -1105,16 +1105,32 @@ mod tests {
     }
 
     #[test]
-    fn a_secret_shaped_name_is_dropped_even_off_the_allowlist() {
+    fn a_secret_shaped_name_is_dropped_though_the_allowlist_would_keep_it() {
+        // The allowlist runs first, so a name it does not hold is gone before
+        // the secret rule is asked about it: `XDG_RUNTIME_DIR_TOKEN` proves
+        // nothing about that rule. `LC_*` is the one family kept by prefix, so
+        // it is where the rule still has work to do — delete `is_secret_shaped`
+        // and `LC_API_KEY` reaches the child.
+        //
         // Windows spells its variables in mixed case, so the match is made on
         // the upper-cased name and the original spelling is what survives.
         let source = [
             ("Path".to_owned(), "C:\\bin".to_owned()),
+            ("LC_API_KEY".to_owned(), "shh".to_owned()),
+            ("Lc_Password".to_owned(), "shh".to_owned()),
             ("XDG_RUNTIME_DIR_TOKEN".to_owned(), "shh".to_owned()),
         ];
         let env = sanitized_env_from(source, []);
         assert_eq!(env.get("Path").map(String::as_str), Some("C:\\bin"));
-        assert!(!env.contains_key("XDG_RUNTIME_DIR_TOKEN"));
+        assert!(
+            !env.contains_key("LC_API_KEY"),
+            "the allowlist keeps LC_*; the secret rule is what drops this one"
+        );
+        assert!(!env.contains_key("Lc_Password"), "matched upper-cased");
+        assert!(
+            !env.contains_key("XDG_RUNTIME_DIR_TOKEN"),
+            "not on the allowlist at all"
+        );
     }
 
     #[test]
