@@ -8,9 +8,9 @@ use std::time::Duration;
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, watch};
 
-use crate::codec::ndjson::DEFAULT_MAX_FRAME_BYTES;
-use crate::error::RemoteError;
-use crate::frame::{Event, PeerInfo};
+use crate::codec::ndjson::{DEFAULT_MAX_FRAME_BYTES, encode_frame_bytes};
+use crate::error::{CodecErrorKind, RemoteError, codes};
+use crate::frame::{Event, Frame, PeerInfo};
 use crate::version::ProtocolVersion;
 
 use super::command::Command;
@@ -79,6 +79,34 @@ impl Shared {
                 usize::try_from(bytes).unwrap_or(usize::MAX)
             });
         self.local_max_frame_bytes.min(remote_limit)
+    }
+
+    /// Validates `frame` and measures its encoded size against the session's
+    /// negotiated limit, mirroring what a port's own `send` would discover,
+    /// but synchronously and before the frame ever reaches the port.
+    ///
+    /// [`crate::port::PortTx::send`] promises its implementors exactly this:
+    /// that a session has already run both checks, so a port may trust the
+    /// frame it is handed. Every outbound frame this session builds — the
+    /// handshake `hello` included — goes through here first.
+    pub(super) fn assert_fits(&self, frame: &Frame, what: &str) -> Result<(), RemoteError> {
+        let limit = self.send_limit_bytes();
+        match encode_frame_bytes(frame, limit) {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind == CodecErrorKind::TooLarge => {
+                let bytes = serde_json::to_vec(frame).map_or(limit + 1, |encoded| encoded.len());
+                Err(RemoteError::new(
+                    codes::FRAME_TOO_LARGE,
+                    format!("{what} encodes to {bytes} bytes; the session limit is {limit} bytes."),
+                )
+                .with_detail("bytes", u64::try_from(bytes).unwrap_or(u64::MAX))
+                .with_detail("limit", u64::try_from(limit).unwrap_or(u64::MAX)))
+            }
+            Err(error) => Err(RemoteError::new(
+                codes::INTERNAL,
+                format!("{what} failed to encode: {error}"),
+            )),
+        }
     }
 
     /// Settles the ready watch with `Ok(remote)`, unless something already

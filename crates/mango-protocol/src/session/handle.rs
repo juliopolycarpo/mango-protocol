@@ -7,8 +7,7 @@ use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::codec::ndjson::encode_frame_bytes;
-use crate::error::{CodecErrorKind, RemoteError, codes};
+use crate::error::{RemoteError, codes};
 use crate::frame::{End, Event, Frame, Limits, PeerInfo, Request};
 use crate::validate::{is_reserved_method_name, is_valid_method_name};
 use crate::version::ProtocolVersion;
@@ -337,7 +336,8 @@ impl Session {
             method: method.to_string(),
             params,
         });
-        assert_fits(&self.shared, &frame, &format!("Request \"{method}\""))?;
+        self.shared
+            .assert_fits(&frame, &format!("Request \"{method}\""))?;
 
         let (reply_tx, mut reply_rx) = oneshot::channel();
         if self
@@ -460,7 +460,7 @@ impl Session {
             payload,
             end: end.then_some(End),
         });
-        assert_fits(&self.shared, &frame, &what)?;
+        self.shared.assert_fits(&frame, &what)?;
         if end {
             sequences.remove(&key);
         } else {
@@ -510,29 +510,6 @@ async fn timeout_wait(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(instant) => tokio::time::sleep_until(instant).await,
         None => std::future::pending().await,
-    }
-}
-
-/// Validates `frame` and measures its encoded size against the session's
-/// negotiated limit, mirroring what a port's own `send` would discover, but
-/// synchronously and before the frame ever reaches the command channel.
-fn assert_fits(shared: &Shared, frame: &Frame, what: &str) -> Result<(), RemoteError> {
-    let limit = shared.send_limit_bytes();
-    match encode_frame_bytes(frame, limit) {
-        Ok(_) => Ok(()),
-        Err(error) if error.kind == CodecErrorKind::TooLarge => {
-            let bytes = serde_json::to_vec(frame).map_or(limit + 1, |encoded| encoded.len());
-            Err(RemoteError::new(
-                codes::FRAME_TOO_LARGE,
-                format!("{what} encodes to {bytes} bytes; the session limit is {limit} bytes."),
-            )
-            .with_detail("bytes", u64::try_from(bytes).unwrap_or(u64::MAX))
-            .with_detail("limit", u64::try_from(limit).unwrap_or(u64::MAX)))
-        }
-        Err(error) => Err(RemoteError::new(
-            codes::INTERNAL,
-            format!("{what} failed to encode: {error}"),
-        )),
     }
 }
 

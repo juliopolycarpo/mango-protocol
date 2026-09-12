@@ -103,20 +103,21 @@ impl<Tx: PortTx, Rx: PortRx> SessionDriver<Tx, Rx> {
     /// commands until something ends the session; tears it down and returns
     /// why.
     pub async fn run(mut self) -> SessionClosure {
-        let hello = self.build_hello();
-        let hello_outcome = self.tx.send(Frame::Hello(hello)).await;
-        if !matches!(hello_outcome, SendOutcome::Sent) {
-            // The transport can go away between construction and the first
-            // send: a peer that refuses the credential closes the socket the
-            // moment it opens.
-            let detail = match &hello_outcome {
-                SendOutcome::Refused(error) => error.to_string(),
-                _ => "the port is already closed".to_string(),
-            };
-            self.shared.fail_ready(RemoteError::new(
-                codes::UNAVAILABLE,
-                format!("The transport refused the hello: {detail}"),
-            ));
+        let hello = Frame::Hello(self.build_hello());
+        // The hello takes the same preflight as every other outbound frame:
+        // `PortTx::send` promises its implementors a frame that is already
+        // valid and within the ceiling, and a port that trusts that promise —
+        // a clone-mode `MemoryPort`, say — would otherwise put an invalid
+        // `PeerInfo`, or an oversized capability object, straight on the wire.
+        let refusal = match self.shared.assert_fits(&hello, "The hello") {
+            Err(error) => Some(error),
+            // The transport can also go away between construction and the
+            // first send: a peer that refuses the credential closes the socket
+            // the moment it opens.
+            Ok(()) => refused_hello(self.tx.send(hello).await),
+        };
+        if let Some(error) = refusal {
+            self.shared.fail_ready(error);
             let writer = Writer::spawn(self.tx);
             return teardown::teardown(
                 self.shared,
@@ -220,6 +221,19 @@ impl<Tx: PortTx, Rx: PortRx> SessionDriver<Tx, Rx> {
             }),
         }
     }
+}
+
+/// Why the hello never reached the peer, or `None` when it went out.
+fn refused_hello(outcome: SendOutcome) -> Option<RemoteError> {
+    let detail = match outcome {
+        SendOutcome::Sent => return None,
+        SendOutcome::Refused(error) => error.to_string(),
+        _ => "the port is already closed".to_string(),
+    };
+    Some(RemoteError::new(
+        codes::UNAVAILABLE,
+        format!("The transport refused the hello: {detail}"),
+    ))
 }
 
 /// Routes one inbound frame. `Some` breaks the main loop with that reason.

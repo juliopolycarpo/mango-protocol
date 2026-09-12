@@ -168,6 +168,41 @@ async fn closes_under_a_flood_of_inbound_frames() {
     );
 }
 
+/// `PortTx::send` promises its caller every frame is already valid and within
+/// the negotiated ceiling. The hello is a frame like any other, so it takes the
+/// same preflight — otherwise a clone-mode pair, or any port that trusts that
+/// promise, puts a schema-invalid hello straight on the wire.
+#[tokio::test]
+async fn refuses_to_send_a_hello_that_does_not_validate() {
+    let (a, b) = port_pair();
+    let invalid = PeerInfo {
+        name: String::new(),
+        version: "0.1.0".into(),
+        role: "runtime".into(),
+    };
+    let (session, _driver) = Session::spawn(a, SessionOptions::new(invalid));
+    let mut raw = RawPeer::new(b);
+
+    let error = within("ready()", session.ready())
+        .await
+        .expect_err("the local hello does not validate");
+    assert!(
+        error.message.contains("hello.peer.name"),
+        "expected the refusal to name the offending member | received: {}",
+        error.message
+    );
+
+    let closure = within("closed()", session.closed()).await;
+    assert_eq!(closure.code, close_codes::RELEASED);
+    assert_eq!(closure.reason.as_deref(), Some("hello could not be sent"));
+
+    // Nothing reached the peer: the port's own closure is the first item.
+    match within("the peer's first inbound item", raw.next()).await {
+        Inbound::Closed(_) => {}
+        other => panic!("expected the peer to receive no frame | received: {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn answers_a_request_that_arrives_before_the_handshake_with_unavailable() {
     let (a, b) = port_pair();
