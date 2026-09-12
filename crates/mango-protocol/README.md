@@ -36,8 +36,12 @@ What the crate covers:
 - behind the `tokio` feature, a `Session` (request/response multiplexing, cancel, event streams,
   liveness, graceful close) over any `Port`, and a `Contract` builder that validates, serves and
   calls it — see `cargo run --example session_pair --features tokio` and `docs/adopt-rust.md`;
-- behind the `testing` feature, a reusable conformance suite a transport crate runs its own `Port`
-  against.
+- behind the `testing` feature, a reusable conformance suite every transport here runs against,
+  and that a transport crate of your own can run its `Port` against;
+- behind `tokio`, `websocket` and `spawn`, the transports themselves: stdio, a local socket
+  (a Unix domain socket or a Windows named pipe, each published owner-only), a WebSocket dialler
+  and acceptor with `wss://` over rustls, and a spawn launcher with the hardened `ssh` argv
+  preset.
 
-Transports of their own are a later milestone. The codec-only path depends on `serde` and
-`serde_json` only; `tokio`/`tokio-util`/`jsonschema` arrive only behind the `tokio` feature. MIT.
+The codec-only path depends on `serde` and `serde_json` only; `tokio`/`tokio-util`/`jsonschema`
+arrive only behind the `tokio` feature, and each transport feature adds its own. MIT.
