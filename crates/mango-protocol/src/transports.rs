@@ -13,6 +13,7 @@
 //! | [`stdio`] | standard input and standard output |
 //! | [`ipc`] | a Unix domain socket, or a Windows named pipe |
 //! | [`spawn`] | a child process's own standard streams |
+//! | [`websocket`] | one WebSocket connection, dialled or accepted |
 //!
 //! [`deadline`] is not a transport but the bound every dialling one connects
 //! under, and the one error type they all fail with; [`ssh`] is not one
@@ -26,5 +27,7 @@ pub mod spawn;
 #[cfg(feature = "spawn")]
 pub mod ssh;
 pub mod stdio;
+#[cfg(feature = "websocket")]
+pub mod websocket;
 
 pub use deadline::{ConnectDeadline, ConnectError};

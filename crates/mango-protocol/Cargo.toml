@@ -32,14 +32,28 @@ tokio = [
 testing = ["tokio"]
 # The spawn launcher and the ssh argv preset it is usually given.
 spawn = ["tokio", "tokio/process", "dep:nix"]
+# The WebSocket dialler and acceptor, with client-side TLS for wss://.
+websocket = [
+  "tokio",
+  "dep:futures-util",
+  "dep:tokio-tungstenite",
+  "dep:rustls",
+  "dep:webpki-roots",
+]
 
 [dependencies]
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["sink"] }
 jsonschema = { version = "0.56", optional = true, default-features = false }
+# `ring`, not the `aws-lc-rs` default: it builds without cmake or nasm, which
+# is what keeps the Windows and aarch64 CI lanes from needing a C toolchain.
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 schemars = { version = "1.2", optional = true, features = ["derive"] }
 serde = { version = "1.0.219", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.140", default-features = false, features = ["std"] }
 tokio = { version = "1.53", optional = true, default-features = false, features = ["rt", "sync", "time", "macros"] }
+tokio-tungstenite = { version = "0.30", optional = true, default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", optional = true, default-features = false }
+webpki-roots = { version = "1", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # `SIGTERM`: step 2 of the termination sequence, which `std` and `tokio` can
