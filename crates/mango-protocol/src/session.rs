@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{mpsc, watch};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinHandle;
 
 use crate::codec::ndjson::DEFAULT_MAX_FRAME_BYTES;
 use crate::port::Port;
@@ -26,7 +26,9 @@ mod shared;
 mod teardown;
 
 pub use driver::SessionDriver;
-pub use handle::{RemotePeer, RequestOptions, Session, SessionState};
+pub use handle::{
+    EventInput, EventStream, PongStream, RemotePeer, RequestOptions, Session, SessionState,
+};
 pub use handler::{CallContext, Handler, HandlerFuture, HandlerGuard};
 pub use options::SessionOptions;
 pub use teardown::SessionClosure;
@@ -82,6 +84,9 @@ impl Session {
             handlers: Mutex::new(HashMap::new()),
             next_generation: std::sync::atomic::AtomicU64::new(0),
             handler_grace: options.handler_grace,
+            event_sequences: Mutex::new(HashMap::new()),
+            event_subscribers: Mutex::new(Vec::new()),
+            pong_subscribers: Mutex::new(Vec::new()),
         });
         for (method, handler) in options.handlers {
             shared.register_handler(method, handler);
@@ -96,9 +101,10 @@ impl Session {
             commands: commands_rx,
             handshake_timeout: options.handshake_timeout,
             pending: HashMap::new(),
-            tasks: JoinSet::new(),
-            active: HashMap::new(),
-            by_task_id: HashMap::new(),
+            tracking: dispatch::RequestTracking::default(),
+            liveness_interval: options.liveness_interval,
+            liveness: None,
+            awaiting_pong: false,
         };
         (session, driver)
     }

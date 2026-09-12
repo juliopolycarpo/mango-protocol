@@ -1,6 +1,5 @@
-//! Mirrors the handshake, frame-ceiling, dispatch and teardown cases of
-//! `packages/protocol/src/session.test.ts`. Events and liveness are covered
-//! once the driver grows those match arms.
+//! Mirrors the handshake, frame-ceiling, dispatch, events/liveness and
+//! teardown cases of `packages/protocol/src/session.test.ts`.
 #![cfg(feature = "tokio")]
 
 mod support;
@@ -14,7 +13,9 @@ use mango_protocol::frame::{
     Close, ErrorPayload, ErrorResponse, Hello, Limits, PeerInfo, Request, Response,
 };
 use mango_protocol::port::{Inbound, PortClosure, port_pair};
-use mango_protocol::session::{CallContext, RequestOptions, Session, SessionOptions, SessionState};
+use mango_protocol::session::{
+    CallContext, EventInput, RequestOptions, Session, SessionOptions, SessionState,
+};
 use mango_protocol::{CodecError, Frame};
 use serde_json::Value;
 use tokio::sync::oneshot;
@@ -511,4 +512,183 @@ async fn aborts_the_handler_signal_when_the_session_closes() {
     assert_eq!(closure.unfinished_handlers, 0);
 
     let _ = requester.await;
+}
+
+fn tick_event(topic: &str) -> EventInput {
+    EventInput {
+        topic: topic.into(),
+        payload: Value::from(1),
+        stream_id: None,
+        end: false,
+    }
+}
+
+#[tokio::test]
+async fn drops_events_emitted_before_the_handshake_and_after_close() {
+    let (a, b) = port_pair();
+    let (session, driver) = Session::open(a, SessionOptions::new(peer("a")));
+    tokio::spawn(driver.run());
+    let mut raw = RawPeer::new(b);
+
+    let early = session
+        .emit(tick_event("test.early"))
+        .expect("emit does not fail before the handshake");
+    assert!(
+        !early,
+        "expected the event before the handshake to be dropped"
+    );
+
+    raw.send(hello_frame("b")).await;
+    within("ready()", session.ready())
+        .await
+        .expect("handshake succeeds");
+
+    let ok = session
+        .emit(tick_event("test.ok"))
+        .expect("emit does not fail once ready");
+    assert!(ok, "expected the event to be sent once ready");
+
+    session.close(close_codes::RELEASED, None).await;
+
+    let late = session
+        .emit(tick_event("test.late"))
+        .expect("emit does not fail after close");
+    assert!(!late, "expected the event after close to be dropped");
+}
+
+#[tokio::test(start_paused = true)]
+async fn closes_with_a_liveness_timeout_when_pongs_stop() {
+    let (a, b) = port_pair();
+    let options =
+        SessionOptions::new(peer("a")).with_liveness_interval(Some(Duration::from_millis(15)));
+    let (session, driver) = Session::open(a, options);
+    tokio::spawn(driver.run());
+    let mut raw = RawPeer::new(b);
+
+    raw.send(hello_frame("b")).await;
+    within("ready()", session.ready())
+        .await
+        .expect("handshake succeeds");
+
+    // The peer never answers a ping, so the second tick (one missed round
+    // trip) closes the session.
+    let closure = within("closed()", session.closed()).await;
+    assert_eq!(closure.code, close_codes::RELEASED);
+    assert_eq!(closure.reason.as_deref(), Some("liveness timeout"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn stays_open_while_the_peer_answers_pings() {
+    let (a, b) = port_pair();
+    let options =
+        SessionOptions::new(peer("a")).with_liveness_interval(Some(Duration::from_millis(10)));
+    let (session, driver) = Session::open(a, options);
+    tokio::spawn(driver.run());
+    let mut raw = RawPeer::new(b);
+
+    raw.send(hello_frame("b")).await;
+    within("ready()", session.ready())
+        .await
+        .expect("handshake succeeds");
+
+    tokio::spawn(async move {
+        loop {
+            match raw.next().await {
+                Inbound::Frame(Frame::Ping) => raw.send(Frame::Pong).await,
+                Inbound::Closed(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(session.state(), SessionState::Ready);
+    session.close_now(close_codes::RELEASED, None);
+}
+
+// The remaining two cases are Rust-only: nothing in the TS table names them,
+// but "every new function gets a test" covers `emit`'s per-stream sequencing
+// and `ping`/`pongs` regardless.
+
+#[tokio::test]
+async fn sequences_events_per_stream_key_and_releases_the_counter_on_end() {
+    let (a, b) = port_pair();
+    let (session_a, _driver_a) = Session::spawn(a, SessionOptions::new(peer("a")));
+    let (session_b, _driver_b) = Session::spawn(b, SessionOptions::new(peer("b")));
+    within("a's ready()", session_a.ready())
+        .await
+        .expect("handshake succeeds");
+    within("b's ready()", session_b.ready())
+        .await
+        .expect("handshake succeeds");
+
+    let mut events = session_b.events();
+
+    for (payload, end) in [(1, false), (2, false), (3, true)] {
+        session_a
+            .emit(EventInput {
+                topic: "fs.changed".into(),
+                payload: Value::from(payload),
+                stream_id: Some("s1".into()),
+                end,
+            })
+            .expect("emit does not fail once ready");
+    }
+    // `end` released the "s1" counter; a new stream on the same key restarts
+    // at 0. A different key (no stream_id) is independent, starting at its
+    // own 0 regardless of how many events "s1" has already seen.
+    session_a
+        .emit(EventInput {
+            topic: "fs.changed".into(),
+            payload: Value::from(4),
+            stream_id: Some("s1".into()),
+            end: false,
+        })
+        .expect("emit does not fail once ready");
+    session_a
+        .emit(EventInput {
+            topic: "fs.tick".into(),
+            payload: Value::from(5),
+            stream_id: None,
+            end: false,
+        })
+        .expect("emit does not fail once ready");
+
+    let mut seen = Vec::new();
+    for _ in 0..5 {
+        let event = within("the next event", events.recv())
+            .await
+            .expect("the stream stays open for every emitted event");
+        seen.push((event.topic, event.stream_id, event.seq, event.end.is_some()));
+    }
+    assert_eq!(
+        seen,
+        vec![
+            ("fs.changed".to_string(), Some("s1".to_string()), 0, false),
+            ("fs.changed".to_string(), Some("s1".to_string()), 1, false),
+            ("fs.changed".to_string(), Some("s1".to_string()), 2, true),
+            ("fs.changed".to_string(), Some("s1".to_string()), 0, false),
+            ("fs.tick".to_string(), None, 0, false),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn answers_a_ping_with_a_pong_the_pinger_can_observe() {
+    let (a, b) = port_pair();
+    let (session_a, _driver_a) = Session::spawn(a, SessionOptions::new(peer("a")));
+    let (session_b, _driver_b) = Session::spawn(b, SessionOptions::new(peer("b")));
+    within("a's ready()", session_a.ready())
+        .await
+        .expect("handshake succeeds");
+    within("b's ready()", session_b.ready())
+        .await
+        .expect("handshake succeeds");
+
+    let mut pongs = session_a.pongs();
+    session_a.ping();
+
+    within("the pong", pongs.recv())
+        .await
+        .expect("the peer answers the ping");
 }

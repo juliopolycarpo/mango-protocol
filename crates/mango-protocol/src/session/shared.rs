@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::codec::ndjson::DEFAULT_MAX_FRAME_BYTES;
 use crate::error::RemoteError;
-use crate::frame::PeerInfo;
+use crate::frame::{Event, PeerInfo};
 use crate::version::ProtocolVersion;
 
 use super::command::Command;
@@ -58,6 +58,12 @@ pub(super) struct Shared {
     pub(super) next_generation: AtomicU64,
     /// How long teardown waits for in-flight handlers to settle.
     pub(super) handler_grace: Duration,
+    /// Per-stream-key sequence counters (`streamId`, else `topic`), read and
+    /// advanced by `emit` under the same lock, so lock-acquisition order is
+    /// exactly wire order.
+    pub(super) event_sequences: Mutex<HashMap<String, u64>>,
+    pub(super) event_subscribers: Mutex<Vec<mpsc::UnboundedSender<Event>>>,
+    pub(super) pong_subscribers: Mutex<Vec<mpsc::UnboundedSender<()>>>,
 }
 
 impl Shared {
@@ -116,5 +122,34 @@ impl Shared {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         lock(&self.handlers).insert(method.clone(), (generation, handler));
         (method, generation)
+    }
+
+    /// Registers a new event subscriber, returning its receiving half.
+    pub(super) fn subscribe_events(&self) -> mpsc::UnboundedReceiver<Event> {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        lock(&self.event_subscribers).push(sender);
+        receiver
+    }
+
+    /// Registers a new pong subscriber, returning its receiving half.
+    pub(super) fn subscribe_pongs(&self) -> mpsc::UnboundedReceiver<()> {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        lock(&self.pong_subscribers).push(sender);
+        receiver
+    }
+
+    /// Delivers `event` to every live subscriber, but only once the session
+    /// is ready — mirrors the TS receive-side gate exactly (a session drops
+    /// an `evt` frame that arrives before its own handshake finished).
+    pub(super) fn fan_out_event(&self, event: Event) {
+        if lock(&self.inner).state != SessionState::Ready {
+            return;
+        }
+        lock(&self.event_subscribers).retain(|sender| sender.send(event.clone()).is_ok());
+    }
+
+    /// Delivers one liveness pong to every live subscriber.
+    pub(super) fn fan_out_pong(&self) {
+        lock(&self.pong_subscribers).retain(|sender| sender.send(()).is_ok());
     }
 }

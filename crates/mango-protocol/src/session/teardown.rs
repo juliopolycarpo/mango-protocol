@@ -7,7 +7,7 @@ use crate::close::{close_codes, is_fatal_close_code};
 use crate::error::{CodecError, RemoteError, codes};
 use crate::port::{PortClosure, PortTx};
 
-use super::dispatch::{ActiveRequest, HandlerOutcome};
+use super::dispatch::RequestTracking;
 use super::driver::{PendingRequest, Writer};
 use super::handle::SessionState;
 use super::shared::{Shared, lock};
@@ -72,8 +72,7 @@ pub struct SessionClosure {
 pub(super) async fn teardown<Tx: PortTx>(
     shared: Arc<Shared>,
     mut pending: HashMap<String, PendingRequest>,
-    active: HashMap<String, ActiveRequest>,
-    mut tasks: tokio::task::JoinSet<HandlerOutcome>,
+    mut tracking: RequestTracking,
     reason: Teardown,
     writer: Writer<Tx>,
 ) -> SessionClosure {
@@ -138,14 +137,22 @@ pub(super) async fn teardown<Tx: PortTx>(
     // Step 6: cancel every active (inbound) handler's token; the task itself
     // is never aborted (it keeps running to completion on its own), it just
     // stops producing a frame once step 3 has already shut the writer down.
-    for request in active.into_values() {
+    for request in tracking.active.into_values() {
         request.cancel.cancel();
     }
+
+    // Step 7: clear the seq map and drop every event/pong subscriber. A
+    // receiver still held simply sees its channel end once whatever is
+    // already queued drains — there is no TS-style explicit "stream ended"
+    // signal to mirror, since `Listeners.clear()` has no such signal either.
+    lock(&shared.event_sequences).clear();
+    lock(&shared.event_subscribers).clear();
+    lock(&shared.pong_subscribers).clear();
 
     // Step 8: grace-drain outstanding handler tasks. A join_next loop, not
     // JoinSet::join_all, since join_all re-raises a panic instead of
     // recovering it the way dispatch's own join_next_with_id handling does.
-    let outstanding = tasks.len();
+    let outstanding = tracking.tasks.len();
     let mut drained = 0;
     if outstanding > 0 {
         let grace = tokio::time::sleep(shared.handler_grace);
@@ -153,7 +160,7 @@ pub(super) async fn teardown<Tx: PortTx>(
         loop {
             tokio::select! {
                 biased;
-                joined = tasks.join_next() => {
+                joined = tracking.tasks.join_next() => {
                     if joined.is_none() {
                         break;
                     }

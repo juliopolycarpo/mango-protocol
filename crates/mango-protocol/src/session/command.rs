@@ -28,4 +28,8 @@ pub(super) enum Command {
     /// (the pending entry stays, so the peer's real `err CANCELLED` — cancel
     /// is advisory, not a promise — still settles it).
     Cancel { id: String, forget: bool },
+    /// Hands a pre-built frame straight to the writer: a locally built event
+    /// (already validated and sequenced under `Shared`'s own lock) or a
+    /// manual `ping`.
+    Send(Frame),
 }

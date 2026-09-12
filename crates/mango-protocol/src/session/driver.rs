@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::{Id, JoinHandle, JoinSet};
+use tokio::task::JoinHandle;
 
 use crate::close::close_codes;
 use crate::codec::ndjson::DEFAULT_MAX_FRAME_BYTES;
@@ -16,7 +16,7 @@ use crate::port::{Inbound, PortClosure, PortRx, PortTx, SendOutcome};
 use crate::version::{Negotiation, negotiate};
 
 use super::command::Command;
-use super::dispatch::{self, ActiveRequest, HandlerOutcome};
+use super::dispatch::{self, RequestTracking};
 use super::handle::{RemotePeer, SessionState};
 use super::shared::{Shared, lock};
 use super::teardown::{self, SessionClosure, Teardown};
@@ -87,9 +87,15 @@ pub struct SessionDriver<Tx, Rx> {
     pub(super) commands: mpsc::UnboundedReceiver<Command>,
     pub(super) handshake_timeout: Duration,
     pub(super) pending: HashMap<String, PendingRequest>,
-    pub(super) tasks: JoinSet<HandlerOutcome>,
-    pub(super) active: HashMap<String, ActiveRequest>,
-    pub(super) by_task_id: HashMap<Id, String>,
+    pub(super) tracking: RequestTracking,
+    /// `None` disables liveness (TS's `livenessIntervalMs: false`).
+    pub(super) liveness_interval: Option<Duration>,
+    /// Lazily built the moment the handshake completes, so the first tick is
+    /// one full interval after becoming ready, never after construction.
+    pub(super) liveness: Option<tokio::time::Interval>,
+    /// Set on every ping this side sends, cleared on every pong it receives;
+    /// still set when the next tick fires means the peer missed a round trip.
+    pub(super) awaiting_pong: bool,
 }
 
 impl<Tx: PortTx, Rx: PortRx> SessionDriver<Tx, Rx> {
@@ -115,8 +121,7 @@ impl<Tx: PortTx, Rx: PortRx> SessionDriver<Tx, Rx> {
             return teardown::teardown(
                 self.shared,
                 self.pending,
-                self.active,
-                self.tasks,
+                self.tracking,
                 Teardown::Local {
                     code: close_codes::RELEASED,
                     reason: Some("hello could not be sent".into()),
@@ -134,17 +139,31 @@ impl<Tx: PortTx, Rx: PortRx> SessionDriver<Tx, Rx> {
         // only ever borrows individual fields (self.shared, self.rx, ...)
         // rather than `self` as a whole.
         let reason = loop {
-            let handshaking = lock(&self.shared.inner).state == SessionState::Handshaking;
+            let state = lock(&self.shared.inner).state;
+            if self.liveness.is_none()
+                && state == SessionState::Ready
+                && let Some(period) = self.liveness_interval
+            {
+                let mut interval =
+                    tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+                // Coalesce a run of missed ticks (the driver task stalled past
+                // a full period) into one, rather than firing back-to-back: a
+                // burst would arm `awaiting_pong` on the first tick and see it
+                // still armed on the second, closing on a healthy peer that
+                // simply never had a chance to answer. JS `setInterval`
+                // coalesces the same way, so TS has no such case to guard.
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                self.liveness = Some(interval);
+            }
             tokio::select! {
                 biased;
                 inbound = self.rx.recv() => match inbound {
                     Some(Inbound::Frame(frame)) => {
                         if let Some(reason) = on_frame(
                             &self.shared,
-                            &mut self.tasks,
-                            &mut self.active,
-                            &mut self.by_task_id,
+                            &mut self.tracking,
                             &mut self.pending,
+                            &mut self.awaiting_pong,
                             &writer,
                             frame,
                         ) {
@@ -159,30 +178,26 @@ impl<Tx: PortTx, Rx: PortRx> SessionDriver<Tx, Rx> {
                         break reason;
                     }
                 }
-                Some(settled) = self.tasks.join_next_with_id(), if !self.tasks.is_empty() => {
+                Some(settled) = self.tracking.tasks.join_next_with_id(), if !self.tracking.tasks.is_empty() => {
                     dispatch::on_handler_settled(
                         &self.shared,
-                        &mut self.active,
-                        &mut self.by_task_id,
+                        &mut self.tracking,
                         &writer,
                         settled,
                     );
                 }
-                () = &mut sleep, if handshaking => {
+                () = &mut sleep, if state == SessionState::Handshaking => {
                     break on_handshake_timeout(&self.shared, self.handshake_timeout);
+                }
+                () = liveness_tick(self.liveness.as_mut()) => {
+                    if let Some(reason) = on_liveness_tick(&mut self.awaiting_pong, &writer) {
+                        break reason;
+                    }
                 }
             }
         };
 
-        teardown::teardown(
-            self.shared,
-            self.pending,
-            self.active,
-            self.tasks,
-            reason,
-            writer,
-        )
-        .await
+        teardown::teardown(self.shared, self.pending, self.tracking, reason, writer).await
     }
 
     fn build_hello(&self) -> Hello {
@@ -205,10 +220,9 @@ impl<Tx: PortTx, Rx: PortRx> SessionDriver<Tx, Rx> {
 /// field, `tx` included, to still be there.
 fn on_frame<Tx: PortTx>(
     shared: &Arc<Shared>,
-    tasks: &mut JoinSet<HandlerOutcome>,
-    active: &mut HashMap<String, ActiveRequest>,
-    by_task_id: &mut HashMap<Id, String>,
+    tracking: &mut RequestTracking,
     pending: &mut HashMap<String, PendingRequest>,
+    awaiting_pong: &mut bool,
     writer: &Writer<Tx>,
     frame: Frame,
 ) -> Option<Teardown> {
@@ -219,7 +233,7 @@ fn on_frame<Tx: PortTx>(
             reason: close.reason,
         }),
         Frame::Req(request) => {
-            dispatch::on_request(shared, tasks, active, by_task_id, writer, request);
+            dispatch::on_request(shared, tracking, writer, request);
             None
         }
         Frame::Res(response) => {
@@ -235,12 +249,23 @@ fn on_frame<Tx: PortTx>(
             on_response(pending, error_response.id, Err(error));
             None
         }
-        Frame::Cancel(cancel) => {
-            dispatch::on_cancel(active, &cancel.id);
+        Frame::Evt(event) => {
+            shared.fan_out_event(event);
             None
         }
-        // Evt/Ping/Pong: handled once events and liveness land.
-        _ => None,
+        Frame::Cancel(cancel) => {
+            dispatch::on_cancel(&tracking.active, &cancel.id);
+            None
+        }
+        Frame::Ping => {
+            writer.enqueue(Frame::Pong);
+            None
+        }
+        Frame::Pong => {
+            *awaiting_pong = false;
+            shared.fan_out_pong();
+            None
+        }
     }
 }
 
@@ -328,7 +353,38 @@ fn on_command<Tx: PortTx>(
             writer.enqueue(Frame::Cancel(Cancel { id }));
             None
         }
+        Command::Send(frame) => {
+            writer.enqueue(frame);
+            None
+        }
     }
+}
+
+/// Ticks `interval`, or never resolves if there is none (liveness disabled,
+/// or not yet built — see [`SessionDriver::liveness`]).
+async fn liveness_tick(interval: Option<&mut tokio::time::Interval>) {
+    match interval {
+        Some(interval) => {
+            interval.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// One liveness interval elapsed. Closes with a liveness timeout if the
+/// previous ping never got a pong back — one missed round trip, since the
+/// interval is already several times a healthy peer's round trip — otherwise
+/// sends a fresh ping and arms the check for the next tick.
+fn on_liveness_tick<Tx: PortTx>(awaiting_pong: &mut bool, writer: &Writer<Tx>) -> Option<Teardown> {
+    if *awaiting_pong {
+        return Some(Teardown::Local {
+            code: close_codes::RELEASED,
+            reason: Some("liveness timeout".into()),
+        });
+    }
+    *awaiting_pong = true;
+    writer.enqueue(Frame::Ping);
+    None
 }
 
 fn on_handshake_timeout(shared: &Shared, handshake_timeout: Duration) -> Teardown {

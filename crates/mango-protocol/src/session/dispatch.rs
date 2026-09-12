@@ -29,6 +29,19 @@ pub(super) struct ActiveRequest {
 /// The task-output type every handler invocation produces.
 pub(super) type HandlerOutcome = Result<Value, RemoteError>;
 
+/// Bookkeeping for every inbound request this driver is currently answering:
+/// the spawned handler tasks, the request each is answering (with its
+/// cancellation token), and the task-id → request-id reverse lookup a
+/// panic-safe settlement needs. Grouped into one type since every one of
+/// these fields changes together, on exactly the same two events (a request
+/// arrives, a handler settles).
+#[derive(Default)]
+pub(super) struct RequestTracking {
+    pub(super) tasks: JoinSet<HandlerOutcome>,
+    pub(super) active: HashMap<String, ActiveRequest>,
+    pub(super) by_task_id: HashMap<Id, String>,
+}
+
 fn respond_error<Tx: PortTx>(
     writer: &Writer<Tx>,
     id: String,
@@ -57,9 +70,7 @@ fn detail(key: &str, value: impl Into<Value>) -> Map<String, Value> {
 /// handler onto `tasks`.
 pub(super) fn on_request<Tx: PortTx>(
     shared: &Arc<Shared>,
-    tasks: &mut JoinSet<HandlerOutcome>,
-    active: &mut HashMap<String, ActiveRequest>,
-    by_task_id: &mut HashMap<Id, String>,
+    tracking: &mut RequestTracking,
     writer: &Writer<Tx>,
     request: Request,
 ) {
@@ -86,7 +97,7 @@ pub(super) fn on_request<Tx: PortTx>(
         );
         return;
     };
-    if active.contains_key(&id) {
+    if tracking.active.contains_key(&id) {
         respond_error(
             writer,
             id.clone(),
@@ -137,9 +148,9 @@ pub(super) fn on_request<Tx: PortTx>(
         },
     };
     shared.in_flight.fetch_add(1, Ordering::Relaxed);
-    let abort_handle = tasks.spawn(handler.call(params, context));
-    by_task_id.insert(abort_handle.id(), id.clone());
-    active.insert(id, ActiveRequest { cancel, method });
+    let abort_handle = tracking.tasks.spawn(handler.call(params, context));
+    tracking.by_task_id.insert(abort_handle.id(), id.clone());
+    tracking.active.insert(id, ActiveRequest { cancel, method });
 }
 
 /// A `cancel` frame for a request this side is (or was) answering: signals
@@ -157,8 +168,7 @@ pub(super) fn on_cancel(active: &HashMap<String, ActiveRequest>, id: &str) {
 /// frame and clears the request's bookkeeping.
 pub(super) fn on_handler_settled<Tx: PortTx>(
     shared: &Shared,
-    active: &mut HashMap<String, ActiveRequest>,
-    by_task_id: &mut HashMap<Id, String>,
+    tracking: &mut RequestTracking,
     writer: &Writer<Tx>,
     settled: Result<(Id, HandlerOutcome), JoinError>,
 ) {
@@ -171,10 +181,10 @@ pub(super) fn on_handler_settled<Tx: PortTx>(
         }
     };
     shared.in_flight.fetch_sub(1, Ordering::Relaxed);
-    let Some(id) = by_task_id.remove(&task_id) else {
+    let Some(id) = tracking.by_task_id.remove(&task_id) else {
         return;
     };
-    let Some(active_request) = active.remove(&id) else {
+    let Some(active_request) = tracking.active.remove(&id) else {
         return;
     };
     match outcome {

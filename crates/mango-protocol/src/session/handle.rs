@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::codec::ndjson::encode_frame_bytes;
 use crate::error::{CodecErrorKind, RemoteError, codes};
-use crate::frame::{Frame, Limits, PeerInfo, Request};
+use crate::frame::{End, Event, Frame, Limits, PeerInfo, Request};
 use crate::validate::{is_reserved_method_name, is_valid_method_name};
 use crate::version::ProtocolVersion;
 
@@ -79,6 +79,61 @@ pub struct RequestOptions {
     /// A local deadline: sends `cancel`, then rejects with `TIMEOUT` without
     /// waiting for the peer's answer.
     pub timeout: Option<Duration>,
+}
+
+/// One event to publish via [`Session::emit`].
+///
+/// # Example
+///
+/// ```
+/// use mango_protocol::session::EventInput;
+/// use serde_json::json;
+///
+/// let event = EventInput {
+///     topic: "fs.changed".into(),
+///     payload: json!({ "path": "/tmp/a" }),
+///     stream_id: None,
+///     end: false,
+/// };
+/// assert!(!event.end);
+/// ```
+pub struct EventInput {
+    /// Same grammar as a method name; `rpc.` is reserved.
+    pub topic: String,
+    /// Any JSON value, including `null`.
+    pub payload: Value,
+    /// Correlates one multi-frame stream; sequence numbers are per stream
+    /// key (`stream_id`, else `topic`).
+    pub stream_id: Option<String>,
+    /// Marks the last event of the stream and releases its counter.
+    pub end: bool,
+}
+
+/// A live subscription to a [`Session`]'s incoming events, from
+/// [`Session::events`].
+pub struct EventStream {
+    receiver: mpsc::UnboundedReceiver<Event>,
+}
+
+impl EventStream {
+    /// The next event, or `None` once the session has closed and every
+    /// already-queued event has been delivered.
+    pub async fn recv(&mut self) -> Option<Event> {
+        self.receiver.recv().await
+    }
+}
+
+/// A live subscription to a [`Session`]'s incoming `pong`s, from
+/// [`Session::pongs`].
+pub struct PongStream {
+    receiver: mpsc::UnboundedReceiver<()>,
+}
+
+impl PongStream {
+    /// Resolves on every `pong`, or `None` once the session has closed.
+    pub async fn recv(&mut self) -> Option<()> {
+        self.receiver.recv().await
+    }
 }
 
 /// A symmetric Mango Protocol session over any [`crate::port::Port`].
@@ -355,6 +410,88 @@ impl Session {
         match closure {
             Some(closure) => error.with_detail("close_code", closure.code),
             None => error,
+        }
+    }
+
+    /// Publishes an event. Sequence numbers are per stream key (`stream_id`,
+    /// else `topic`); `end` releases the counter. Returns `Ok(false)`, and
+    /// sends nothing, before the handshake completes or after the session
+    /// closed; fails with `FRAME_TOO_LARGE` rather than sending an oversized
+    /// frame.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
+    /// use mango_protocol::frame::PeerInfo;
+    /// use mango_protocol::port::port_pair;
+    /// use mango_protocol::session::{EventInput, Session, SessionOptions};
+    /// use serde_json::Value;
+    ///
+    /// let (a, _b) = port_pair();
+    /// let peer = PeerInfo { name: "e".into(), version: "0.1.0".into(), role: "runtime".into() };
+    /// let (session, _driver) = Session::open(a, SessionOptions::new(peer));
+    /// let sent = session
+    ///     .emit(EventInput { topic: "fs.changed".into(), payload: Value::Null, stream_id: None, end: false })
+    ///     .expect("emit does not fail before the handshake");
+    /// assert!(!sent, "the handshake has not completed yet");
+    /// # }
+    /// ```
+    pub fn emit(&self, event: EventInput) -> Result<bool, RemoteError> {
+        if self.state() != SessionState::Ready {
+            return Ok(false);
+        }
+        let EventInput {
+            topic,
+            payload,
+            stream_id,
+            end,
+        } = event;
+        let key = stream_id.clone().unwrap_or_else(|| topic.clone());
+        let mut sequences = lock(&self.shared.event_sequences);
+        let seq = sequences.get(&key).copied().unwrap_or(0);
+        let what = format!("Event \"{topic}\"");
+        let frame = Frame::Evt(Event {
+            topic,
+            seq,
+            stream_id,
+            payload,
+            end: end.then_some(End),
+        });
+        assert_fits(&self.shared, &frame, &what)?;
+        if end {
+            sequences.remove(&key);
+        } else {
+            sequences.insert(key, seq + 1);
+        }
+        // `sequences` stays held across the send: two threads racing the same
+        // stream key must not be able to interleave their sends in an order
+        // that disagrees with the seq numbers they were just given.
+        let _ = self.shared.commands.send(Command::Send(frame));
+        Ok(true)
+    }
+
+    /// Subscribes to every event this session receives from its peer, from
+    /// the moment of the call onward.
+    #[must_use]
+    pub fn events(&self) -> EventStream {
+        EventStream {
+            receiver: self.shared.subscribe_events(),
+        }
+    }
+
+    /// Sends a protocol `ping`; the peer answers with `pong`.
+    pub fn ping(&self) {
+        let _ = self.shared.commands.send(Command::Send(Frame::Ping));
+    }
+
+    /// Subscribes to every `pong` this session receives, from the moment of
+    /// the call onward.
+    #[must_use]
+    pub fn pongs(&self) -> PongStream {
+        PongStream {
+            receiver: self.shared.subscribe_pongs(),
         }
     }
 }
