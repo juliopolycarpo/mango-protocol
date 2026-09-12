@@ -22,11 +22,12 @@ pub(super) enum Command {
         frame: Frame,
         reply: oneshot::Sender<Result<Value, RemoteError>>,
     },
-    /// Sends a `cancel` frame for `id`. `forget: false` on a local timeout
-    /// (the pending entry is deleted, so a late real answer is silently
-    /// ignored); `forget: true` on a user cancel or a dropped request future
-    /// (the pending entry stays, so the peer's real `err CANCELLED` — cancel
-    /// is advisory, not a promise — still settles it).
+    /// Sends a `cancel` frame for `id`. `forget: true` on a user cancel (the
+    /// pending entry stays, because that future is still awaiting its reply:
+    /// cancel is advisory, so the peer's real `err CANCELLED` — or even a
+    /// successful `res` — is what settles it). `forget: false` on a local
+    /// timeout or a dropped request future: both have let go of the reply
+    /// receiver, so the entry is deleted and a late answer silently ignored.
     Cancel { id: String, forget: bool },
     /// Hands a pre-built frame straight to the writer: a locally built event
     /// (already validated and sequenced under `Shared`'s own lock) or a

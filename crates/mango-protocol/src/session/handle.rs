@@ -538,6 +538,13 @@ fn assert_fits(shared: &Shared, frame: &Frame, what: &str) -> Result<(), RemoteE
 /// Sends `cancel` for `id` when dropped before being [`CancelGuard::disarm`]ed
 /// — covers a request future dropped before it settled, not just an explicit
 /// user cancel.
+///
+/// The drop path forgets the pending entry (`forget: false`): the future that
+/// owned the reply receiver is gone, so the peer's eventual answer has nothing
+/// to settle and keeping the entry would only grow the driver's map. An
+/// explicit user cancel is the opposite case — that future is still awaiting
+/// `reply_rx` for the `err CANCELLED` the peer owes it — and sends its own
+/// `forget: true` from the `select!` loop rather than through this guard.
 struct CancelGuard {
     id: String,
     commands: mpsc::UnboundedSender<Command>,
@@ -555,8 +562,59 @@ impl Drop for CancelGuard {
         if self.armed {
             let _ = self.commands.send(Command::Cancel {
                 id: std::mem::take(&mut self.id),
-                forget: true,
+                forget: false,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::command::Command;
+    use super::CancelGuard;
+    use tokio::sync::mpsc;
+
+    fn guard(commands: mpsc::UnboundedSender<Command>) -> CancelGuard {
+        CancelGuard {
+            id: "r-1".into(),
+            commands,
+            armed: true,
+        }
+    }
+
+    /// A dropped request future takes its reply receiver with it, so there is
+    /// nothing left for a late `res`/`err` to settle: the driver must release
+    /// the pending entry rather than hold it for an answer nobody awaits.
+    #[test]
+    fn a_dropped_guard_cancels_and_releases_the_pending_entry() {
+        let (commands, mut received) = mpsc::unbounded_channel();
+        drop(guard(commands));
+
+        match received.try_recv() {
+            Ok(Command::Cancel { id, forget }) => {
+                assert_eq!(id, "r-1");
+                assert!(
+                    !forget,
+                    "expected the dropped guard to release the pending entry: forget = false | \
+                     received: forget = true"
+                );
+            }
+            Ok(_) => panic!("expected Command::Cancel | received: another command"),
+            Err(error) => panic!("expected Command::Cancel | received: {error}"),
+        }
+    }
+
+    /// A settled request disarms its guard, so dropping it must send nothing.
+    #[test]
+    fn a_disarmed_guard_sends_nothing() {
+        let (commands, mut received) = mpsc::unbounded_channel();
+        let mut guard = guard(commands);
+        guard.disarm();
+        drop(guard);
+
+        assert!(
+            received.try_recv().is_err(),
+            "expected a disarmed guard to send no command | received: one"
+        );
     }
 }

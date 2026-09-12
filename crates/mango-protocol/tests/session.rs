@@ -10,7 +10,7 @@ use std::time::Duration;
 use mango_protocol::close::close_codes;
 use mango_protocol::error::{CodecErrorKind, RemoteError, codes};
 use mango_protocol::frame::{
-    Close, ErrorPayload, ErrorResponse, Hello, Limits, PeerInfo, Request, Response,
+    Cancel, Close, ErrorPayload, ErrorResponse, Hello, Limits, PeerInfo, Request, Response,
 };
 use mango_protocol::port::{Inbound, PortClosure, port_pair};
 use mango_protocol::session::{
@@ -432,6 +432,41 @@ async fn ignores_a_response_for_an_unknown_id() {
 
     // Neither frame panicked or tore the session down.
     assert_eq!(session.state(), SessionState::Ready);
+}
+
+/// A caller that walks away from a request future — a losing `tokio::select!`
+/// branch, an aborted task — still owes the peer a `cancel`, so the handler it
+/// started does not run on unwatched.
+#[tokio::test]
+async fn sends_cancel_when_a_request_future_is_dropped_before_it_settles() {
+    let (a, b) = port_pair();
+    let (session, _driver) = Session::spawn(a, SessionOptions::new(peer("a")));
+    let mut raw = RawPeer::new(b);
+    raw.send(hello_frame("b")).await;
+    within("ready()", session.ready())
+        .await
+        .expect("handshake succeeds");
+
+    let requester = tokio::spawn(async move {
+        let _ = session.request("test.slow", Value::Null).await;
+    });
+    let sent = within(
+        "the req frame",
+        raw.until(|frame| matches!(frame, Frame::Req(_))),
+    )
+    .await;
+    let Frame::Req(sent) = sent else {
+        unreachable!("until() matched a req frame")
+    };
+
+    requester.abort();
+
+    let cancel = within(
+        "the cancel frame",
+        raw.until(|frame| matches!(frame, Frame::Cancel(_))),
+    )
+    .await;
+    assert_eq!(cancel, Frame::Cancel(Cancel { id: sent.id }));
 }
 
 #[tokio::test]
