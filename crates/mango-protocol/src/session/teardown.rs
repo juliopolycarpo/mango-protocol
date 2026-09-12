@@ -150,28 +150,20 @@ pub(super) async fn teardown<Tx: PortTx>(
     // Step 8: grace-drain outstanding handler tasks. A join_next loop, not
     // JoinSet::join_all, since join_all re-raises a panic instead of
     // recovering it the way dispatch's own join_next_with_id handling does.
-    let outstanding = tracking.tasks.len();
-    let mut drained = 0;
-    if outstanding > 0 {
-        let grace = tokio::time::sleep(shared.handler_grace);
-        tokio::pin!(grace);
-        loop {
-            tokio::select! {
-                biased;
-                joined = tracking.tasks.join_next() => {
-                    if joined.is_none() {
-                        break;
-                    }
-                    drained += 1;
-                    if drained == outstanding {
-                        break;
-                    }
+    let grace = tokio::time::sleep(shared.handler_grace);
+    tokio::pin!(grace);
+    loop {
+        tokio::select! {
+            biased;
+            joined = tracking.tasks.join_next() => {
+                if joined.is_none() {
+                    break;
                 }
-                () = &mut grace => break,
             }
+            () = &mut grace => break,
         }
     }
-    let unfinished_handlers = outstanding - drained;
+    let unfinished_handlers = tracking.tasks.len();
 
     let closure = SessionClosure {
         code,
