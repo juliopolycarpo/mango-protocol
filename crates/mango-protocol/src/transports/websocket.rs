@@ -311,12 +311,17 @@ where
                     }
                 }
                 Some(Err(error)) => {
+                    // The socket is gone, exactly as it is when the peer sends
+                    // a close frame: a send queued after this would be reported
+                    // as sent and never carried.
+                    self.writer.mark_closed();
                     self.closure = Some(PortClosure::Closed {
                         code: None,
                         reason: Some(error.to_string()),
                     });
                 }
                 None => {
+                    self.writer.mark_closed();
                     self.closure = Some(PortClosure::Closed {
                         code: None,
                         reason: None,

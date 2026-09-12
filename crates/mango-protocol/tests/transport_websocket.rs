@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use mango_protocol::close::close_codes;
+use mango_protocol::frame::Frame;
+use mango_protocol::port::{Inbound, Port, PortRx, PortTx, SendOutcome};
 use mango_protocol::session::{Session, SessionClosure, SessionOptions};
 use mango_protocol::testing::{ConformancePair, Fixture, RawConnection, run_conformance_suite};
 use mango_protocol::transports::deadline::{ConnectDeadline, ConnectError};
@@ -240,6 +242,38 @@ async fn the_websocket_behaves_like_a_mango_transport_at_a_small_message_ceiling
         options: WebSocketOptions::default().with_max_message_bytes(2048),
     })
     .await;
+}
+
+#[tokio::test]
+async fn a_socket_that_ended_reports_a_later_send_as_closed_not_sent() {
+    // The peer's own close frame marks the writer closed; a socket that simply
+    // ended, or failed, has to do the same. A frame reported as `Sent` on a
+    // connection that is gone is a response the session believes it delivered,
+    // and the NDJSON port has never had that gap.
+    let acceptor = Acceptor::bind(WebSocketOptions::default()).await;
+    let url = acceptor.url();
+    let dialling =
+        tokio::spawn(async move { dial(&url, WebSocketOptions::default(), Some(TOKEN)).await });
+    let accepted = acceptor.accept().await.expect("the credential is known");
+    let dialled = dialling
+        .await
+        .expect("the dial task runs")
+        .expect("the acceptor selects mango.v1");
+
+    // The far side vanishes without a close frame, which is what a crash
+    // leaves behind.
+    drop(accepted);
+
+    let (mut tx, mut rx) = dialled.split();
+    assert!(
+        matches!(rx.recv().await, Some(Inbound::Closed(_))),
+        "the socket ending is a closure"
+    );
+    assert_eq!(
+        tx.send(Frame::Ping).await,
+        SendOutcome::Closed,
+        "a frame queued on a socket that is gone is not one the peer will read"
+    );
 }
 
 #[tokio::test]
