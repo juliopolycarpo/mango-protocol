@@ -100,9 +100,11 @@ describeInterop('interop: WebSocket (TypeScript serves, Rust dials)', () => {
       throw new Error(`${String(cause)}\npeer said:\n${peer.diagnostics()}`, { cause });
     } finally {
       session.close(CLOSE_CODES.RELEASED, 'interop done');
-      // The peer's session ends with the socket, so it exits on its own.
-      expect(await peer.exited).toBe(0);
     }
+    // The peer's session ends with the socket, so it exits on its own.
+    // Asserted after the block, not inside it: a throw in `finally` replaces
+    // whatever failed above it, so a wedged peer would hide the real failure.
+    expect(await peer.exited).toBe(0);
   }, 60_000);
 });
 
