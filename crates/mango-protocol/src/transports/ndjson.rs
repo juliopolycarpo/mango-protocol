@@ -296,7 +296,11 @@ struct SharedWriter<W>(Arc<Mutex<WriterState<W>>>);
 
 #[derive(Debug)]
 struct WriterState<W> {
-    writer: W,
+    /// Taken and dropped when the port ends. Dropping is what actually closes
+    /// the underlying handle: `poll_shutdown` is a no-op on a child's stdin
+    /// and a flush on a Windows named pipe, so a peer waiting for end of file
+    /// would wait for ever on a handle that was only "shut down".
+    writer: Option<W>,
     /// False once the stream ended or refused a write; every later write is
     /// reported as the transport being gone rather than retried.
     writable: bool,
@@ -311,7 +315,7 @@ impl<W> Clone for SharedWriter<W> {
 impl<W: AsyncWrite + Unpin + Send> SharedWriter<W> {
     fn new(writer: W) -> Self {
         Self(Arc::new(Mutex::new(WriterState {
-            writer,
+            writer: Some(writer),
             writable: true,
         })))
     }
@@ -329,7 +333,10 @@ impl<W: AsyncWrite + Unpin + Send> SharedWriter<W> {
         if !state.writable {
             return SendOutcome::Closed;
         }
-        match write_record(&mut state.writer, &line).await {
+        let Some(writer) = state.writer.as_mut() else {
+            return SendOutcome::Closed;
+        };
+        match write_record(writer, &line).await {
             Ok(()) => SendOutcome::Sent,
             Err(_) => {
                 state.writable = false;
@@ -355,20 +362,28 @@ impl<W: AsyncWrite + Unpin + Send> SharedWriter<W> {
         if !state.writable {
             return;
         }
-        if write_record(&mut state.writer, &line).await.is_err() {
+        let Some(writer) = state.writer.as_mut() else {
+            return;
+        };
+        if write_record(writer, &line).await.is_err() {
             state.writable = false;
         }
     }
 
     /// Ends the writable half once, whatever ended the port.
+    ///
+    /// The handle is dropped, not merely shut down. `poll_shutdown` is a no-op
+    /// on a child's stdin and a flush on a Windows named pipe, so a peer that
+    /// treats end of file as the session ending — which spawn.md says a
+    /// conforming child does — only ever sees it because the handle went.
     async fn shut_down(&self) {
         let mut state = self.0.lock().await;
-        if !state.writable {
-            return;
-        }
         state.writable = false;
-        // A half already gone has nothing left to release.
-        let _ = state.writer.shutdown().await;
+        let Some(mut writer) = state.writer.take() else {
+            return;
+        };
+        let _ = writer.shutdown().await;
+        drop(writer);
     }
 }
 

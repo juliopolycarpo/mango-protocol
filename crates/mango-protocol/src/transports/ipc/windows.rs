@@ -114,7 +114,17 @@ impl IpcListener {
         // The next client needs an instance of its own, created with the same
         // restriction as the first: a second instance created without one
         // would publish an address anybody could answer on.
-        let next = security::create_owner_only_instance(&self.path, false)?;
+        let next = match security::create_owner_only_instance(&self.path, false) {
+            Ok(next) => next,
+            Err(error) => {
+                // A client is already connected to the idle instance. Left
+                // alone it would be neither served nor told, and the next
+                // `accept` would hand it out as a fresh arrival, because
+                // `connect` on an already-connected instance succeeds.
+                let _ = self.idle.disconnect();
+                return Err(error);
+            }
+        };
         let connected = std::mem::replace(&mut self.idle, next);
 
         let identity = PeerIdentity {

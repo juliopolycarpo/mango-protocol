@@ -1,72 +1,116 @@
-//! A peer that stops reading is a peer the sender must give up on, not one it
-//! waits for for ever.
+//! The one queue per connection of `spec/transports/websocket.md`.
 //!
-//! `spec/transports/websocket.md` (Backpressure): "A queue that grows past one
-//! frame limit while the socket is not draining is a peer that is not reading;
-//! the sender closes with `4400` rather than holding every pending response
-//! for a socket that may never drain."
+//! "A queue that grows past one frame limit while the socket is not draining is
+//! a peer that is not reading; the sender closes with `4400` rather than
+//! holding every pending response for a socket that may never drain."
+//!
+//! Both halves of that sentence are tested here: a peer that stopped reading is
+//! given up on with `4400`, and a peer that is reading is left alone — however
+//! large the frames it is being sent.
 #![cfg(feature = "websocket")]
 
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use mango_protocol::close::close_codes;
+use mango_protocol::codec::ndjson::encode_frame_bytes;
 use mango_protocol::frame::{Frame, Request};
 use mango_protocol::port::{Port, PortTx, SendOutcome};
 use mango_protocol::transports::deadline::ConnectDeadline;
 use mango_protocol::transports::websocket::WebSocketOptions;
 use mango_protocol::transports::websocket::client::{WebSocketConnectOptions, connect_websocket};
 use serde_json::Value;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::handshake::server::{Request as UpgradeRequest, Response};
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 
 /// Small enough that a handful of frames passes it, and well under the
-/// operating system's own socket buffers so the stall is this port's rule
-/// rather than the kernel's.
+/// operating system's own socket buffers so a stall is this port's rule rather
+/// than the kernel's.
 const FRAME_LIMIT: usize = 64 * 1024;
 
-/// One frame of roughly an eighth of the limit, so eight of them reach it.
-fn filler(index: usize) -> Frame {
-    Frame::Req(Request {
-        id: format!("r-{index}"),
-        method: "test.bulk".into(),
-        params: Value::String("x".repeat(FRAME_LIMIT / 8)),
-    })
+/// The smallest message ceiling the spec allows, so one frame becomes many
+/// chunks and the header overhead is at its largest.
+const MESSAGE_LIMIT: usize = 2048;
+
+fn options() -> WebSocketOptions {
+    WebSocketOptions::default()
+        .with_max_frame_bytes(FRAME_LIMIT)
+        .with_max_message_bytes(MESSAGE_LIMIT)
 }
 
+/// A request whose encoded line is `bytes` long, to the byte.
+fn frame_of(bytes: usize) -> Frame {
+    let mut payload = 1;
+    loop {
+        let frame = Frame::Req(Request {
+            id: "r-1".into(),
+            method: "test.bulk".into(),
+            params: Value::String("x".repeat(payload)),
+        });
+        let encoded = encode_frame_bytes(&frame, FRAME_LIMIT)
+            .expect("within the limit")
+            .len();
+        if encoded == bytes {
+            return frame;
+        }
+        assert!(encoded < bytes, "overshot {bytes} at {encoded}");
+        payload += bytes - encoded;
+    }
+}
+
+/// Upgrades one connection, selecting the subprotocol so this crate's dialler
+/// accepts it.
 #[allow(
     clippy::result_large_err,
     reason = "the handshake callback's error type is tungstenite's own ErrorResponse"
 )]
+async fn upgrade(socket: TcpStream) -> WebSocketStream<TcpStream> {
+    tokio_tungstenite::accept_hdr_async(
+        socket,
+        |_request: &UpgradeRequest, mut response: Response| {
+            response.headers_mut().insert(
+                "sec-websocket-protocol",
+                HeaderValue::from_static("mango.v1"),
+            );
+            Ok(response)
+        },
+    )
+    .await
+    .expect("the upgrade completes")
+}
+
 #[tokio::test]
 async fn a_peer_that_stops_reading_is_closed_with_4400_rather_than_waited_on() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
     let address = listener.local_addr().expect("a bound address");
+    let (start_reading, wait) = oneshot::channel::<()>();
+    let (report, closed) = oneshot::channel::<Option<u16>>();
 
-    // An acceptor that completes the upgrade and then never reads another
-    // byte: the socket stays open, and nothing drains it.
+    // An acceptor that completes the upgrade and then reads nothing until the
+    // sender has already given up on it.
     let acceptor = tokio::spawn(async move {
         let (socket, _address) = listener.accept().await.expect("a dialler");
-        let stream = tokio_tungstenite::accept_hdr_async(
-            socket,
-            |_request: &tokio_tungstenite::tungstenite::handshake::server::Request,
-             mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
-                response.headers_mut().insert(
-                    "sec-websocket-protocol",
-                    tokio_tungstenite::tungstenite::http::HeaderValue::from_static("mango.v1"),
-                );
-                Ok(response)
-            },
-        )
-        .await
-        .expect("the upgrade completes");
-        // Hold the socket open without reading it.
-        tokio::time::sleep(Duration::from_secs(30)).await;
-        drop(stream);
+        let mut stream = upgrade(socket).await;
+        let _ = wait.await;
+        // Now drain: the backlog moves, and the farewell queued behind it
+        // arrives last.
+        let mut code = None;
+        while let Some(Ok(message)) = stream.next().await {
+            if let Message::Close(frame) = message {
+                code = frame.map(|frame| u16::from(frame.code));
+                break;
+            }
+        }
+        let _ = report.send(code);
     });
 
     let port = connect_websocket(
         &format!("ws://{address}/stalled"),
-        &WebSocketConnectOptions::default()
-            .with_websocket(WebSocketOptions::default().with_max_frame_bytes(FRAME_LIMIT)),
+        &WebSocketConnectOptions::default().with_websocket(options()),
         &ConnectDeadline::default().with_timeout(Duration::from_secs(5)),
     )
     .await
@@ -75,16 +119,21 @@ async fn a_peer_that_stops_reading_is_closed_with_4400_rather_than_waited_on() {
     let (mut tx, _rx) = port.split();
     let sending = async {
         // Far more than the frame limit: whatever the kernel's own buffers
-        // absorb, the queue has to pass one frame limit long before this ends.
+        // absorb, the queue passes one frame limit long before this ends.
         for index in 0..2048 {
-            if tx.send(filler(index)).await != SendOutcome::Sent {
+            let frame = Frame::Req(Request {
+                id: format!("r-{index}"),
+                method: "test.bulk".into(),
+                params: Value::String("x".repeat(FRAME_LIMIT / 8)),
+            });
+            if tx.send(frame).await != SendOutcome::Sent {
                 return index;
             }
         }
         panic!("the port accepted 2048 frames without ever reporting the peer as gone");
     };
 
-    let stopped_at = tokio::time::timeout(Duration::from_secs(10), sending)
+    let stopped_at = tokio::time::timeout(Duration::from_secs(20), sending)
         .await
         .expect("the port gives up on a peer that is not reading rather than blocking for ever");
     assert!(
@@ -92,7 +141,66 @@ async fn a_peer_that_stops_reading_is_closed_with_4400_rather_than_waited_on() {
         "the first frame should still have been accepted"
     );
 
-    acceptor.abort();
-    // The code the peer is owed, whether or not it ever reads it.
-    assert_eq!(close_codes::PROTOCOL_ERROR, 4400);
+    let _ = start_reading.send(());
+    let code = tokio::time::timeout(Duration::from_secs(20), closed)
+        .await
+        .expect("the farewell reaches the peer once it starts reading again")
+        .expect("the acceptor reports what it read");
+    assert_eq!(
+        code,
+        Some(close_codes::PROTOCOL_ERROR),
+        "the peer is owed the code, not just a socket that stopped"
+    );
+    let _ = acceptor.await;
+}
+
+#[tokio::test]
+async fn a_frame_at_the_limit_is_not_mistaken_for_a_peer_that_stopped_reading() {
+    // A frame of exactly the limit is legal, and at the smallest legal message
+    // ceiling its chunk headers add another 300-odd bytes. Measuring a frame
+    // against the limit by its own queued size would close a healthy session
+    // on a response the protocol explicitly permits.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+    let address = listener.local_addr().expect("a bound address");
+
+    let acceptor = tokio::spawn(async move {
+        let (socket, _address) = listener.accept().await.expect("a dialler");
+        let mut stream = upgrade(socket).await;
+        let mut payload = 0_usize;
+        while let Some(Ok(message)) = stream.next().await {
+            match message {
+                Message::Binary(bytes) => payload += bytes.len() - 9,
+                Message::Close(_) => break,
+                _ => {}
+            }
+            // Stop at the frame itself; the farewell that follows it carries a
+            // payload of its own and is not what is being measured.
+            if payload >= FRAME_LIMIT {
+                break;
+            }
+        }
+        payload
+    });
+
+    let port = connect_websocket(
+        &format!("ws://{address}/healthy"),
+        &WebSocketConnectOptions::default().with_websocket(options()),
+        &ConnectDeadline::default().with_timeout(Duration::from_secs(5)),
+    )
+    .await
+    .expect("the acceptor selects mango.v1");
+
+    let (mut tx, _rx) = port.split();
+    assert_eq!(
+        tx.send(frame_of(FRAME_LIMIT)).await,
+        SendOutcome::Sent,
+        "a frame of exactly the limit is one the protocol permits"
+    );
+    tx.close(close_codes::RELEASED, None).await;
+
+    let reassembled = tokio::time::timeout(Duration::from_secs(20), acceptor)
+        .await
+        .expect("the peer reads it all")
+        .expect("the acceptor task runs");
+    assert_eq!(reassembled, FRAME_LIMIT, "every chunk of the frame arrived");
 }

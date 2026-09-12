@@ -26,7 +26,9 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 
 use crate::close::{close_code_for_codec_error, close_codes};
-use crate::codec::chunk::{ChunkReassembler, DEFAULT_MAX_MESSAGE_BYTES, encode_chunks};
+use crate::codec::chunk::{
+    CHUNK_HEADER_BYTES, ChunkReassembler, DEFAULT_MAX_MESSAGE_BYTES, encode_chunks,
+};
 use crate::codec::ndjson::DEFAULT_MAX_FRAME_BYTES;
 use crate::error::{CodecError, CodecErrorKind};
 use crate::frame::Frame;
@@ -133,27 +135,39 @@ impl WebSocketOptions {
     /// The tungstenite configuration these options imply.
     ///
     /// The queue the spec's Backpressure section is about is this port's own,
-    /// not this one: tungstenite writes straight through to the socket, so its
-    /// write buffer never accumulates and could not be measured. What the
-    /// configuration does carry is the ceiling on an *incoming* message, which
-    /// is one chunk — anything larger is a peer that is not speaking
-    /// `mango.v1` at all.
+    /// not tungstenite's: it writes straight through to the socket, so its
+    /// write buffer never accumulates and could not be measured.
+    ///
+    /// The ceiling here bounds an *incoming* message, and it is deliberately
+    /// not [`WebSocketOptions::max_message_bytes`]. That number is this
+    /// sender's own setting — websocket.md calls it "a local setting of at
+    /// least 2048 bytes" — and the receiver's obligations, which the spec
+    /// lists exhaustively, include no ceiling on a message at all. A peer is
+    /// free to put a whole frame in one message, so that is what is allowed;
+    /// the reassembler still refuses anything whose payload passes the frame
+    /// limit.
     ///
     /// # Example
     ///
     /// ```
+    /// use mango_protocol::codec::chunk::CHUNK_HEADER_BYTES;
     /// use mango_protocol::transports::websocket::WebSocketOptions;
     ///
-    /// let config = WebSocketOptions::default().socket_config();
-    /// assert_eq!(config.max_message_size, Some(16 * 1024));
+    /// // A peer that sends one 2 KiB chunk and a peer that sends the whole
+    /// // frame at once are both conforming, so neither is cut off.
+    /// let options = WebSocketOptions::default().with_max_message_bytes(2048);
+    /// let config = options.socket_config();
+    /// assert_eq!(
+    ///     config.max_message_size,
+    ///     Some(options.max_frame_bytes + CHUNK_HEADER_BYTES)
+    /// );
     /// ```
     #[must_use]
     pub fn socket_config(&self) -> WebSocketConfig {
+        let incoming = self.max_frame_bytes.saturating_add(CHUNK_HEADER_BYTES);
         WebSocketConfig::default()
-            // One chunk message is the largest thing either side ever sends,
-            // so anything bigger is a peer that is not speaking mango.v1.
-            .max_message_size(Some(self.max_message_bytes))
-            .max_frame_size(Some(self.max_message_bytes))
+            .max_message_size(Some(incoming))
+            .max_frame_size(Some(incoming))
             // Every chunk goes to the socket as it is written; this port's own
             // queue is what holds anything back.
             .write_buffer_size(0)
@@ -343,6 +357,9 @@ where
                 None
             }
             Message::Close(frame) => {
+                // The socket is going; a send queued after this would be
+                // reported as sent and never carried.
+                self.writer.mark_closed();
                 self.closure = Some(peer_closure(frame.as_ref()));
                 None
             }
@@ -356,10 +373,15 @@ where
     /// maps to, then stop. A chunk stream cannot be resynchronised.
     async fn refuse(&mut self, error: CodecError) {
         let code = close_code_for_codec_error(&error);
-        self.writer
-            .close(code, Some(&error.to_string()), true)
-            .await;
+        let reason = error.to_string();
+        // Recorded before the await, never after: `recv` is cancel-safe, and a
+        // closure written on the far side of an await is one a caller that
+        // lost a `select!` race would never be told about. Losing it here
+        // would downgrade a refusal to the plain release an ended socket
+        // reports, so a dialler would retry a peer whose frames it cannot
+        // read.
         self.closure = Some(PortClosure::ProtocolError { error, code });
+        self.writer.close(code, Some(&reason), true).await;
     }
 }
 
@@ -486,7 +508,10 @@ impl SocketWriter {
             Err(error) => return SendOutcome::Refused(error),
         };
         let bytes: usize = messages.iter().map(Vec::len).sum();
-        self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
+        // What was already waiting, this frame excluded. A frame is never
+        // measured against the limit by its own size: one of exactly the frame
+        // limit is legal, and its chunk headers would push any total over.
+        let waiting = self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
         if self
             .commands
             .send(WriteCommand::Chunks { messages, bytes })
@@ -496,7 +521,7 @@ impl SocketWriter {
             self.open.store(false, Ordering::Release);
             return SendOutcome::Closed;
         }
-        if self.queued_bytes.load(Ordering::Acquire) > self.options.max_frame_bytes {
+        if waiting > self.options.max_frame_bytes {
             self.close(
                 close_codes::PROTOCOL_ERROR,
                 Some("the send queue outgrew one frame limit while the socket was not draining"),
@@ -536,6 +561,13 @@ impl SocketWriter {
         let _ = tokio::time::timeout(CLOSE_FLUSH_GRACE, finished).await;
     }
 
+    /// Records that the socket is gone without writing anything: the peer
+    /// closed it, so a frame queued after this would be reported as sent and
+    /// never carried.
+    fn mark_closed(&self) {
+        self.open.store(false, Ordering::Release);
+    }
+
     /// Best effort: a farewell the codec refuses is the optional half here,
     /// since the socket's own close code carries the same reason.
     fn queue_farewell(&self, code: u16, reason: Option<&str>) {
@@ -568,8 +600,11 @@ async fn drive<S>(
     while let Some(command) = commands.recv().await {
         match command {
             WriteCommand::Chunks { messages, bytes } => {
-                let written = write_chunks(&mut sink, messages).await;
+                // Released as the writer takes them, not after they are
+                // written: what the counter measures is the queue behind the
+                // socket, and the frame being written is no longer in it.
                 queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                let written = write_chunks(&mut sink, messages).await;
                 if !written {
                     open.store(false, Ordering::Release);
                     break;
@@ -622,7 +657,7 @@ fn clamp_close_reason(reason: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{WebSocketOptions, clamp_close_reason, peer_closure};
+    use super::{CHUNK_HEADER_BYTES, WebSocketOptions, clamp_close_reason, peer_closure};
     use crate::port::PortClosure;
     use tokio_tungstenite::tungstenite::protocol::CloseFrame;
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -679,10 +714,15 @@ mod tests {
     }
 
     #[test]
-    fn an_incoming_message_larger_than_one_chunk_is_refused_by_the_socket() {
+    fn the_receive_ceiling_is_what_a_peer_may_send_not_what_this_side_sends() {
+        // The message ceiling is the *sender's* local setting, so a peer that
+        // puts a whole frame in one message is conforming. Capping arrivals at
+        // this side's own ceiling would cut off such a peer on its first bulk
+        // result, and the spec lists no ceiling among a receiver's duties.
         let options = WebSocketOptions::default().with_max_message_bytes(2048);
         let config = options.socket_config();
-        assert_eq!(config.max_message_size, Some(2048));
-        assert_eq!(config.max_frame_size, Some(2048));
+        let whole_frame = Some(options.max_frame_bytes + CHUNK_HEADER_BYTES);
+        assert_eq!(config.max_message_size, whole_frame);
+        assert_eq!(config.max_frame_size, whole_frame);
     }
 }
