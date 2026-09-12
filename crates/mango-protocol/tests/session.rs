@@ -670,6 +670,30 @@ async fn drops_events_emitted_before_the_handshake_and_after_close() {
     assert!(!late, "expected the event after close to be dropped");
 }
 
+/// A zero period is no cadence at all, and `tokio::time::interval_at` panics
+/// on one. That panic used to unwind the driver the moment the handshake
+/// completed, skipping teardown entirely: the handle stayed visibly `Ready`
+/// and `closed()` waited for ever.
+#[tokio::test]
+async fn treats_a_zero_liveness_interval_as_disabled() {
+    let (a, b) = port_pair();
+    let options = SessionOptions::new(peer("a")).with_liveness_interval(Some(Duration::ZERO));
+    let (session, driver) = Session::spawn(a, options);
+    let mut raw = RawPeer::new(b);
+    raw.send(hello_frame("b")).await;
+    within("ready()", session.ready())
+        .await
+        .expect("handshake succeeds");
+
+    session.close_now(close_codes::RELEASED, Some("bye"));
+    let closure = within("the driver's own closure", driver)
+        .await
+        .expect("the driver ran its teardown instead of panicking on a zero interval");
+
+    assert_eq!(closure.code, close_codes::RELEASED);
+    assert_eq!(closure.reason.as_deref(), Some("bye"));
+}
+
 #[tokio::test(start_paused = true)]
 async fn closes_with_a_liveness_timeout_when_pongs_stop() {
     let (a, b) = port_pair();

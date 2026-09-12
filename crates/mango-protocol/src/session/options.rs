@@ -52,6 +52,7 @@ pub struct SessionOptions {
     pub handshake_timeout: Duration,
     /// Ping cadence after the handshake; `None` disables liveness checking
     /// (mirrors the TypeScript SDK's `livenessIntervalMs: false`).
+    /// `Some(Duration::ZERO)` is no cadence either, and reads as `None`.
     pub liveness_interval: Option<Duration>,
     /// Prefix of generated request ids.
     pub request_id_prefix: String,
@@ -139,6 +140,7 @@ impl SessionOptions {
     }
 
     /// Sets the ping cadence, or disables liveness checking with `None`.
+    /// `Some(Duration::ZERO)` disables it too — a zero cadence is none.
     #[must_use]
     pub fn with_liveness_interval(mut self, liveness_interval: Option<Duration>) -> Self {
         self.liveness_interval = liveness_interval;

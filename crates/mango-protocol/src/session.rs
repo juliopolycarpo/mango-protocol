@@ -102,7 +102,11 @@ impl Session {
             handshake_timeout: options.handshake_timeout,
             pending: HashMap::new(),
             tracking: dispatch::RequestTracking::default(),
-            liveness_interval: options.liveness_interval,
+            // A zero period is no cadence at all, and `interval_at` panics on
+            // one. Normalised here rather than in the setter because
+            // `SessionOptions` exposes the field publicly, so a caller can
+            // assign it without going through `with_liveness_interval`.
+            liveness_interval: options.liveness_interval.filter(|period| !period.is_zero()),
             liveness: None,
             awaiting_pong: false,
         };
