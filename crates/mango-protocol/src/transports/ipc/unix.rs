@@ -1,0 +1,442 @@
+//! The POSIX half of the local socket transport: a Unix domain socket the
+//! listener publishes owner-only, and the peer credentials the socket itself
+//! carries.
+
+use std::io;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{UnixListener, UnixStream};
+
+use crate::transports::deadline::{ConnectDeadline, ConnectError, connect_within};
+use crate::transports::ndjson::NdjsonPort;
+
+use super::{PeerIdentity, PeerUser};
+
+/// Owner-only, the permission local-socket.md requires of a POSIX socket file.
+const SOCKET_MODE: u32 = 0o600;
+
+/// The port a dialled connection produces.
+pub type IpcPort = NdjsonPort<OwnedReadHalf, OwnedWriteHalf>;
+
+/// The port an accepted connection produces. The same type on POSIX, where
+/// both ends of a Unix socket are the same kind of object.
+pub type IpcServerPort = IpcPort;
+
+/// A socket file in the user's runtime directory.
+pub(super) fn address_for(name: &str) -> PathBuf {
+    let directory = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|value| !value.is_empty())
+        .map_or_else(std::env::temp_dir, PathBuf::from);
+    directory.join(format!("{name}.sock"))
+}
+
+/// A listener on a local socket, and the address it actually bound.
+///
+/// # Example
+///
+/// ```no_run
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() -> std::io::Result<()> {
+/// use mango_protocol::transports::ipc::listen_ipc;
+///
+/// let mut listener = listen_ipc("/run/user/1000/mango-hub.sock").await?;
+/// let (_port, _identity) = listener.accept().await?;
+/// listener.close().await;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug)]
+pub struct IpcListener {
+    listener: UnixListener,
+    path: PathBuf,
+    max_frame_bytes: Option<usize>,
+}
+
+impl IpcListener {
+    /// The address this listener bound.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> std::io::Result<()> {
+    /// use mango_protocol::transports::ipc::listen_ipc;
+    ///
+    /// let listener = listen_ipc("/run/user/1000/mango-hub.sock").await?;
+    /// assert!(listener.path().ends_with("mango-hub.sock"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Sets the frame limit every port this listener produces enforces.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> std::io::Result<()> {
+    /// use mango_protocol::transports::ipc::listen_ipc;
+    ///
+    /// let listener = listen_ipc("/run/user/1000/mango-hub.sock")
+    ///     .await?
+    ///     .with_max_frame_bytes(1 << 20);
+    /// # let _ = listener;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Self {
+        self.max_frame_bytes = Some(max_frame_bytes);
+        self
+    }
+
+    /// Waits for the next connection and hands back its port and the identity
+    /// the socket carries.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `accept` failed with. Reading the peer's credentials is not
+    /// one of those: a platform that will not answer leaves the identity
+    /// empty rather than refusing a connection that is otherwise fine.
+    pub async fn accept(&mut self) -> io::Result<(IpcServerPort, PeerIdentity)> {
+        let (stream, _address) = self.listener.accept().await?;
+        let identity = identity_of(&stream);
+        Ok((self.port(stream), identity))
+    }
+
+    /// Stops accepting and removes the socket file.
+    ///
+    /// The sessions already handed out are not this listener's to end: their
+    /// ports moved to whoever called [`IpcListener::accept`], and
+    /// local-socket.md's "a listener shutting down sends `close` `4000` to
+    /// every session first" is that owner's to honour.
+    pub async fn close(self) {
+        drop(self.listener);
+        // Best effort: an address already gone, or replaced by a newer
+        // listener that bound after this one stopped, is not this one's to
+        // report on.
+        let _ = tokio::fs::remove_file(&self.path).await;
+    }
+
+    fn port(&self, stream: UnixStream) -> IpcServerPort {
+        socket_port(stream, self.max_frame_bytes)
+    }
+}
+
+/// Listens on a local socket, owner-only from the instant the address exists.
+///
+/// The socket is bound at a temporary name beside `path`, restricted to
+/// `0600` while only this process knows about it, and then renamed onto
+/// `path`. `bind` takes its mode from the umask, so binding straight onto the
+/// address would publish a world-connectable socket for as long as a `chmod`
+/// takes; the TypeScript SDK closes that window by setting the process-wide
+/// umask, which a library cannot do without reaching into every other thread.
+/// A rename is atomic and local to this call.
+///
+/// A stale socket file left by a previous process is removed first. Anything
+/// else at the address is refused rather than replaced: a regular file there
+/// is a mistake the caller has to see.
+///
+/// # Errors
+///
+/// Whatever binding, restricting or publishing the address failed with, and
+/// [`io::ErrorKind::AlreadyExists`] when something that is not a socket
+/// already holds the address.
+pub async fn listen_ipc(path: impl AsRef<Path>) -> io::Result<IpcListener> {
+    let path = path.as_ref().to_path_buf();
+    remove_stale_socket(&path).await?;
+
+    let staging = staging_path(&path);
+    // A crash between these two steps leaves the staging name behind, where
+    // the next bind's own staging path (this process's id) will not collide
+    // with it and the stale-socket removal never looks. Cheap to clean up by
+    // hand, and never mistaken for the published address.
+    let _ = tokio::fs::remove_file(&staging).await;
+    let listener = UnixListener::bind(&staging)?;
+    if let Err(error) = restrict(&staging).await {
+        let _ = tokio::fs::remove_file(&staging).await;
+        return Err(error);
+    }
+    if let Err(error) = tokio::fs::rename(&staging, &path).await {
+        let _ = tokio::fs::remove_file(&staging).await;
+        return Err(error);
+    }
+
+    Ok(IpcListener {
+        listener,
+        path,
+        max_frame_bytes: None,
+    })
+}
+
+/// Connects to a local socket and returns the port for that connection.
+///
+/// # Errors
+///
+/// [`ConnectError::Io`] with the operating system's own error when the path
+/// has no listener, and [`ConnectError::TimedOut`]/[`ConnectError::Cancelled`]
+/// when `deadline` abandoned an attempt nobody completed.
+pub async fn connect_ipc(
+    path: impl AsRef<Path>,
+    deadline: &ConnectDeadline,
+) -> Result<IpcPort, ConnectError> {
+    let path = path.as_ref();
+    let target = path.display().to_string();
+    let stream = connect_within(&target, deadline, async {
+        Ok(UnixStream::connect(path).await?)
+    })
+    .await?;
+    Ok(socket_port(stream, None))
+}
+
+/// One connection, one port: the socket is both the byte source and the sink.
+fn socket_port(stream: UnixStream, max_frame_bytes: Option<usize>) -> IpcPort {
+    let (reader, writer) = stream.into_split();
+    let port = NdjsonPort::new(reader, writer);
+    match max_frame_bytes {
+        Some(limit) => port.with_max_frame_bytes(limit),
+        None => port,
+    }
+}
+
+/// The credentials the socket carries for the peer that opened it.
+fn identity_of(stream: &UnixStream) -> PeerIdentity {
+    let Ok(credentials) = stream.peer_cred() else {
+        return PeerIdentity::default();
+    };
+    PeerIdentity {
+        process_id: credentials.pid().and_then(|pid| u32::try_from(pid).ok()),
+        user: Some(PeerUser {
+            uid: credentials.uid(),
+            gid: credentials.gid(),
+        }),
+    }
+}
+
+/// Where a listener binds before it publishes. Beside the final address, so
+/// the rename onto it stays within one directory and one filesystem, and
+/// unique per attempt, so two listeners racing for the same address do not
+/// stage over each other.
+fn staging_path(path: &Path) -> PathBuf {
+    static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(0);
+    let attempt = NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed);
+    let mut staging = path.as_os_str().to_owned();
+    staging.push(format!(".{}.{attempt}.binding", std::process::id()));
+    PathBuf::from(staging)
+}
+
+/// Makes the socket file readable and writable by its owner alone.
+async fn restrict(path: &Path) -> io::Result<()> {
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_MODE)).await
+}
+
+/// Removes the socket file a previous process left behind. Only a socket is
+/// removed: anything else at the address is a mistake to report, not
+/// something to delete.
+async fn remove_stale_socket(path: &Path) -> io::Result<()> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        // Nothing at the path, which is the ordinary case.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "{} is {:?}; expected nothing, or a socket file a previous listener left behind",
+                path.display(),
+                metadata.file_type()
+            ),
+        ));
+    }
+    tokio::fs::remove_file(path).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConnectDeadline, IpcListener, SOCKET_MODE, connect_ipc, listen_ipc, staging_path};
+    use crate::frame::Frame;
+    use crate::port::{Inbound, Port, PortRx, PortTx};
+    use crate::transports::deadline::ConnectError;
+    use std::io;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio_util::sync::CancellationToken;
+
+    static NEXT_ADDRESS: AtomicU64 = AtomicU64::new(0);
+
+    /// A socket path in a directory that goes away with the test. The crate
+    /// carries no development dependency for one, and this is the only module
+    /// that needs a scratch directory.
+    struct Address(PathBuf);
+
+    impl Address {
+        fn new() -> Self {
+            let unique = NEXT_ADDRESS.fetch_add(1, Ordering::Relaxed);
+            let directory =
+                std::env::temp_dir().join(format!("mango-ipc-{}-{unique}", std::process::id()));
+            std::fs::create_dir_all(&directory).expect("a scratch directory");
+            Self(directory)
+        }
+
+        fn path(&self) -> PathBuf {
+            self.0.join("mango.sock")
+        }
+    }
+
+    impl Drop for Address {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn listening(address: &Address) -> IpcListener {
+        listen_ipc(address.path())
+            .await
+            .expect("the address is free")
+    }
+
+    #[tokio::test]
+    async fn the_published_socket_is_owner_only() {
+        let address = Address::new();
+        let listener = listening(&address).await;
+
+        let mode = std::fs::metadata(listener.path())
+            .expect("the socket exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, SOCKET_MODE, "expected {SOCKET_MODE:o}, got {mode:o}");
+        listener.close().await;
+    }
+
+    #[tokio::test]
+    async fn nothing_is_left_at_the_staging_name() {
+        let address = Address::new();
+        let listener = listening(&address).await;
+
+        assert!(
+            !staging_path(&address.path()).exists(),
+            "the staging name is renamed onto the address, not left beside it"
+        );
+        listener.close().await;
+    }
+
+    #[tokio::test]
+    async fn an_accepted_connection_carries_frames_and_names_its_peer() {
+        let address = Address::new();
+        let mut listener = listening(&address).await;
+
+        let dial = tokio::spawn({
+            let path = address.path();
+            async move { connect_ipc(path, &ConnectDeadline::default()).await }
+        });
+        let (accepted, identity) = listener.accept().await.expect("a connection arrives");
+        let dialled = dial
+            .await
+            .expect("the dial task runs")
+            .expect("it connects");
+
+        // The test dials itself, so the peer the socket reports is this very
+        // process — the check an application makes before it serves anything.
+        assert!(
+            identity.user.is_some(),
+            "a POSIX socket carries the peer's credentials"
+        );
+        if let Some(pid) = identity.process_id {
+            assert_eq!(pid, std::process::id());
+        }
+
+        let (mut dialled_tx, _dialled_rx) = dialled.split();
+        let (_accepted_tx, mut accepted_rx) = accepted.split();
+        dialled_tx.send(Frame::Ping).await;
+        assert_eq!(accepted_rx.recv().await, Some(Inbound::Frame(Frame::Ping)));
+        listener.close().await;
+    }
+
+    #[tokio::test]
+    async fn closing_a_listener_takes_its_address_with_it() {
+        let address = Address::new();
+        let listener = listening(&address).await;
+        assert!(address.path().exists());
+
+        listener.close().await;
+
+        assert!(
+            !address.path().exists(),
+            "a closed listener leaves no address behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_socket_file_is_replaced() {
+        let address = Address::new();
+        // A listener that vanished without closing leaves its address behind.
+        drop(listening(&address).await);
+
+        let second = listen_ipc(address.path())
+            .await
+            .expect("a stale socket is not an occupied address");
+        second.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_regular_file_at_the_address_is_reported_not_replaced() {
+        let address = Address::new();
+        std::fs::write(address.path(), b"not a socket").expect("the file is written");
+
+        let error = listen_ipc(address.path())
+            .await
+            .expect_err("a regular file is not a stale socket");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(
+            error.to_string().contains("expected nothing, or a socket"),
+            "{error}"
+        );
+        assert!(
+            Path::new(&address.path()).exists(),
+            "the caller's own file is still there"
+        );
+    }
+
+    #[tokio::test]
+    async fn dialling_an_address_with_no_listener_reports_the_system_error() {
+        let address = Address::new();
+        let error = connect_ipc(address.path(), &ConnectDeadline::default())
+            .await
+            .expect_err("nothing is listening");
+
+        match error {
+            ConnectError::Io(error) => assert_eq!(error.kind(), io::ErrorKind::NotFound),
+            other => panic!("expected an operating system error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dial_the_caller_already_gave_up_on_opens_nothing() {
+        let address = Address::new();
+        let listener = listening(&address).await;
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let error = connect_ipc(
+            address.path(),
+            &ConnectDeadline::default().with_cancel(token),
+        )
+        .await
+        .expect_err("a cancelled dial is abandoned");
+
+        assert!(matches!(error, ConnectError::Cancelled { .. }));
+        listener.close().await;
+    }
+}

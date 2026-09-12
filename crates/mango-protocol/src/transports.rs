@@ -11,11 +11,13 @@
 //! | --- | --- |
 //! | [`ndjson`] | any pair of byte streams |
 //! | [`stdio`] | standard input and standard output |
+//! | [`ipc`] | a Unix domain socket, or a Windows named pipe |
 //!
 //! [`deadline`] is not a transport but the bound every dialling one connects
 //! under, and the one error type they all fail with.
 
 pub mod deadline;
+pub mod ipc;
 pub mod ndjson;
 pub mod stdio;
 
