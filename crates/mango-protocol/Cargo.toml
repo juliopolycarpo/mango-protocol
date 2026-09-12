@@ -30,6 +30,8 @@ tokio = [
 ]
 # The reusable conformance suite, exercised through a Fixture, not this crate's own MemoryPort.
 testing = ["tokio"]
+# The spawn launcher and the ssh argv preset it is usually given.
+spawn = ["tokio", "tokio/process", "dep:nix"]
 
 [dependencies]
 jsonschema = { version = "0.56", optional = true, default-features = false }
@@ -38,6 +40,11 @@ serde = { version = "1.0.219", default-features = false, features = ["derive", "
 serde_json = { version = "1.0.140", default-features = false, features = ["std"] }
 tokio = { version = "1.53", optional = true, default-features = false, features = ["rt", "sync", "time", "macros"] }
 tokio-util = { version = "0.7", optional = true, default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+# `SIGTERM`: step 2 of the termination sequence, which `std` and `tokio` can
+# only spell as `SIGKILL`.
+nix = { version = "0.31", optional = true, default-features = false, features = ["signal"] }
 
 [target.'cfg(windows)'.dependencies]
 # The named pipe's security descriptor and the client's process id; nothing

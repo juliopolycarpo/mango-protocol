@@ -12,13 +12,19 @@
 //! | [`ndjson`] | any pair of byte streams |
 //! | [`stdio`] | standard input and standard output |
 //! | [`ipc`] | a Unix domain socket, or a Windows named pipe |
+//! | [`spawn`] | a child process's own standard streams |
 //!
 //! [`deadline`] is not a transport but the bound every dialling one connects
-//! under, and the one error type they all fail with.
+//! under, and the one error type they all fail with; [`ssh`] is not one
+//! either, but the argv that puts [`spawn`] on the far end of a network.
 
 pub mod deadline;
 pub mod ipc;
 pub mod ndjson;
+#[cfg(feature = "spawn")]
+pub mod spawn;
+#[cfg(feature = "spawn")]
+pub mod ssh;
 pub mod stdio;
 
 pub use deadline::{ConnectDeadline, ConnectError};
