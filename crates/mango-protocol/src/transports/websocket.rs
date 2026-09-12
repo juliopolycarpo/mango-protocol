@@ -34,6 +34,7 @@ use crate::frame::Frame;
 use crate::port::{Inbound, Port, PortClosure, PortRx, PortTx, SendOutcome};
 
 use super::CLOSE_FLUSH_GRACE;
+use super::ndjson::clamp_reason;
 
 pub mod client;
 pub mod server;
@@ -565,24 +566,47 @@ impl SocketWriter {
         self.open.store(false, Ordering::Release);
     }
 
-    /// Best effort: a farewell the codec refuses is the optional half here,
-    /// since the socket's own close code carries the same reason.
+    /// Queues the farewell of §10, keeping its code even when its reason is
+    /// what will not encode.
     fn queue_farewell(&self, code: u16, reason: Option<&str>) {
-        let frame = Frame::Close(crate::frame::Close {
-            code,
-            reason: reason.map(ToOwned::to_owned),
-        });
-        let Ok(messages) = encode_chunks(
-            &frame,
-            self.options.max_message_bytes,
-            self.options.max_frame_bytes,
-        ) else {
+        let Some(messages) = farewell_messages(code, reason, self.options) else {
             return;
         };
         let bytes: usize = messages.iter().map(Vec::len).sum();
         self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
         let _ = self.commands.send(WriteCommand::Chunks { messages, bytes });
     }
+}
+
+/// The farewell of §10 as chunk messages, dropping its reason if that is what
+/// it takes to encode one.
+///
+/// The reason is the part that may not fit. It is clamped to the schema's
+/// [`MAX_REASON_CHARS`](crate::validate::MAX_REASON_CHARS) first — a refusal
+/// message, or a caller's own text, can run past it, and a frame the codec
+/// refuses is one the peer never reads — and then dropped altogether if a
+/// lowered frame limit still will not take it, because JSON escapes one NUL
+/// into six bytes. The code is what the peer needs: dropping the whole record
+/// for the sake of its reason would leave a refused peer with no `close` frame
+/// at all, which is the same thing the NDJSON port refuses to do. `None` means
+/// no `close` frame can be encoded with this code at all.
+fn farewell_messages(
+    code: u16,
+    reason: Option<&str>,
+    options: WebSocketOptions,
+) -> Option<Vec<Vec<u8>>> {
+    for candidate in [reason.map(clamp_reason), None] {
+        let frame = Frame::Close(crate::frame::Close {
+            code,
+            reason: candidate,
+        });
+        if let Ok(messages) =
+            encode_chunks(&frame, options.max_message_bytes, options.max_frame_bytes)
+        {
+            return Some(messages);
+        }
+    }
+    None
 }
 
 /// The writer task: one queue per connection, drained in order.
@@ -654,10 +678,66 @@ fn clamp_close_reason(reason: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{CHUNK_HEADER_BYTES, WebSocketOptions, clamp_close_reason, peer_closure};
+    use super::{
+        CHUNK_HEADER_BYTES, WebSocketOptions, clamp_close_reason, farewell_messages, peer_closure,
+    };
+    use crate::close::close_codes;
     use crate::port::PortClosure;
+    use crate::validate::MAX_REASON_CHARS;
     use tokio_tungstenite::tungstenite::protocol::CloseFrame;
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    /// The line a farewell's chunk messages reassemble to.
+    fn farewell_line(messages: &[Vec<u8>]) -> String {
+        let payload: Vec<u8> = messages
+            .iter()
+            .flat_map(|message| message[CHUNK_HEADER_BYTES..].to_vec())
+            .collect();
+        String::from_utf8(payload).expect("the farewell is UTF-8")
+    }
+
+    #[test]
+    fn a_farewell_reason_past_the_schema_limit_is_cut_rather_than_dropped() {
+        // The reason a refusal carries is a decoder message, and a caller may
+        // pass one of its own; either can run past the schema's ceiling. An
+        // unclamped one makes the whole record unencodable, and the peer then
+        // reads no `close` frame at all — which is what the NDJSON port's own
+        // clamp exists to prevent.
+        let long = "x".repeat(MAX_REASON_CHARS + 10);
+        let messages = farewell_messages(
+            close_codes::RELEASED,
+            Some(&long),
+            WebSocketOptions::default(),
+        )
+        .expect("a clamped reason encodes");
+
+        let line = farewell_line(&messages);
+        assert!(
+            line.contains(&"x".repeat(MAX_REASON_CHARS)),
+            "the reason survives, cut to what the schema allows: {line:?}"
+        );
+        assert!(
+            !line.contains(&"x".repeat(MAX_REASON_CHARS + 1)),
+            "and no further: {line:?}"
+        );
+    }
+
+    #[test]
+    fn a_farewell_keeps_its_code_when_the_reason_will_not_fit_the_frame_limit() {
+        // A reason is clamped by characters, but JSON escapes one NUL into six
+        // bytes, so a schema-valid reason can still outgrow a lowered limit.
+        // The code is the part the peer needs.
+        let options = WebSocketOptions::default().with_max_frame_bytes(4096);
+        let long = "\0".repeat(MAX_REASON_CHARS);
+        let messages = farewell_messages(close_codes::PROTOCOL_ERROR, Some(&long), options)
+            .expect("the code still encodes");
+
+        assert_eq!(
+            farewell_line(&messages),
+            "{\"type\":\"close\",\"code\":4400}",
+            "the farewell keeps its code and loses only the reason"
+        );
+    }
 
     #[test]
     fn a_reason_code_close_frame_becomes_the_sessions_closure() {

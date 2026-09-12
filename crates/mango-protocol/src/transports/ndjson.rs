@@ -551,8 +551,9 @@ async fn write_record<W: AsyncWrite + Unpin>(writer: &mut W, line: &[u8]) -> std
 
 /// Cuts a close reason down to the [`MAX_REASON_CHARS`] the schema allows, on
 /// a character boundary, so a long decoder message cannot make the farewell
-/// itself unencodable.
-fn clamp_reason(reason: &str) -> String {
+/// itself unencodable. Shared with the WebSocket port, whose farewell is the
+/// same `close` frame under a different framing.
+pub(crate) fn clamp_reason(reason: &str) -> String {
     if reason.chars().count() <= MAX_REASON_CHARS {
         return reason.to_owned();
     }
