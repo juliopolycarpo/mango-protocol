@@ -526,7 +526,13 @@ impl<W: AsyncWrite + Unpin + Send> SharedWriter<W> {
         let Some(mut writer) = state.writer.take() else {
             return;
         };
-        let _ = writer.shutdown().await;
+        // Bounded for the same reason the farewell is. Evicting the stuck
+        // write releases the guard but not the peer: on a handle whose
+        // `poll_shutdown` is a flush — `tokio::io::Stdout`, a Windows pipe
+        // write half — this waits on the very pipe that would not take the
+        // bytes. Dropping is what actually closes the handle anyway, so a
+        // shutdown that will not land is one to stop waiting for.
+        let _ = tokio::time::timeout(CLOSE_FLUSH_GRACE, writer.shutdown()).await;
         drop(writer);
     }
 }
@@ -837,6 +843,10 @@ mod tests {
     /// what a pipe whose peer stopped reading does. `touched` reports the
     /// first poll, so a test can know the write is in flight — and holding
     /// the shared writer — before it does anything else.
+    ///
+    /// Its shutdown stalls too, because that is the same pipe: `poll_shutdown`
+    /// is a flush on `tokio::io::Stdout` and on a Windows pipe write half, so
+    /// a peer that will not read blocks it exactly as it blocks a write.
     struct StalledSink {
         touched: watch::Sender<bool>,
     }
@@ -863,7 +873,7 @@ mod tests {
         }
 
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
+            Poll::Pending
         }
     }
 
