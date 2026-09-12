@@ -11,8 +11,10 @@
  */
 
 import { Ajv2020 } from 'ajv/dist/2020';
+import { CLOSE_CODES } from '../packages/protocol/src/close';
 import chunks from '../spec/fixtures/1/chunks.json';
 import frames from '../spec/fixtures/1/frames.json';
+import legacyHello from '../spec/fixtures/1/legacy-hello.json';
 import ndjson from '../spec/fixtures/1/ndjson.json';
 import negotiation from '../spec/fixtures/1/negotiation.json';
 import catalogSchema from '../spec/schema/1/catalog.json';
@@ -89,6 +91,29 @@ for (const item of negotiation.cases) {
   }
 }
 
+// A greeting from before this wire existed must fail the schema, and the
+// refusal must be the one that maps to 4426 rather than the generic 4400:
+// its `type` is `hello`, so a peer reading it knows the far side speaks a
+// different wire rather than that it sent nonsense.
+for (const item of legacyHello.cases) {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(item.line);
+  } catch {
+    fail(`legacy-hello ${item.name}: the line is not JSON`);
+    continue;
+  }
+  if (validateFrame(parsed) === true) {
+    fail(`legacy-hello ${item.name}: should not validate against the wire 1 schema`);
+  }
+  if ((parsed as { type?: unknown }).type !== 'hello') {
+    fail(`legacy-hello ${item.name}: type should be "hello", so the refusal maps to 4426`);
+  }
+  if (item.closeCode !== CLOSE_CODES.PROTOCOL_MISMATCH) {
+    fail(`legacy-hello ${item.name}: closeCode should be ${CLOSE_CODES.PROTOCOL_MISMATCH}`);
+  }
+}
+
 const sampleCatalog = {
   name: 'fixture-contract',
   version: '1.0.0',
@@ -123,5 +148,5 @@ if (failures.length > 0) {
   process.exit(1);
 }
 console.log(
-  `verify-spec: ${frames.cases.length} frame, ${ndjson.cases.length} ndjson, ${chunks.cases.length} chunk and ${negotiation.cases.length} negotiation cases agree with the schema`
+  `verify-spec: ${frames.cases.length} frame, ${ndjson.cases.length} ndjson, ${chunks.cases.length} chunk, ${negotiation.cases.length} negotiation and ${legacyHello.cases.length} legacy-hello cases agree with the schema`
 );

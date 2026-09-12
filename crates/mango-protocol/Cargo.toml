@@ -83,5 +83,9 @@ name = "roundtrip"
 name = "session_pair"
 required-features = ["tokio"]
 
+[[example]]
+name = "conformance_peer"
+required-features = ["testing", "websocket", "spawn"]
+
 [package.metadata.docs.rs]
 all-features = true
