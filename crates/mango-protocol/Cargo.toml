@@ -18,11 +18,18 @@ workspace = true
 default = []
 # JSON Schema emission used by the repo's equality check; not needed to speak the protocol.
 schema = ["dep:schemars"]
+# The Port trait, an in-process port pair, and (in later commits) the session and contract.
+tokio = ["dep:tokio", "dep:tokio-util"]
 
 [dependencies]
 schemars = { version = "1.2", optional = true, features = ["derive"] }
 serde = { version = "1.0.219", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.140", default-features = false, features = ["std"] }
+tokio = { version = "1.53", optional = true, default-features = false, features = ["rt", "sync", "time", "macros"] }
+tokio-util = { version = "0.7", optional = true, default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1.53", features = ["macros", "rt", "rt-multi-thread", "test-util"] }
 
 [[example]]
 name = "emit_schema"

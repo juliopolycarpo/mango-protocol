@@ -46,6 +46,9 @@ pub mod version;
 #[cfg(feature = "schema")]
 pub mod schema;
 
+#[cfg(feature = "tokio")]
+pub mod port;
+
 pub use catalog::{Catalog, CatalogEvent, CatalogMethod};
 pub use close::{close_code_name, close_codes, is_fatal_close_code};
 pub use codec::chunk::{ChunkReassembler, encode_chunks};
