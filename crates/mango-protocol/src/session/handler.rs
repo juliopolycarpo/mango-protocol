@@ -130,18 +130,26 @@ pub struct HandlerGuard {
     pub(super) method: String,
     pub(super) generation: u64,
     pub(super) shared: Arc<super::shared::Shared>,
+    /// Cleared by [`HandlerGuard::persist`], so `Drop` keeps the registration.
+    pub(super) armed: bool,
 }
 
 impl HandlerGuard {
-    /// Keeps the registration for the session's life; the returned value has
-    /// no further effect and dropping it does nothing.
-    pub fn persist(self) {
-        std::mem::forget(self);
+    /// Keeps the registration for the session's life.
+    ///
+    /// The guard is still dropped — releasing its `Arc` on the session's
+    /// shared state, which a `mem::forget` would strand for the life of the
+    /// process — it simply no longer unregisters the handler on the way out.
+    pub fn persist(mut self) {
+        self.armed = false;
     }
 }
 
 impl Drop for HandlerGuard {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         let mut handlers = lock(&self.shared.handlers);
         if handlers
             .get(&self.method)
@@ -149,5 +157,68 @@ impl Drop for HandlerGuard {
         {
             handlers.remove(&self.method);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::frame::PeerInfo;
+    use crate::port::port_pair;
+    use crate::session::{Session, SessionOptions};
+
+    use super::super::shared::lock;
+
+    fn peer() -> PeerInfo {
+        PeerInfo {
+            name: "example".into(),
+            version: "0.1.0".into(),
+            role: "runtime".into(),
+        }
+    }
+
+    /// `persist` means "keep the registration for the session's life", not
+    /// "keep the session alive for the process's". A hub that persists a
+    /// handler per connection and then drops the session would otherwise leak
+    /// that connection's `Shared` — handler map, subscriber lists, command
+    /// channel — on every cycle.
+    #[test]
+    fn persist_keeps_the_handler_and_still_releases_the_session() {
+        let (a, _b) = port_pair();
+        let (session, driver) = Session::open(a, SessionOptions::new(peer()));
+        let shared = Arc::downgrade(&session.shared);
+
+        session
+            .handle("text.echo", |params, _context| async move { Ok(params) })
+            .persist();
+        let live = shared.upgrade().expect("the session is still alive");
+        assert!(
+            lock(&live.handlers).contains_key("text.echo"),
+            "expected persist to keep the handler registered | received: no registration"
+        );
+        drop(live);
+
+        drop(session);
+        drop(driver);
+        assert!(
+            shared.upgrade().is_none(),
+            "expected the session's Shared to be released once the handle and its driver are \
+             gone | received: a live Arc"
+        );
+    }
+
+    /// The registration only outlives the guard when `persist` says so.
+    #[test]
+    fn dropping_the_guard_unregisters_the_handler() {
+        let (a, _b) = port_pair();
+        let (session, _driver) = Session::open(a, SessionOptions::new(peer()));
+
+        drop(session.handle("text.echo", |params, _context| async move { Ok(params) }));
+
+        assert!(
+            !lock(&session.shared.handlers).contains_key("text.echo"),
+            "expected the dropped guard to unregister the handler | received: a live registration"
+        );
     }
 }

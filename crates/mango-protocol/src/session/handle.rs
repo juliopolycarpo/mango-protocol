@@ -299,6 +299,7 @@ impl Session {
             method,
             generation,
             shared: Arc::clone(&self.shared),
+            armed: true,
         }
     }
 
