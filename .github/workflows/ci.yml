@@ -47,10 +47,17 @@ jobs:
           persist-credentials: false
       - run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+        with:
+          tool: cargo-hack
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - run: cargo test --all-targets --all-features --locked
       - run: cargo test --doc --all-features --locked
+      - run: cargo hack clippy --feature-powerset --all-targets --locked -- -D warnings
+      - run: cargo doc --no-deps --all-features --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   transports:
     name: Transports (${{ matrix.os }})

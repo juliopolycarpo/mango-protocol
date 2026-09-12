@@ -19,13 +19,25 @@ export interface Task {
   readonly name: string;
   readonly argv: readonly string[];
   readonly cwd?: string;
+  /** Extra environment variables, merged over the current process's own. */
+  readonly env?: Readonly<Record<string, string>>;
 }
 
 /** Repository root as a native path (a URL pathname would keep a leading slash on Windows). */
 export const ROOT_DIR = fileURLToPath(new URL('..', import.meta.url)).replace(/[\\/]$/, '');
 
-export function task(name: string, argv: readonly string[], cwd?: string): Task {
-  return cwd === undefined ? { name, argv } : { name, argv, cwd };
+export function task(
+  name: string,
+  argv: readonly string[],
+  cwd?: string,
+  env?: Readonly<Record<string, string>>
+): Task {
+  return {
+    name,
+    argv,
+    ...(cwd === undefined ? {} : { cwd }),
+    ...(env === undefined ? {} : { env }),
+  };
 }
 
 /**
@@ -50,6 +62,7 @@ export async function runTask(item: Task): Promise<TaskResult> {
   console.log(`\n▶ ${item.name}: ${item.argv.join(' ')}`);
   const child = Bun.spawn(resolveArgv(item.argv), {
     cwd: item.cwd ?? ROOT_DIR,
+    ...(item.env === undefined ? {} : { env: { ...process.env, ...item.env } }),
     stdout: 'inherit',
     stderr: 'inherit',
     stdin: 'ignore',
@@ -97,4 +110,13 @@ export function hasCargo(): boolean {
 
 export function warnNoCargo(): void {
   console.warn('cargo not found on PATH; skipping the Rust half. CI runs it.');
+}
+
+/** True when `cargo-hack` resolves on PATH; CI installs it via `taiki-e/install-action`. */
+export function hasCargoHack(): boolean {
+  return Bun.which('cargo-hack') !== null;
+}
+
+export function warnNoCargoHack(): void {
+  console.warn('cargo-hack not found on PATH; skipping the feature-powerset check. CI runs it.');
 }
