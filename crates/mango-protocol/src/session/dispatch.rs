@@ -5,11 +5,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 use tokio::task::{Id, JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 
-use crate::codec::ndjson::encode_frame_bytes;
 use crate::error::{RemoteError, codes};
 use crate::frame::{ErrorPayload, ErrorResponse, Frame, Request, Response};
 use crate::port::PortTx;
@@ -42,27 +41,15 @@ pub(super) struct RequestTracking {
     pub(super) by_task_id: HashMap<Id, String>,
 }
 
-fn respond_error<Tx: PortTx>(
-    writer: &Writer<Tx>,
-    id: String,
-    code: &str,
-    message: String,
-    details: Option<Map<String, Value>>,
-) {
+fn respond_error<Tx: PortTx>(writer: &Writer<Tx>, id: String, error: RemoteError) {
     writer.enqueue(Frame::Err(ErrorResponse {
         id,
         error: ErrorPayload {
-            code: code.to_string(),
-            message,
-            details,
+            code: error.code,
+            message: error.message,
+            details: error.details,
         },
     }));
-}
-
-fn detail(key: &str, value: impl Into<Value>) -> Map<String, Value> {
-    let mut details = Map::new();
-    details.insert(key.to_string(), value.into());
-    details
 }
 
 /// Routes one inbound `req` frame: the four refusal checks (not ready, a
@@ -89,37 +76,35 @@ pub(super) fn on_request<Tx: PortTx>(
         respond_error(
             writer,
             id,
-            codes::UNAVAILABLE,
-            "The session handshake has not completed; requests are refused until both hellos \
-             have crossed."
-                .to_string(),
-            None,
+            RemoteError::new(
+                codes::UNAVAILABLE,
+                "The session handshake has not completed; requests are refused until both \
+                 hellos have crossed.",
+            ),
         );
         return;
     };
     if tracking.active.contains_key(&id) {
+        let message = format!(
+            "Request id \"{id}\" is already in flight; expected an id unique among the \
+             sender's pending requests."
+        );
         respond_error(
             writer,
             id.clone(),
-            codes::INVALID_REQUEST,
-            format!(
-                "Request id \"{id}\" is already in flight; expected an id unique among the \
-                 sender's pending requests."
-            ),
-            Some(detail("id", id)),
+            RemoteError::new(codes::INVALID_REQUEST, message).with_detail("id", id),
         );
         return;
     }
     if is_reserved_method_name(&method) {
+        let message = format!(
+            "Method \"{method}\" is reserved; the rpc. segment belongs to the protocol and \
+             defines no method in wire 1.0."
+        );
         respond_error(
             writer,
             id,
-            codes::INVALID_REQUEST,
-            format!(
-                "Method \"{method}\" is reserved; the rpc. segment belongs to the protocol and \
-                 defines no method in wire 1.0."
-            ),
-            Some(detail("method", method)),
+            RemoteError::new(codes::INVALID_REQUEST, message).with_detail("method", method),
         );
         return;
     }
@@ -127,12 +112,11 @@ pub(super) fn on_request<Tx: PortTx>(
         .get(&method)
         .map(|(_, handler)| Arc::clone(handler));
     let Some(handler) = handler else {
+        let message = format!("Method \"{method}\" has no handler on this peer.");
         respond_error(
             writer,
             id,
-            codes::METHOD_UNSUPPORTED,
-            format!("Method \"{method}\" has no handler on this peer."),
-            Some(detail("method", method)),
+            RemoteError::new(codes::METHOD_UNSUPPORTED, message).with_detail("method", method),
         );
         return;
     };
@@ -189,13 +173,7 @@ pub(super) fn on_handler_settled<Tx: PortTx>(
     };
     match outcome {
         Ok(value) => respond_result(shared, writer, &active_request.method, id, value),
-        Err(error) => respond_error(
-            writer,
-            id,
-            &error.code,
-            error.message,
-            error.details.map(|details| details.into_iter().collect()),
-        ),
+        Err(error) => respond_error(writer, id, error),
     }
 }
 
@@ -210,18 +188,9 @@ fn respond_result<Tx: PortTx>(
         id: id.clone(),
         result: value,
     });
-    let limit = shared.send_limit_bytes();
-    match encode_frame_bytes(&frame, limit) {
-        Ok(_) => writer.enqueue(frame),
-        Err(_) => respond_error(
-            writer,
-            id,
-            codes::FRAME_TOO_LARGE,
-            format!(
-                "The result of \"{method}\" encodes to more bytes than the session limit of {limit}."
-            ),
-            Some(detail("limit", u64::try_from(limit).unwrap_or(u64::MAX))),
-        ),
+    match shared.assert_fits(&frame, &format!("The result of \"{method}\"")) {
+        Ok(()) => writer.enqueue(frame),
+        Err(error) => respond_error(writer, id, error),
     }
 }
 
