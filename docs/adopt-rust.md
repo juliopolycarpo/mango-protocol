@@ -225,7 +225,11 @@ if session.ready().await.is_err() {
     let why = peer.start_error(None).await;      // exit status, spawn error, last stderr line
     eprintln!("{}", why.stderr_line);
 }
-peer.terminate().await;                          // stdin, then SIGTERM, then SIGKILL
+// Closing the session ends the child's stdin, which is step 1 of the
+// sequence and all a conforming peer needs; `terminate` waits that out and
+// escalates to SIGTERM and SIGKILL for a child that does not leave.
+session.close(close_codes::RELEASED, Some("done")).await;
+peer.terminate().await;
 
 // SSH, WSL and container launches are the same transport with a different argv
 // in front; the preset is pure, so a caller can unit-test its launch command.

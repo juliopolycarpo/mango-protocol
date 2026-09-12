@@ -409,6 +409,10 @@ fn is_secret_shaped(upper: &str) -> bool {
 ///     let why = peer.start_error(None).await;
 ///     eprintln!("the runtime never started: {}", why.stderr_line);
 /// }
+/// // Closing the session ends the child's stdin, which is step 1 of the
+/// // termination sequence; `terminate` then waits for the child and escalates
+/// // only if it stays.
+/// session.close(mango_protocol::close_codes::RELEASED, None).await;
 /// peer.terminate().await;
 /// # }
 /// ```
