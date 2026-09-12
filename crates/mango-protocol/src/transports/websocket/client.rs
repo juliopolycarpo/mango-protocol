@@ -296,12 +296,12 @@ mod tests {
     }
 
     #[test]
-    fn an_address_that_is_not_a_websocket_url_is_refused_before_anything_opens() {
-        let error = build_request(
-            "https://hub.example/runtime",
-            &WebSocketConnectOptions::default(),
-        )
-        .expect_err("https is not a WebSocket scheme");
+    fn an_address_that_is_not_a_url_is_refused_before_anything_opens() {
+        // A scheme of `http`/`https` is not refused here: tungstenite reads
+        // those as the `ws`/`wss` they stand for. What cannot be read as a URL
+        // at all is refused before a socket is opened.
+        let error = build_request("hub.example/runtime", &WebSocketConnectOptions::default())
+            .expect_err("an address with no scheme is not a URL");
         match error {
             ConnectError::Refused { detail, .. } => {
                 assert!(detail.contains("ws:// or wss://"), "{detail}");

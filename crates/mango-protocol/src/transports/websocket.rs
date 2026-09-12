@@ -10,12 +10,16 @@
 //! [`server`] does the upgrade-time work — the subprotocol and the bearer —
 //! for a peer that has no HTTP stack of its own yet.
 
+use std::marker::PhantomData;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -37,6 +41,10 @@ pub const WEBSOCKET_SUBPROTOCOL: &str = "mango.v1";
 /// RFC 6455 caps the close reason at 123 UTF-8 bytes; the `close` frame
 /// carries the full one.
 const MAX_CLOSE_REASON_BYTES: usize = 123;
+
+/// How long a close waits for the socket to take it. Immediate on a healthy
+/// connection; a peer that stopped reading must not hold up a teardown.
+const CLOSE_FLUSH_GRACE: Duration = Duration::from_secs(2);
 
 /// How this transport frames, and how much it will hold for a socket that is
 /// not draining.
@@ -124,11 +132,12 @@ impl WebSocketOptions {
 
     /// The tungstenite configuration these options imply.
     ///
-    /// `max_write_buffer_size` is the bounded send queue of the spec's
-    /// Backpressure section: a socket that is not draining may hold one whole
-    /// frame plus the message being written, and a sender that reaches the
-    /// ceiling closes with `4400` rather than holding every pending response
-    /// for a peer that may never read again.
+    /// The queue the spec's Backpressure section is about is this port's own,
+    /// not this one: tungstenite writes straight through to the socket, so its
+    /// write buffer never accumulates and could not be measured. What the
+    /// configuration does carry is the ceiling on an *incoming* message, which
+    /// is one chunk — anything larger is a peer that is not speaking
+    /// `mango.v1` at all.
     ///
     /// # Example
     ///
@@ -145,8 +154,9 @@ impl WebSocketOptions {
             // so anything bigger is a peer that is not speaking mango.v1.
             .max_message_size(Some(self.max_message_bytes))
             .max_frame_size(Some(self.max_message_bytes))
+            // Every chunk goes to the socket as it is written; this port's own
+            // queue is what holds anything back.
             .write_buffer_size(0)
-            .max_write_buffer_size(self.max_frame_bytes.saturating_add(self.max_message_bytes))
     }
 }
 
@@ -214,15 +224,16 @@ where
     fn split(self) -> (Self::Tx, Self::Rx) {
         let options = self.options;
         let (sink, stream) = self.stream.split();
-        let sink = SharedSink::new(sink, options);
+        let writer = SocketWriter::spawn(sink, options);
         let tx = WebSocketTx {
-            sink: sink.clone(),
+            writer: writer.clone(),
             options,
+            socket: PhantomData,
         };
         let rx = WebSocketRx {
             stream,
             reassembler: ChunkReassembler::new(options.max_message_bytes, options.max_frame_bytes),
-            sink,
+            writer,
             closure: None,
             terminal: false,
         };
@@ -233,8 +244,10 @@ where
 /// The send half of a [`WebSocketPort`].
 #[derive(Debug)]
 pub struct WebSocketTx<S> {
-    sink: SharedSink<S>,
+    writer: SocketWriter,
     options: WebSocketOptions,
+    /// Ties this half to the socket's own type, which the writer task owns.
+    socket: PhantomData<fn() -> S>,
 }
 
 impl<S> PortTx for WebSocketTx<S>
@@ -242,22 +255,13 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     async fn send(&mut self, frame: Frame) -> SendOutcome {
-        let messages = match encode_chunks(
-            &frame,
-            self.options.max_message_bytes,
-            self.options.max_frame_bytes,
-        ) {
-            Ok(messages) => messages,
-            Err(error) => return SendOutcome::Refused(error),
-        };
-        self.sink.send_chunks(messages).await
+        self.writer.send_frame(&frame).await
     }
 
     async fn close(self, code: u16, reason: Option<String>) {
-        if self.options.send_close_frame {
-            self.sink.send_farewell(code, reason.clone()).await;
-        }
-        self.sink.close(code, reason.as_deref()).await;
+        self.writer
+            .close(code, reason.as_deref(), self.options.send_close_frame)
+            .await;
     }
 }
 
@@ -266,7 +270,7 @@ where
 pub struct WebSocketRx<S> {
     stream: SplitStream<WebSocketStream<S>>,
     reassembler: ChunkReassembler,
-    sink: SharedSink<S>,
+    writer: SocketWriter,
     /// Why the socket ended; held until it is the next thing to hand out.
     closure: Option<PortClosure>,
     terminal: bool,
@@ -352,8 +356,9 @@ where
     /// maps to, then stop. A chunk stream cannot be resynchronised.
     async fn refuse(&mut self, error: CodecError) {
         let code = close_code_for_codec_error(&error);
-        self.sink.send_farewell(code, Some(error.to_string())).await;
-        self.sink.close(code, Some(&error.to_string())).await;
+        self.writer
+            .close(code, Some(&error.to_string()), true)
+            .await;
         self.closure = Some(PortClosure::ProtocolError { error, code });
     }
 }
@@ -382,137 +387,223 @@ fn peer_closure(frame: Option<&CloseFrame>) -> PortClosure {
     }
 }
 
-/// The socket's send half, shared by the two port halves.
+/// The socket's send half, behind the one queue per connection that
+/// websocket.md's Backpressure section describes.
 ///
-/// The receive half needs it for one thing: the farewell a refused message
-/// calls for, which the TypeScript port writes from `#failReceive` on the same
-/// socket object.
-#[derive(Debug)]
-struct SharedSink<S>(Arc<Mutex<SinkState<S>>>);
-
-#[derive(Debug)]
-struct SinkState<S> {
-    sink: SplitSink<WebSocketStream<S>, Message>,
-    open: bool,
+/// A task owns the sink; a send hands its chunks over and returns. That is
+/// what makes the queue observable at all: a sender that simply awaited the
+/// socket would have no queue to measure, and a peer that stopped reading
+/// would stall it for ever rather than be given up on. The counter is the
+/// bytes handed over and not yet written, and passing one frame limit is the
+/// signal the spec names.
+///
+/// The receive half holds one of these too, for the farewell a refused
+/// message calls for — the same thing the TypeScript port writes from
+/// `#failReceive`.
+#[derive(Debug, Clone)]
+struct SocketWriter {
+    commands: mpsc::UnboundedSender<WriteCommand>,
+    /// Bytes handed to the writer task and not yet written.
+    queued_bytes: Arc<AtomicUsize>,
+    /// False once anything closed the socket; every later send is reported as
+    /// the transport being gone rather than queued behind a dead one.
+    open: Arc<AtomicBool>,
+    /// Held, never read: dropping the last handle aborts the writer task, so
+    /// one still stuck on a socket that will not take the farewell cannot
+    /// outlive the port.
+    _task: Arc<AbortOnDrop>,
     options: WebSocketOptions,
 }
 
-impl<S> Clone for SharedSink<S> {
-    fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0))
+/// One item for the writer task.
+#[derive(Debug)]
+enum WriteCommand {
+    /// One frame's chunks, written contiguously so two frames never
+    /// interleave, and the byte count to release from the queue afterwards.
+    Chunks {
+        messages: Vec<Vec<u8>>,
+        bytes: usize,
+    },
+    /// Close the socket with this code and stop.
+    Close {
+        code: u16,
+        reason: Option<String>,
+        done: oneshot::Sender<()>,
+    },
+}
+
+/// A writer task that is aborted when the last handle to it goes.
+#[derive(Debug)]
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
-impl<S> SharedSink<S>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    fn new(sink: SplitSink<WebSocketStream<S>, Message>, options: WebSocketOptions) -> Self {
-        Self(Arc::new(Mutex::new(SinkState {
+impl SocketWriter {
+    fn spawn<S>(sink: SplitSink<WebSocketStream<S>, Message>, options: WebSocketOptions) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (commands, receiver) = mpsc::unbounded_channel();
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let open = Arc::new(AtomicBool::new(true));
+        let task = tokio::spawn(drive(
             sink,
-            open: true,
+            receiver,
+            Arc::clone(&queued_bytes),
+            Arc::clone(&open),
+        ));
+        Self {
+            commands,
+            queued_bytes,
+            open,
+            _task: Arc::new(AbortOnDrop(task)),
             options,
-        })))
+        }
     }
 
-    /// Sends one frame's chunks contiguously, so two frames' chunks never
-    /// interleave: the lock is held for the whole run.
-    async fn send_chunks(&self, messages: Vec<Vec<u8>>) -> SendOutcome {
-        let mut state = self.0.lock().await;
-        if !state.open {
+    /// Queues one frame's chunks.
+    ///
+    /// Reports [`SendOutcome::Sent`] once they are the writer's, the way the
+    /// TypeScript port reports a message the socket buffered. A queue that has
+    /// passed one frame limit is a peer that is not reading: the socket is
+    /// closed with `4400` and the session is told the transport is gone,
+    /// rather than every pending response being held for a socket that may
+    /// never drain.
+    async fn send_frame(&self, frame: &Frame) -> SendOutcome {
+        if !self.open.load(Ordering::Acquire) {
             return SendOutcome::Closed;
         }
-        for message in messages {
-            if let Err(error) = state.sink.send(Message::Binary(message.into())).await {
-                return state.on_send_error(&error).await;
-            }
+        let messages = match encode_chunks(
+            frame,
+            self.options.max_message_bytes,
+            self.options.max_frame_bytes,
+        ) {
+            Ok(messages) => messages,
+            Err(error) => return SendOutcome::Refused(error),
+        };
+        let bytes: usize = messages.iter().map(Vec::len).sum();
+        self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
+        if self
+            .commands
+            .send(WriteCommand::Chunks { messages, bytes })
+            .is_err()
+        {
+            self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+            self.open.store(false, Ordering::Release);
+            return SendOutcome::Closed;
         }
-        match state.sink.flush().await {
-            Ok(()) => SendOutcome::Sent,
-            Err(error) => state.on_send_error(&error).await,
+        if self.queued_bytes.load(Ordering::Acquire) > self.options.max_frame_bytes {
+            self.close(
+                close_codes::PROTOCOL_ERROR,
+                Some("the send queue outgrew one frame limit while the socket was not draining"),
+                true,
+            )
+            .await;
+            return SendOutcome::Closed;
         }
+        SendOutcome::Sent
     }
 
-    /// Writes the farewell of §10 ahead of the socket close; best effort,
-    /// since the close code carries the same reason.
-    async fn send_farewell(&self, code: u16, reason: Option<String>) {
-        let mut state = self.0.lock().await;
-        if !state.open {
+    /// Closes the socket with the reason code, having queued the farewell
+    /// frame of §10 ahead of it when this port sends one.
+    ///
+    /// Waits a bounded grace for the close to reach the socket: on a healthy
+    /// connection that is immediate, and a peer that will not take it must not
+    /// hold up a teardown.
+    async fn close(&self, code: u16, reason: Option<&str>, send_close_frame: bool) {
+        if !self.open.swap(false, Ordering::AcqRel) {
             return;
         }
-        let frame = Frame::Close(crate::frame::Close { code, reason });
+        if send_close_frame {
+            self.queue_farewell(code, reason);
+        }
+        let (done, finished) = oneshot::channel();
+        if self
+            .commands
+            .send(WriteCommand::Close {
+                code,
+                reason: reason.map(ToOwned::to_owned),
+                done,
+            })
+            .is_err()
+        {
+            return;
+        }
+        let _ = tokio::time::timeout(CLOSE_FLUSH_GRACE, finished).await;
+    }
+
+    /// Best effort: a farewell the codec refuses is the optional half here,
+    /// since the socket's own close code carries the same reason.
+    fn queue_farewell(&self, code: u16, reason: Option<&str>) {
+        let frame = Frame::Close(crate::frame::Close {
+            code,
+            reason: reason.map(ToOwned::to_owned),
+        });
         let Ok(messages) = encode_chunks(
             &frame,
-            state.options.max_message_bytes,
-            state.options.max_frame_bytes,
+            self.options.max_message_bytes,
+            self.options.max_frame_bytes,
         ) else {
-            // The code is not one a `close` frame may carry. The socket close
-            // says the same thing, so the frame is the optional half here.
             return;
         };
-        for message in messages {
-            if state
-                .sink
-                .send(Message::Binary(message.into()))
-                .await
-                .is_err()
-            {
-                state.open = false;
-                return;
-            }
-        }
-        let _ = state.sink.flush().await;
-    }
-
-    /// Closes the socket with the reason code, then consumes nothing: the
-    /// other half may still be reading the peer's own farewell.
-    async fn close(&self, code: u16, reason: Option<&str>) {
-        let mut state = self.0.lock().await;
-        if !state.open {
-            return;
-        }
-        state.open = false;
-        let frame = CloseFrame {
-            code: CloseCode::from(code),
-            reason: clamp_close_reason(reason.unwrap_or_default()).into(),
-        };
-        let _ = state.sink.send(Message::Close(Some(frame))).await;
-        let _ = state.sink.close().await;
+        let bytes: usize = messages.iter().map(Vec::len).sum();
+        self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
+        let _ = self.commands.send(WriteCommand::Chunks { messages, bytes });
     }
 }
 
-impl<S> SinkState<S>
+/// The writer task: one queue per connection, drained in order.
+async fn drive<S>(
+    mut sink: SplitSink<WebSocketStream<S>, Message>,
+    mut commands: mpsc::UnboundedReceiver<WriteCommand>,
+    queued_bytes: Arc<AtomicUsize>,
+    open: Arc<AtomicBool>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    while let Some(command) = commands.recv().await {
+        match command {
+            WriteCommand::Chunks { messages, bytes } => {
+                let written = write_chunks(&mut sink, messages).await;
+                queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                if !written {
+                    open.store(false, Ordering::Release);
+                    break;
+                }
+            }
+            WriteCommand::Close { code, reason, done } => {
+                let frame = CloseFrame {
+                    code: CloseCode::from(code),
+                    reason: clamp_close_reason(reason.as_deref().unwrap_or_default()).into(),
+                };
+                let _ = sink.send(Message::Close(Some(frame))).await;
+                let _ = done.send(());
+                break;
+            }
+        }
+    }
+    let _ = sink.close().await;
+}
+
+/// Writes one frame's chunks contiguously. False once the socket refused one,
+/// which is the connection being gone rather than a frame to retry.
+async fn write_chunks<S>(
+    sink: &mut SplitSink<WebSocketStream<S>, Message>,
+    messages: Vec<Vec<u8>>,
+) -> bool
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    /// A send the stream cannot recover from. A queue that grew past the
-    /// ceiling while the socket was not draining is a peer that is not
-    /// reading: close with `4400` rather than hold every pending response for
-    /// a socket that may never drain (websocket.md, Backpressure). Anything
-    /// else is the socket already being gone.
-    async fn on_send_error(
-        &mut self,
-        error: &tokio_tungstenite::tungstenite::Error,
-    ) -> SendOutcome {
-        let backpressure = matches!(
-            error,
-            tokio_tungstenite::tungstenite::Error::WriteBufferFull(_)
-        );
-        if self.open && backpressure {
-            self.open = false;
-            let frame = CloseFrame {
-                code: CloseCode::from(close_codes::PROTOCOL_ERROR),
-                reason: clamp_close_reason(
-                    "the send queue outgrew one frame limit while the socket was not draining",
-                )
-                .into(),
-            };
-            let _ = self.sink.send(Message::Close(Some(frame))).await;
+    for message in messages {
+        if sink.send(Message::Binary(message.into())).await.is_err() {
+            return false;
         }
-        self.open = false;
-        let _ = self.sink.close().await;
-        SendOutcome::Closed
     }
+    sink.flush().await.is_ok()
 }
 
 /// Cuts a close reason down to the 123 UTF-8 bytes RFC 6455 allows, on a
@@ -588,12 +679,10 @@ mod tests {
     }
 
     #[test]
-    fn the_send_queue_is_bounded_by_one_frame_limit_plus_a_message() {
-        let options = WebSocketOptions::default()
-            .with_max_frame_bytes(65_536)
-            .with_max_message_bytes(2048);
+    fn an_incoming_message_larger_than_one_chunk_is_refused_by_the_socket() {
+        let options = WebSocketOptions::default().with_max_message_bytes(2048);
         let config = options.socket_config();
-        assert_eq!(config.max_write_buffer_size, 65_536 + 2048);
         assert_eq!(config.max_message_size, Some(2048));
+        assert_eq!(config.max_frame_size, Some(2048));
     }
 }
