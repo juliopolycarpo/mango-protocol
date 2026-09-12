@@ -29,7 +29,7 @@
 //! ```
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
@@ -124,6 +124,86 @@ where
     pub fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Self {
         self.max_frame_bytes = max_frame_bytes;
         self
+    }
+}
+
+impl<R, W> NdjsonPort<R, W>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    /// A handle that can end this port from somewhere that does not own it.
+    ///
+    /// A listener needs one: `spec/transports/local-socket.md` has it send
+    /// `close` `4000` to every session before it stops, and by then the ports
+    /// themselves have moved to whoever accepted them. The handle holds a weak
+    /// reference, so keeping one never keeps a connection alive.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_protocol::transports::ndjson::NdjsonPort;
+    ///
+    /// let (one, two) = tokio::io::duplex(64);
+    /// let (read, _unused) = tokio::io::split(one);
+    /// let (_unused, write) = tokio::io::split(two);
+    /// let port = NdjsonPort::new(read, write);
+    /// assert!(port.closer().is_open());
+    /// ```
+    #[must_use]
+    pub fn closer(&self) -> PortCloser<W> {
+        PortCloser {
+            writer: Arc::downgrade(&self.writer.0),
+            max_frame_bytes: self.max_frame_bytes,
+        }
+    }
+}
+
+/// Ends a port from outside, for an owner that handed it on.
+///
+/// # Example
+///
+/// ```
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() {
+/// use mango_protocol::close::close_codes;
+/// use mango_protocol::transports::ndjson::NdjsonPort;
+///
+/// let (one, two) = tokio::io::duplex(1024);
+/// let (read, _unused) = tokio::io::split(one);
+/// let (_unused, write) = tokio::io::split(two);
+/// let port = NdjsonPort::new(read, write);
+/// let closer = port.closer();
+///
+/// closer.close(close_codes::RELEASED, Some("listener closing")).await;
+/// # }
+/// ```
+#[derive(Debug)]
+pub struct PortCloser<W> {
+    writer: Weak<Mutex<WriterState<W>>>,
+    max_frame_bytes: usize,
+}
+
+impl<W: AsyncWrite + Unpin + Send + 'static> PortCloser<W> {
+    /// False once the port it refers to has been dropped, so a caller holding
+    /// a list of these can forget the ones nobody is using any more.
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        self.writer.strong_count() > 0
+    }
+
+    /// Writes the farewell of §10 on that port and ends its writable half.
+    ///
+    /// A port that is already gone is a no-op: the session it belonged to has
+    /// ended, and there is nobody left to tell.
+    pub async fn close(&self, code: u16, reason: Option<&str>) {
+        let Some(writer) = self.writer.upgrade() else {
+            return;
+        };
+        let writer = SharedWriter(writer);
+        writer
+            .write_close(code, reason.map(ToOwned::to_owned), self.max_frame_bytes)
+            .await;
+        writer.shut_down().await;
     }
 }
 

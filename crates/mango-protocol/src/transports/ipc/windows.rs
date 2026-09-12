@@ -8,8 +8,9 @@ use std::time::Duration;
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, NamedPipeServer};
 
+use crate::close::close_codes;
 use crate::transports::deadline::{ConnectDeadline, ConnectError, connect_within};
-use crate::transports::ndjson::NdjsonPort;
+use crate::transports::ndjson::{NdjsonPort, PortCloser};
 
 use super::PeerIdentity;
 
@@ -58,6 +59,9 @@ pub struct IpcListener {
     idle: NamedPipeServer,
     path: PathBuf,
     max_frame_bytes: Option<usize>,
+    /// Weak handles to the ports handed out, so shutting down can tell the
+    /// sessions still using them. Holding one never keeps a pipe alive.
+    accepted: Vec<PortCloser<WriteHalf<NamedPipeServer>>>,
 }
 
 impl IpcListener {
@@ -132,14 +136,27 @@ impl IpcListener {
             user: None,
         };
         let (reader, writer) = tokio::io::split(connected);
-        Ok((self.framed(reader, writer), identity))
+        let port = self.framed(reader, writer);
+        // Connections that have since ended are forgotten here rather than
+        // accumulating for the life of a long-running listener.
+        self.accepted.retain(PortCloser::is_open);
+        self.accepted.push(port.closer());
+        Ok((port, identity))
     }
 
-    /// Stops accepting. Clients already served keep their connections: their
-    /// ports moved to whoever called [`IpcListener::accept`], and
-    /// local-socket.md's "a listener shutting down sends `close` `4000` to
-    /// every session first" is that owner's to honour.
+    /// Tells every session still open on this listener why, then stops
+    /// accepting.
+    ///
+    /// local-socket.md: "A listener shutting down sends `close` `4000` to every
+    /// session first." The ports moved to whoever called
+    /// [`IpcListener::accept`], so this writes the farewell through the handle
+    /// kept for each of them.
     pub async fn close(self) {
+        for accepted in &self.accepted {
+            accepted
+                .close(close_codes::RELEASED, Some("listener closing"))
+                .await;
+        }
         drop(self.idle);
     }
 
@@ -176,6 +193,7 @@ pub async fn listen_ipc(path: impl AsRef<Path>) -> io::Result<IpcListener> {
         idle,
         path,
         max_frame_bytes: None,
+        accepted: Vec::new(),
     })
 }
 

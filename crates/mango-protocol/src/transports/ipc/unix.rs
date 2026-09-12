@@ -10,8 +10,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::close::close_codes;
 use crate::transports::deadline::{ConnectDeadline, ConnectError, connect_within};
-use crate::transports::ndjson::NdjsonPort;
+use crate::transports::ndjson::{NdjsonPort, PortCloser};
 
 use super::{PeerIdentity, PeerUser};
 
@@ -53,6 +54,9 @@ pub struct IpcListener {
     listener: UnixListener,
     path: PathBuf,
     max_frame_bytes: Option<usize>,
+    /// Weak handles to the ports handed out, so shutting down can tell the
+    /// sessions still using them. Holding one never keeps a connection alive.
+    accepted: Vec<PortCloser<OwnedWriteHalf>>,
 }
 
 impl IpcListener {
@@ -108,16 +112,28 @@ impl IpcListener {
     pub async fn accept(&mut self) -> io::Result<(IpcServerPort, PeerIdentity)> {
         let (stream, _address) = self.listener.accept().await?;
         let identity = identity_of(&stream);
-        Ok((self.port(stream), identity))
+        let port = self.port(stream);
+        // Connections that have since ended are forgotten here rather than
+        // accumulating for the life of a long-running listener.
+        self.accepted.retain(PortCloser::is_open);
+        self.accepted.push(port.closer());
+        Ok((port, identity))
     }
 
-    /// Stops accepting and removes the socket file.
+    /// Tells every session still open on this listener why, stops accepting,
+    /// and removes the socket file.
     ///
-    /// The sessions already handed out are not this listener's to end: their
-    /// ports moved to whoever called [`IpcListener::accept`], and
-    /// local-socket.md's "a listener shutting down sends `close` `4000` to
-    /// every session first" is that owner's to honour.
+    /// local-socket.md: "A listener shutting down sends `close` `4000` to every
+    /// session first." The ports moved to whoever called
+    /// [`IpcListener::accept`], so this writes the farewell through the handle
+    /// kept for each of them; a peer then reads an announced release rather
+    /// than inferring one from a socket that vanished.
     pub async fn close(self) {
+        for accepted in &self.accepted {
+            accepted
+                .close(close_codes::RELEASED, Some("listener closing"))
+                .await;
+        }
         drop(self.listener);
         // Best effort: an address already gone, or replaced by a newer
         // listener that bound after this one stopped, is not this one's to
@@ -174,6 +190,7 @@ pub async fn listen_ipc(path: impl AsRef<Path>) -> io::Result<IpcListener> {
         listener,
         path,
         max_frame_bytes: None,
+        accepted: Vec::new(),
     })
 }
 
@@ -298,6 +315,7 @@ mod tests {
     use super::{
         ConnectDeadline, IpcListener, SOCKET_MODE, connect_ipc, listen_ipc, publish, staging_path,
     };
+    use crate::close::close_codes;
     use crate::frame::Frame;
     use crate::port::{Inbound, Port, PortRx, PortTx};
     use crate::transports::deadline::ConnectError;
@@ -419,6 +437,33 @@ mod tests {
         dialled_tx.send(Frame::Ping).await;
         assert_eq!(accepted_rx.recv().await, Some(Inbound::Frame(Frame::Ping)));
         listener.close().await;
+    }
+
+    #[tokio::test]
+    async fn closing_a_listener_tells_the_sessions_it_accepted() {
+        let address = Address::new();
+        let mut listener = listening(&address).await;
+        let dial = tokio::spawn({
+            let path = address.path();
+            async move { connect_ipc(path, &ConnectDeadline::default()).await }
+        });
+        let (_accepted, _identity) = listener.accept().await.expect("a connection arrives");
+        let dialled = dial
+            .await
+            .expect("the dial task runs")
+            .expect("it connects");
+        let (_dialled_tx, mut dialled_rx) = dialled.split();
+
+        listener.close().await;
+
+        // An announced release, not one inferred from a socket that vanished.
+        assert_eq!(
+            dialled_rx.recv().await,
+            Some(Inbound::Frame(Frame::Close(crate::frame::Close {
+                code: close_codes::RELEASED,
+                reason: Some("listener closing".into()),
+            })))
+        );
     }
 
     #[tokio::test]
