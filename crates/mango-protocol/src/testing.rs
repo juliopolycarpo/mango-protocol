@@ -224,6 +224,17 @@ pub fn conformance_options(peer: PeerInfo) -> SessionOptions {
         .handle("test.refuse", refuse)
 }
 
+/// Connects `fixture` with both sides' default conformance options — the
+/// `conformance_a()`/`conformance_b()` pairing nearly every case uses.
+async fn connect_default<F: Fixture>(fixture: &F) -> F::Pair {
+    fixture
+        .connect(
+            conformance_options(conformance_a()),
+            conformance_options(conformance_b()),
+        )
+        .await
+}
+
 /// Echoes its params back so a case can prove what crossed the wire.
 async fn echo(params: Value, _context: CallContext) -> Result<Value, RemoteError> {
     Ok(params)
@@ -310,12 +321,7 @@ pub const CONFORMANCE_CASES: [&str; 20] = [
 ];
 
 async fn completes_the_handshake_in_both_directions_and_exposes_the_peers<F: Fixture>(fixture: &F) {
-    let mut pair = fixture
-        .connect(
-            conformance_options(conformance_a()),
-            conformance_options(conformance_b()),
-        )
-        .await;
+    let mut pair = connect_default(fixture).await;
     let (from_a, from_b) = tokio::join!(pair.a().ready(), pair.b().ready());
     let from_a = from_a.expect("a's handshake succeeds");
     let from_b = from_b.expect("b's handshake succeeds");
@@ -366,12 +372,7 @@ async fn refuses_a_different_major_with_4426_on_both_sides<F: Fixture>(fixture: 
 }
 
 async fn round_trips_a_request_and_its_result_in_both_directions<F: Fixture>(fixture: &F) {
-    let mut pair = fixture
-        .connect(
-            conformance_options(conformance_a()),
-            conformance_options(conformance_b()),
-        )
-        .await;
+    let mut pair = connect_default(fixture).await;
     let params = json!({ "nested": { "list": [1, 2, 3], "text": "héllo · ünicode · 🥭" } });
     let echoed = pair
         .a()
@@ -389,12 +390,7 @@ async fn round_trips_a_request_and_its_result_in_both_directions<F: Fixture>(fix
 }
 
 async fn serves_concurrent_requests_in_both_directions<F: Fixture>(fixture: &F) {
-    let mut pair = fixture
-        .connect(
-            conformance_options(conformance_a()),
-            conformance_options(conformance_b()),
-        )
-        .await;
+    let mut pair = connect_default(fixture).await;
     let (r1, r2, r3, r4) = tokio::join!(
         pair.a().request("test.echo", json!(1)),
         pair.b().request("test.echo", json!(2)),
@@ -409,12 +405,7 @@ async fn serves_concurrent_requests_in_both_directions<F: Fixture>(fixture: &F) 
 }
 
 async fn reports_an_unsupported_method_without_ending_the_session<F: Fixture>(fixture: &F) {
-    let mut pair = fixture
-        .connect(
-            conformance_options(conformance_a()),
-            conformance_options(conformance_b()),
-        )
-        .await;
+    let mut pair = connect_default(fixture).await;
     let error = pair
         .a()
         .request("test.absent", json!({}))
@@ -431,12 +422,7 @@ async fn reports_an_unsupported_method_without_ending_the_session<F: Fixture>(fi
 }
 
 async fn carries_a_handler_chosen_error_code_and_its_details<F: Fixture>(fixture: &F) {
-    let mut pair = fixture
-        .connect(
-            conformance_options(conformance_a()),
-            conformance_options(conformance_b()),
-        )
-        .await;
+    let mut pair = connect_default(fixture).await;
     let error = pair
         .a()
         .request(
@@ -458,12 +444,7 @@ async fn carries_a_handler_chosen_error_code_and_its_details<F: Fixture>(fixture
 }
 
 async fn refuses_a_reserved_rpc_method_before_it_reaches_the_wire<F: Fixture>(fixture: &F) {
-    let mut pair = fixture
-        .connect(
-            conformance_options(conformance_a()),
-            conformance_options(conformance_b()),
-        )
-        .await;
+    let mut pair = connect_default(fixture).await;
     let error = pair
         .a()
         .request("rpc.discover", json!({}))
@@ -474,12 +455,7 @@ async fn refuses_a_reserved_rpc_method_before_it_reaches_the_wire<F: Fixture>(fi
 }
 
 async fn delivers_an_event_stream_and_its_end_marker_in_order<F: Fixture>(fixture: &F) {
-    let mut pair = fixture
-        .connect(
-            conformance_options(conformance_a()),
-            conformance_options(conformance_b()),
-        )
-        .await;
+    let mut pair = connect_default(fixture).await;
     // emit() no-ops (Ok(false)) before the handshake completes; both sides
     // must be ready before the first one, or it silently never reaches the
     // wire and the recv() below waits forever.
@@ -539,12 +515,7 @@ async fn delivers_an_event_stream_and_its_end_marker_in_order<F: Fixture>(fixtur
 }
 
 async fn numbers_events_per_topic_when_no_stream_id_is_given<F: Fixture>(fixture: &F) {
-    let mut pair = fixture
-        .connect(
-            conformance_options(conformance_a()),
-            conformance_options(conformance_b()),
-        )
-        .await;
+    let mut pair = connect_default(fixture).await;
     // See delivers_an_event_stream_and_its_end_marker_in_order: emit() no-ops
     // before the handshake completes.
     pair.a().ready().await.expect("a is ready");
@@ -582,12 +553,7 @@ async fn numbers_events_per_topic_when_no_stream_id_is_given<F: Fixture>(fixture
 }
 
 async fn answers_a_protocol_ping_with_a_pong_in_both_directions<F: Fixture>(fixture: &F) {
-    let mut pair = fixture
-        .connect(
-            conformance_options(conformance_a()),
-            conformance_options(conformance_b()),
-        )
-        .await;
+    let mut pair = connect_default(fixture).await;
     let mut pongs_a = pair.a().pongs();
     let mut pongs_b = pair.b().pongs();
     pair.a().ping();
@@ -598,12 +564,7 @@ async fn answers_a_protocol_ping_with_a_pong_in_both_directions<F: Fixture>(fixt
 }
 
 async fn cancels_an_in_flight_request_and_reports_it_as_cancelled<F: Fixture>(fixture: &F) {
-    let mut pair = fixture
-        .connect(
-            conformance_options(conformance_a()),
-            conformance_options(conformance_b()),
-        )
-        .await;
+    let mut pair = connect_default(fixture).await;
     let cancel = CancellationToken::new();
     let a = pair.a().clone();
     let options = RequestOptions {
@@ -623,12 +584,7 @@ async fn cancels_an_in_flight_request_and_reports_it_as_cancelled<F: Fixture>(fi
 }
 
 async fn times_out_a_request_locally_and_ignores_the_late_answer<F: Fixture>(fixture: &F) {
-    let mut pair = fixture
-        .connect(
-            conformance_options(conformance_a()),
-            conformance_options(conformance_b()),
-        )
-        .await;
+    let mut pair = connect_default(fixture).await;
     let options = RequestOptions {
         timeout: Some(Duration::from_millis(50)),
         ..Default::default()
@@ -651,12 +607,7 @@ async fn times_out_a_request_locally_and_ignores_the_late_answer<F: Fixture>(fix
 async fn fails_in_flight_requests_with_unavailable_when_the_connection_drops<F: Fixture>(
     fixture: &F,
 ) {
-    let mut pair = fixture
-        .connect(
-            conformance_options(conformance_a()),
-            conformance_options(conformance_b()),
-        )
-        .await;
+    let mut pair = connect_default(fixture).await;
     let a = pair.a().clone();
     let pending = tokio::spawn(async move { a.request("test.forever", json!({})).await });
     settled().await;
@@ -674,12 +625,7 @@ async fn fails_in_flight_requests_with_unavailable_when_the_connection_drops<F: 
 }
 
 async fn propagates_a_close_reason_code_to_the_peer<F: Fixture>(fixture: &F) {
-    let mut pair = fixture
-        .connect(
-            conformance_options(conformance_a()),
-            conformance_options(conformance_b()),
-        )
-        .await;
+    let mut pair = connect_default(fixture).await;
     pair.a().ready().await.expect("a is ready");
     pair.b().ready().await.expect("b is ready");
     pair.b().close_now(
@@ -698,12 +644,7 @@ async fn propagates_a_close_reason_code_to_the_peer<F: Fixture>(fixture: &F) {
 }
 
 async fn refuses_a_result_past_the_frame_limit_without_ending_the_session<F: Fixture>(fixture: &F) {
-    let mut pair = fixture
-        .connect(
-            conformance_options(conformance_a()),
-            conformance_options(conformance_b()),
-        )
-        .await;
+    let mut pair = connect_default(fixture).await;
     let options = RequestOptions {
         timeout: Some(Duration::from_secs(30)),
         ..Default::default()
@@ -748,12 +689,7 @@ async fn honours_the_lower_announced_frame_limit_when_sending<F: Fixture>(fixtur
 }
 
 async fn keeps_two_concurrent_oversized_results_from_interleaving<F: Fixture>(fixture: &F) {
-    let mut pair = fixture
-        .connect(
-            conformance_options(conformance_a()),
-            conformance_options(conformance_b()),
-        )
-        .await;
+    let mut pair = connect_default(fixture).await;
     let size = 512 * 1024;
     let long_timeout = || RequestOptions {
         timeout: Some(Duration::from_secs(30)),
