@@ -523,13 +523,21 @@ impl<W: AsyncWrite + Unpin + Send> SharedWriter<W> {
         self.0.ending.send_replace(true);
         let mut state = self.0.state.lock().await;
         state.writable = false;
-        let Some(mut writer) = state.writer.take() else {
+        let taken = state.writer.take();
+        // The guard goes before the await, not with it. Nothing left in the
+        // state is needed: the writer is out of it and no later write can be
+        // reported as sent. Anyone else ending this port — a listener's
+        // farewell, the other half's close — would otherwise queue behind a
+        // shutdown that is itself waiting on the peer.
+        drop(state);
+        let Some(mut writer) = taken else {
             return;
         };
         // Bounded for the same reason the farewell is. Evicting the stuck
         // write releases the guard but not the peer: on a handle whose
         // `poll_shutdown` is a flush — `tokio::io::Stdout`, a Windows pipe
-        // write half — this waits on the very pipe that would not take the
+        // write half, where `FlushFileBuffers` does not return until the
+        // client reads — this waits on the very pipe that would not take the
         // bytes. Dropping is what actually closes the handle anyway, so a
         // shutdown that will not land is one to stop waiting for.
         let _ = tokio::time::timeout(CLOSE_FLUSH_GRACE, writer.shutdown()).await;
@@ -849,12 +857,26 @@ mod tests {
     /// a peer that will not read blocks it exactly as it blocks a write.
     struct StalledSink {
         touched: watch::Sender<bool>,
+        shutting: watch::Sender<bool>,
+    }
+
+    /// What a [`StalledSink`] reports about itself.
+    struct SinkWatch {
+        writing: watch::Receiver<bool>,
+        shutting: watch::Receiver<bool>,
     }
 
     impl StalledSink {
-        fn new() -> (Self, watch::Receiver<bool>) {
-            let (touched, in_flight) = watch::channel(false);
-            (Self { touched }, in_flight)
+        fn new() -> (Self, SinkWatch) {
+            let (touched, writing) = watch::channel(false);
+            let (shutting, shutting_rx) = watch::channel(false);
+            (
+                Self { touched, shutting },
+                SinkWatch {
+                    writing,
+                    shutting: shutting_rx,
+                },
+            )
         }
     }
 
@@ -873,6 +895,7 @@ mod tests {
         }
 
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.shutting.send_replace(true);
             Poll::Pending
         }
     }
@@ -891,8 +914,8 @@ mod tests {
         }
     }
 
-    /// Waits for the stalled sink to be holding the shared writer.
-    async fn in_flight(watcher: &mut watch::Receiver<bool>) {
+    /// Waits for one of a stalled sink's signals to fire.
+    async fn reached(watcher: &mut watch::Receiver<bool>) {
         while !*watcher.borrow_and_update() {
             watcher.changed().await.expect("the sink outlives the wait");
         }
@@ -906,11 +929,11 @@ mod tests {
         // the peer — and with it the `Inbound::Closed` the session driver is
         // waiting on — never came.
         let (mut peer_writer, port_reader) = duplex(1024);
-        let (sink, mut sending) = StalledSink::new();
+        let (sink, mut watch) = StalledSink::new();
         let (mut tx, mut rx) = NdjsonPort::new(port_reader, sink).split();
 
         let stuck = tokio::spawn(async move { tx.send(Frame::Ping).await });
-        in_flight(&mut sending).await;
+        reached(&mut watch.writing).await;
 
         peer_writer
             .write_all(b"{\"type\":\"nope\"}\n")
@@ -941,13 +964,13 @@ mod tests {
         // `IpcListener::close` writes the farewell through one of these. A
         // listener that cannot leave until every accepted peer drains is a
         // listener one idle client can pin open.
-        let (sink, mut sending) = StalledSink::new();
+        let (sink, mut watch) = StalledSink::new();
         let port = NdjsonPort::new(SilentSource, sink);
         let closer = port.closer();
         let (mut tx, _rx) = port.split();
 
         let stuck = tokio::spawn(async move { tx.send(Frame::Ping).await });
-        in_flight(&mut sending).await;
+        reached(&mut watch.writing).await;
 
         tokio::time::timeout(
             Duration::from_secs(60),
@@ -955,6 +978,48 @@ mod tests {
         )
         .await
         .expect("the listener leaves without waiting out the stuck send");
+        assert_eq!(
+            stuck.await.expect("the stuck send is evicted, not leaked"),
+            SendOutcome::Closed
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_caller_ending_a_port_does_not_wait_out_the_first() {
+        // `shut_down` used to hold the writer's mutex across its own
+        // `shutdown` await, which on a peer that stopped reading is one more
+        // wait on that same peer — `FlushFileBuffers` on a Windows named pipe
+        // does not return until the client reads. A second caller ending the
+        // port (a listener's farewell while the session's own close is in
+        // flight) paid for that wait before it could start.
+        let (sink, mut watch) = StalledSink::new();
+        let port = NdjsonPort::new(SilentSource, sink);
+        let (first, second) = (port.closer(), port.closer());
+        let (mut tx, _rx) = port.split();
+
+        let stuck = tokio::spawn(async move { tx.send(Frame::Ping).await });
+        reached(&mut watch.writing).await;
+        let ending = tokio::spawn(async move {
+            first
+                .close(close_codes::RELEASED, Some("the session closing"))
+                .await;
+        });
+
+        // The first caller is now parked in the `shutdown` the peer will never
+        // complete, which is exactly when the mutex used to be unavailable.
+        reached(&mut watch.shutting).await;
+        let started = tokio::time::Instant::now();
+        second
+            .close(close_codes::RELEASED, Some("listener closing"))
+            .await;
+        let waited = started.elapsed();
+
+        assert!(
+            waited < super::CLOSE_FLUSH_GRACE,
+            "the second caller waited {waited:?} for a port already being ended, \
+             which is the first caller's shutdown grace, not its own work"
+        );
+        ending.await.expect("the first caller finishes");
         assert_eq!(
             stuck.await.expect("the stuck send is evicted, not leaked"),
             SendOutcome::Closed
