@@ -11,7 +11,7 @@ import { CLOSE_CODES } from '../../src/close';
 import { LineDecoder } from '../../src/codec/ndjson';
 import { Session } from '../../src/session';
 import { CONFORMANCE_A } from '../../src/testing/conformance';
-import { spawnPort } from '../../src/transports/spawn';
+import { type ExitStatus, spawnPort } from '../../src/transports/spawn';
 import {
   expectMangoPeerBehaviour,
   INTEROP_ENABLED,
@@ -25,14 +25,18 @@ describeInterop('interop: stdio (TypeScript launches, Rust serves)', () => {
   it('completes the handshake and serves every case over the child pipes', async () => {
     const peer = spawnPort({ argv: [await peerBinary(), '--stdio'] });
     const session = new Session(peer.port, { peer: CONFORMANCE_A, livenessIntervalMs: false });
+    let status: ExitStatus | undefined;
     try {
       await expectMangoPeerBehaviour(session);
     } finally {
       session.close(CLOSE_CODES.RELEASED, 'interop done');
-      const status = await peer.terminate();
-      // The child leaves on the end of its stdin; no signal was needed.
-      expect(status.signal).toBeNull();
+      status = await peer.terminate();
     }
+    // The child leaves on the end of its stdin; no signal was needed. Asserted
+    // after the block, not inside it: a throw in `finally` replaces whatever
+    // failed above it, and a child wedged enough to fail the cases above is
+    // exactly the one `terminate` has to escalate a signal at.
+    expect(status?.signal).toBeNull();
   }, 60_000);
 
   it('answers a runtime-protocol 1.0.1 hello with 4426', async () => {
