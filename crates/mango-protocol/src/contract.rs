@@ -4,8 +4,9 @@
 //! recompiles a schema per request.
 //!
 //! Declare one with [`Contract::builder`], or compile one a peer published
-//! with [`Contract::from_catalog`]. Serving and calling a contract over a
-//! [`crate::session::Session`] is a later piece of this crate's surface.
+//! with [`Contract::from_catalog`]. [`Contract::serve`] registers typed
+//! handlers on a [`crate::session::Session`]; [`Contract::client`] and
+//! [`Contract::events`] call and publish through one.
 
 use std::sync::Arc;
 
@@ -15,18 +16,25 @@ use serde_json::Value;
 
 use crate::catalog::{Catalog, CatalogEvent, CatalogMethod};
 use crate::error::{RemoteError, codes};
+use crate::session::Session;
 use crate::validate::{ValidationError, is_reserved_method_name};
 use crate::version::ProtocolVersion;
 
+mod client;
+mod events;
 mod params;
+mod serve;
 
-/// One method's declaration plus its compiled `params` validator. A
-/// `result` validator joins this once `serve` grows a `validate_results`
-/// option to use it.
+pub use client::ContractClient;
+pub use events::{ContractEvents, EventOptions, TypedEvent, TypedEventStream};
+pub use serve::{ContractHandlers, Guard, ServeGuard, ServeOptions};
+
+/// One method's declaration plus its compiled `params`/`result` validators.
 #[derive(Debug)]
 struct CompiledMethod {
     definition: CatalogMethod,
     params: Arc<Validator>,
+    result: Arc<Validator>,
 }
 
 /// A validated, ready-to-serve application contract.
@@ -149,27 +157,52 @@ impl Contract {
         let compiled = self
             .method(method)
             .ok_or_else(|| unsupported(&self.catalog.name, method))?;
-        if let Some((path, reason)) = params::first_violation(&compiled.params, &params) {
-            return Err(RemoteError::new(
-                codes::INVALID_PARAMS,
-                format!(
-                    "Parameters of \"{method}\" do not match the contract at {path}: {reason}."
-                ),
-            )
-            .with_detail("method", method.to_string())
-            .with_detail("path", path)
-            .with_detail("reason", reason));
-        }
-        serde_json::from_value(params).map_err(|error| {
-            RemoteError::new(
-                codes::INTERNAL,
-                format!(
-                    "Parameters of \"{method}\" passed their schema but do not decode into the \
-                     handler's Rust type: {error}."
-                ),
-            )
-            .with_detail("method", method.to_string())
-        })
+        check_params(method, &compiled.params, &params)?;
+        decode(method, params)
+    }
+
+    /// A typed request surface over `session`, scoped to this contract's
+    /// methods. Requests are not locally checked against the contract before
+    /// sending — the peer's own dispatch is the check, exactly as the
+    /// TypeScript SDK's `ContractClient` relies purely on its compile-time
+    /// method-name type, not a runtime one.
+    #[must_use]
+    pub fn client<'s>(&self, session: &'s Session) -> ContractClient<'s> {
+        ContractClient::new(session)
+    }
+
+    /// Typed event emission and subscription over `session`. Neither `emit`
+    /// nor `subscribe` checks `topic` against this contract locally — same
+    /// as [`Contract::client`], the peer's own dispatch is the check.
+    #[must_use]
+    pub fn events<'s>(&self, session: &'s Session) -> ContractEvents<'s> {
+        ContractEvents::new(session)
+    }
+
+    /// Registers `handlers` on `session`: each is wrapped so a request first
+    /// validates against the method's `params` schema, then runs
+    /// `options.guard` (seeing the validated params and the method's declared
+    /// capabilities — this is what lets a consent gate be a guard instead of
+    /// wrapping every handler by hand), then the handler itself, then
+    /// (only when `options.validate_results` asks for it) checks the result
+    /// against the method's `result` schema.
+    ///
+    /// `handlers` may cover any subset of this contract's declared methods —
+    /// an unregistered declared method falls through to the session's own
+    /// `METHOD_UNSUPPORTED`, so a contract can be served incrementally.
+    /// Naming a method this contract does not declare is the one thing that
+    /// is refused outright.
+    ///
+    /// # Errors
+    /// Returns [`ValidationError`] when `handlers` names a method this
+    /// contract does not declare.
+    pub fn serve(
+        &self,
+        session: &Session,
+        handlers: ContractHandlers,
+        options: ServeOptions,
+    ) -> Result<ServeGuard, ValidationError> {
+        serve::serve(self, session, handlers, options)
     }
 
     fn method(&self, name: &str) -> Option<&CompiledMethod> {
@@ -177,6 +210,56 @@ impl Contract {
             .iter()
             .find(|method| method.definition.name == name)
     }
+}
+
+/// The `INVALID_PARAMS`/`INTERNAL` split [`Contract::parse_params`] and
+/// [`serve`]'s per-request wrapper both need: a schema violation is always
+/// `INVALID_PARAMS` naming the pointer and reason; a schema pass that still
+/// fails to decode is `INTERNAL`, since that is the server's own Rust type
+/// drifting from the schema it advertises, not a bad request.
+fn check_params(method: &str, validator: &Validator, params: &Value) -> Result<(), RemoteError> {
+    if let Some((path, reason)) = params::first_violation(validator, params) {
+        return Err(RemoteError::new(
+            codes::INVALID_PARAMS,
+            format!("Parameters of \"{method}\" do not match the contract at {path}: {reason}."),
+        )
+        .with_detail("method", method.to_string())
+        .with_detail("path", path)
+        .with_detail("reason", reason));
+    }
+    Ok(())
+}
+
+/// Checks `result` against `method`'s `result` schema — [`ServeOptions`]'s
+/// `validate_results` opt-in, run after the handler settles.
+fn check_result(method: &str, validator: &Validator, result: &Value) -> Result<(), RemoteError> {
+    if let Some((path, reason)) = params::first_violation(validator, result) {
+        return Err(RemoteError::new(
+            codes::INTERNAL,
+            format!("Result of \"{method}\" does not match the contract at {path}: {reason}."),
+        )
+        .with_detail("method", method.to_string())
+        .with_detail("path", path)
+        .with_detail("reason", reason));
+    }
+    Ok(())
+}
+
+/// Deserialises parameters already known to have passed their schema; a
+/// failure here is `INTERNAL` (see [`check_params`]), never the schema's own
+/// code — this is the server's own Rust type drifting from the schema it
+/// advertises, not a bad request.
+fn decode<P: DeserializeOwned>(method: &str, value: Value) -> Result<P, RemoteError> {
+    serde_json::from_value(value).map_err(|error| {
+        RemoteError::new(
+            codes::INTERNAL,
+            format!(
+                "Parameters of \"{method}\" passed their schema but failed to decode into the \
+                 handler's Rust type: {error}."
+            ),
+        )
+        .with_detail("method", method.to_string())
+    })
 }
 
 fn unsupported(contract: &str, method: &str) -> RemoteError {
@@ -276,6 +359,10 @@ fn compile(catalog: Catalog) -> Result<Contract, ValidationError> {
                 params: Arc::new(params::compile(
                     &format!("catalog.methods[{index}].params"),
                     &method.params,
+                )?),
+                result: Arc::new(params::compile(
+                    &format!("catalog.methods[{index}].result"),
+                    &method.result,
                 )?),
             })
         })
