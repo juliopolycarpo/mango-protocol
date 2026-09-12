@@ -50,6 +50,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - run: cargo test --all-targets --all-features --locked
+      - run: cargo test --doc --all-features --locked
 
   transports:
     name: Transports (${{ matrix.os }})
