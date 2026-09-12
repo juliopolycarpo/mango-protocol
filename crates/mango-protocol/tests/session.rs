@@ -89,6 +89,85 @@ async fn times_out_when_the_peer_never_says_hello() {
     assert_eq!(closure.reason.as_deref(), Some("handshake timeout"));
 }
 
+/// The driver's `select!` is `biased`, so whichever branch comes first wins
+/// every poll it is ready for. A peer that floods frames faster than the
+/// driver drains them must not be able to hold the control plane off — here,
+/// the handshake deadline it never intends to satisfy.
+///
+/// Real time, not `start_paused`: a paused clock only auto-advances while the
+/// runtime is idle, and a flood never lets it be.
+#[tokio::test]
+async fn fires_the_handshake_timeout_under_a_flood_of_inbound_frames() {
+    let (a, b) = port_pair();
+    let options = SessionOptions::new(peer("a"))
+        .with_handshake_timeout(Duration::from_millis(50))
+        .with_liveness_interval(None);
+    let (session, driver) = Session::open(a, options);
+    tokio::spawn(driver.run());
+
+    // `pong` is the one frame the driver answers with nothing at all, so the
+    // flood stays one-way and this test measures the driver's own fairness
+    // rather than how fast it can fill the peer's queue.
+    let mut raw = RawPeer::new(b);
+    let flood = tokio::spawn(async move {
+        loop {
+            for _ in 0..512 {
+                raw.send(Frame::Pong).await;
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+
+    let started = tokio::time::Instant::now();
+    let closure = within("closed() under an inbound flood", session.closed()).await;
+    let elapsed = started.elapsed();
+    flood.abort();
+
+    assert_eq!(closure.code, close_codes::PROTOCOL_ERROR);
+    assert_eq!(closure.reason.as_deref(), Some("handshake timeout"));
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "expected the 50ms handshake timeout to fire near its deadline while the flood ran | \
+         received: {elapsed:?}"
+    );
+}
+
+/// The same fairness question for the command branch: a flooding peer must not
+/// be able to hold off this side's own `close()`.
+#[tokio::test]
+async fn closes_under_a_flood_of_inbound_frames() {
+    let (a, b) = port_pair();
+    let options = SessionOptions::new(peer("a")).with_liveness_interval(None);
+    let (session, _driver) = Session::spawn(a, options);
+    let mut raw = RawPeer::new(b);
+    raw.send(hello_frame("b")).await;
+    within("ready()", session.ready())
+        .await
+        .expect("handshake succeeds");
+
+    let flood = tokio::spawn(async move {
+        loop {
+            for _ in 0..512 {
+                raw.send(Frame::Pong).await;
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+
+    let started = tokio::time::Instant::now();
+    session.close_now(close_codes::RELEASED, Some("bye"));
+    let closure = within("closed() under an inbound flood", session.closed()).await;
+    let elapsed = started.elapsed();
+    flood.abort();
+
+    assert_eq!(closure.code, close_codes::RELEASED);
+    assert_eq!(closure.reason.as_deref(), Some("bye"));
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "expected close() to land while the flood ran | received: {elapsed:?}"
+    );
+}
+
 #[tokio::test]
 async fn answers_a_request_that_arrives_before_the_handshake_with_unavailable() {
     let (a, b) = port_pair();

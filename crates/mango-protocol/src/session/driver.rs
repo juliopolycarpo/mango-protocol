@@ -155,8 +155,39 @@ impl<Tx: PortTx, Rx: PortRx> SessionDriver<Tx, Rx> {
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 self.liveness = Some(interval);
             }
+            // `biased` polls these in source order and stops at the first
+            // ready branch, so the control plane comes first and inbound last.
+            // The peer sets the inbound rate and a port may be unbounded, so
+            // an inbound-first order lets a frame flood hold off everything
+            // below it: `close()` would not land, a settled handler could not
+            // send its `res` until the flood eased, and the handshake deadline
+            // would never fire. Everything above inbound is either a timer or
+            // bounded by work this side already accepted. The TypeScript SDK
+            // has no equivalent coupling — its timers run off the event loop,
+            // independent of `onFrame`.
             tokio::select! {
                 biased;
+                () = &mut sleep, if state == SessionState::Handshaking => {
+                    break on_handshake_timeout(&self.shared, self.handshake_timeout);
+                }
+                () = liveness_tick(self.liveness.as_mut()) => {
+                    if let Some(reason) = on_liveness_tick(&mut self.awaiting_pong, &writer) {
+                        break reason;
+                    }
+                }
+                Some(settled) = self.tracking.tasks.join_next_with_id(), if !self.tracking.tasks.is_empty() => {
+                    dispatch::on_handler_settled(
+                        &self.shared,
+                        &mut self.tracking,
+                        &writer,
+                        settled,
+                    );
+                }
+                Some(command) = self.commands.recv() => {
+                    if let Some(reason) = on_command(command, &mut self.pending, &writer) {
+                        break reason;
+                    }
+                }
                 inbound = self.rx.recv() => match inbound {
                     Some(Inbound::Frame(frame)) => {
                         if let Some(reason) = on_frame(
@@ -173,27 +204,6 @@ impl<Tx: PortTx, Rx: PortRx> SessionDriver<Tx, Rx> {
                     Some(Inbound::Closed(closure)) => break Teardown::Port(closure),
                     None => break Teardown::Port(PortClosure::Closed { code: None, reason: None }),
                 },
-                Some(command) = self.commands.recv() => {
-                    if let Some(reason) = on_command(command, &mut self.pending, &writer) {
-                        break reason;
-                    }
-                }
-                Some(settled) = self.tracking.tasks.join_next_with_id(), if !self.tracking.tasks.is_empty() => {
-                    dispatch::on_handler_settled(
-                        &self.shared,
-                        &mut self.tracking,
-                        &writer,
-                        settled,
-                    );
-                }
-                () = &mut sleep, if state == SessionState::Handshaking => {
-                    break on_handshake_timeout(&self.shared, self.handshake_timeout);
-                }
-                () = liveness_tick(self.liveness.as_mut()) => {
-                    if let Some(reason) = on_liveness_tick(&mut self.awaiting_pong, &writer) {
-                        break reason;
-                    }
-                }
             }
         };
 
