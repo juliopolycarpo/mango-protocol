@@ -10,10 +10,12 @@ use std::time::Duration;
 
 pub mod raw_peer;
 pub mod recording_guard;
+pub mod refusing_port;
 pub mod scripted_port;
 
 pub use raw_peer::RawPeer;
 pub use recording_guard::RecordingGuard;
+pub use refusing_port::RefusingPort;
 pub use scripted_port::ScriptedPort;
 
 /// Bounds a future so a regression that hangs (rather than fails) still ends

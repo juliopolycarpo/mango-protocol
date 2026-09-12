@@ -36,22 +36,38 @@ pub(super) struct Writer<Tx> {
     task: JoinHandle<Tx>,
 }
 
+/// Resolves with the first send outcome that was not [`SendOutcome::Sent`],
+/// or with `Err` if the writer task itself went away.
+pub(super) type SendFailure = oneshot::Receiver<SendOutcome>;
+
 impl<Tx: PortTx> Writer<Tx> {
-    /// Spawns the writer task, which owns `tx` until [`Writer::shut_down`].
-    pub(super) fn spawn(mut tx: Tx) -> Self {
+    /// Spawns the writer task, which owns `tx` until [`Writer::shut_down`],
+    /// and hands back the channel on which it reports a frame that never
+    /// reached the peer.
+    pub(super) fn spawn(mut tx: Tx) -> (Self, SendFailure) {
         let (sender, mut receiver) = mpsc::unbounded_channel::<Outbound>();
+        let (report, failure) = oneshot::channel();
         let task = tokio::spawn(async move {
+            // Only the first failure is reported: once one frame is lost the
+            // driver tears the session down, and every later refusal on the
+            // same dying transport says nothing new.
+            let mut report = Some(report);
             while let Some(message) = receiver.recv().await {
                 match message {
                     Outbound::Frame(frame) => {
-                        let _ = tx.send(frame).await;
+                        let outcome = tx.send(frame).await;
+                        if !matches!(outcome, SendOutcome::Sent)
+                            && let Some(report) = report.take()
+                        {
+                            let _ = report.send(outcome);
+                        }
                     }
                     Outbound::Shutdown => break,
                 }
             }
             tx
         });
-        Self { sender, task }
+        (Self { sender, task }, failure)
     }
 
     /// Queues a frame; never blocks the caller.
@@ -118,7 +134,7 @@ impl<Tx: PortTx, Rx: PortRx> SessionDriver<Tx, Rx> {
         };
         if let Some(error) = refusal {
             self.shared.fail_ready(error);
-            let writer = Writer::spawn(self.tx);
+            let (writer, _) = Writer::spawn(self.tx);
             return teardown::teardown(
                 self.shared,
                 self.pending,
@@ -132,7 +148,7 @@ impl<Tx: PortTx, Rx: PortRx> SessionDriver<Tx, Rx> {
             .await;
         }
 
-        let writer = Writer::spawn(self.tx);
+        let (writer, mut send_failed) = Writer::spawn(self.tx);
         let sleep = tokio::time::sleep(self.handshake_timeout);
         tokio::pin!(sleep);
 
@@ -168,6 +184,7 @@ impl<Tx: PortTx, Rx: PortRx> SessionDriver<Tx, Rx> {
             // independent of `onFrame`.
             tokio::select! {
                 biased;
+                outcome = &mut send_failed => break on_send_failure(outcome),
                 () = &mut sleep, if state == SessionState::Handshaking => {
                     break on_handshake_timeout(&self.shared, self.handshake_timeout);
                 }
@@ -220,6 +237,28 @@ impl<Tx: PortTx, Rx: PortRx> SessionDriver<Tx, Rx> {
                 max_frame_bytes: Some(self.shared.local_max_frame_bytes as u64),
             }),
         }
+    }
+}
+
+/// The writer reported a frame that never reached the peer, so this session
+/// can no longer keep its side of the protocol: a lost `res`/`err` breaks the
+/// response guarantee the peer is waiting on, and a lost `req` would sit in
+/// `pending` for ever whenever the receive half stays open and liveness is
+/// off. Ending the session is what fails those pending calls.
+///
+/// The TypeScript SDK rejects the one caller instead, because its `port.send`
+/// is synchronous and can report back inline. Rust's writer owns the send half
+/// on its own task, so there is no caller left to reject by the time an
+/// outcome is known — teardown is the nearest equivalent.
+fn on_send_failure(outcome: Result<SendOutcome, oneshot::error::RecvError>) -> Teardown {
+    let reason = match outcome {
+        Ok(SendOutcome::Refused(error)) => format!("the transport refused a frame: {error}"),
+        Ok(_) => "the transport is gone".to_string(),
+        Err(_) => "the writer task ended".to_string(),
+    };
+    Teardown::Local {
+        code: close_codes::RELEASED,
+        reason: Some(reason),
     }
 }
 

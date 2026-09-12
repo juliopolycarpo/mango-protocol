@@ -21,7 +21,7 @@ use serde_json::Value;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use support::{RawPeer, ScriptedPort, within};
+use support::{RawPeer, RefusingPort, ScriptedPort, within};
 
 fn peer(role: &str) -> PeerInfo {
     PeerInfo {
@@ -581,6 +581,34 @@ async fn sends_cancel_when_a_request_future_is_dropped_before_it_settles() {
     )
     .await;
     assert_eq!(cancel, Frame::Cancel(Cancel { id: sent.id }));
+}
+
+/// The writer owns the port's send half on its own task, so a `req` that the
+/// transport refuses cannot reject the caller the way the TypeScript SDK's
+/// synchronous `port.send` does. Discarding that outcome left the request in
+/// `pending` for ever whenever the receive half stayed open and liveness was
+/// off — and a discarded `res`/`err` would silently break the response
+/// guarantee. The session ends instead, which fails every pending call.
+#[tokio::test]
+async fn ends_the_session_when_the_transport_refuses_a_frame() {
+    let port = RefusingPort::new(hello_frame("b"));
+    let options = SessionOptions::new(peer("a")).with_liveness_interval(None);
+    let (session, _driver) = Session::spawn(port, options);
+    within("ready()", session.ready())
+        .await
+        .expect("the hello itself goes out");
+
+    let error = within(
+        "request() over a broken write side",
+        session.request("test.echo", Value::Null),
+    )
+    .await
+    .expect_err("the req frame never reached the peer");
+    assert_eq!(error.code, codes::UNAVAILABLE);
+
+    let closure = within("closed()", session.closed()).await;
+    assert_eq!(closure.code, close_codes::RELEASED);
+    assert_eq!(closure.reason.as_deref(), Some("the transport is gone"));
 }
 
 #[tokio::test]
