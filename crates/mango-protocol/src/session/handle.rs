@@ -252,13 +252,7 @@ impl Session {
     /// Called from inside a handler, this waits out the grace rather than the
     /// handler's own return — use [`Session::close_now`] there instead.
     pub async fn close(&self, code: u16, reason: Option<&str>) -> SessionClosure {
-        if let Some(closure) = self.closure() {
-            return closure;
-        }
-        let _ = self.shared.commands.send(Command::Close {
-            code,
-            reason: reason.map(str::to_string),
-        });
+        self.close_now(code, reason);
         self.closed().await
     }
 
