@@ -745,8 +745,8 @@ const CASE_TIMEOUT: Duration = Duration::from_secs(60);
 /// lists them; panics naming the first case that fails or hangs.
 ///
 /// # Panics
-/// Panics (via `assert!`/`assert_eq!`, an unexpected `Err`, or exceeding
-/// [`CASE_TIMEOUT`]) on the first case that fails to behave as the
+/// Panics (via `assert!`/`assert_eq!`, an unexpected `Err`, or exceeding the
+/// per-case timeout) on the first case that fails to behave as the
 /// specification requires, and if the cases this run actually executed do
 /// not match [`CONFORMANCE_CASES`] filtered by [`Fixture::chunked`]/
 /// [`Fixture::supports_raw`] — a self-check that keeps this function's own
