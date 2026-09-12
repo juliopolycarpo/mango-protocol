@@ -221,16 +221,19 @@ fn identity_of(stream: &UnixStream) -> PeerIdentity {
     }
 }
 
-/// Where a listener binds before it publishes. Beside the final address, so
-/// the rename onto it stays within one directory and one filesystem, and
-/// unique per attempt, so two listeners racing for the same address do not
-/// stage over each other.
+/// Where a listener binds before it publishes: in the address's own directory,
+/// so the link onto it stays within one filesystem, and unique per attempt, so
+/// two listeners racing for the same address do not stage over each other.
+///
+/// A short name of its own rather than the address plus a suffix, because this
+/// is the path `bind` actually sees and `sun_path` is 104 bytes on macOS. An
+/// address close to that limit would otherwise fail to bind at a staging name
+/// longer than itself.
 fn staging_path(path: &Path) -> PathBuf {
     static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(0);
     let attempt = NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed);
-    let mut staging = path.as_os_str().to_owned();
-    staging.push(format!(".{}.{attempt}.binding", std::process::id()));
-    PathBuf::from(staging)
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    directory.join(format!(".mango-{}-{attempt}", std::process::id()))
 }
 
 /// Moves the bound socket onto the address it is published at.
@@ -352,15 +355,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nothing_is_left_at_the_staging_name() {
+    async fn nothing_is_left_beside_the_published_address() {
         let address = Address::new();
         let listener = listening(&address).await;
 
-        assert!(
-            !staging_path(&address.path()).exists(),
-            "the staging name is renamed onto the address, not left beside it"
+        // Every name in the directory, rather than a recomputed staging path:
+        // the counter moves on every call, so asking `staging_path` again
+        // would check a name this listener never used, and the assertion would
+        // hold however much was left behind.
+        let left: Vec<_> = std::fs::read_dir(&address.0)
+            .expect("the scratch directory is readable")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect();
+        assert_eq!(
+            left,
+            vec![std::ffi::OsString::from("mango.sock")],
+            "the socket is published and the staging name is gone"
         );
         listener.close().await;
+    }
+
+    #[test]
+    fn a_staging_name_is_short_enough_to_bind_beside_a_long_address() {
+        // `sun_path` is 104 bytes on macOS, so the name this binds at must not
+        // grow with the address it will be published under.
+        let long = format!("/tmp/{}.sock", "a".repeat(80));
+        let staging = staging_path(Path::new(&long));
+        assert!(
+            staging.as_os_str().len() < long.len(),
+            "{} is not shorter than {long}",
+            staging.display()
+        );
+        assert_eq!(staging.parent(), Path::new(&long).parent());
     }
 
     #[tokio::test]
