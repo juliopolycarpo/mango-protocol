@@ -31,8 +31,10 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
 
+use std::time::Duration;
+
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 use crate::close::close_code_for_codec_error;
 use crate::codec::ndjson::{DEFAULT_MAX_FRAME_BYTES, LineDecoder, encode_line};
@@ -47,6 +49,15 @@ use crate::validate::MAX_REASON_CHARS;
 /// on the receive half rather than on the stack of `recv`, whose future the
 /// session driver holds inside its `select!` for the life of the session.
 const READ_CHUNK_BYTES: usize = 64 * 1024;
+
+/// How long the farewell of §10 has to reach a peer before the port ends
+/// anyway, the same bound the WebSocket port puts on its own close flush.
+///
+/// A pipe write is the only flow control this transport has, so a peer that
+/// stopped reading blocks the write for as long as it likes. Ending a port is
+/// not something a session may be held on: the farewell is best effort, and
+/// this is how long "best" lasts.
+const CLOSE_FLUSH_GRACE: Duration = Duration::from_secs(2);
 
 /// One NDJSON port over a pair of byte streams.
 ///
@@ -179,7 +190,7 @@ where
 /// ```
 #[derive(Debug)]
 pub struct PortCloser<W> {
-    writer: Weak<Mutex<WriterState<W>>>,
+    writer: Weak<WriterShared<W>>,
     max_frame_bytes: usize,
 }
 
@@ -199,11 +210,9 @@ impl<W: AsyncWrite + Unpin + Send + 'static> PortCloser<W> {
         let Some(writer) = self.writer.upgrade() else {
             return;
         };
-        let writer = SharedWriter(writer);
-        writer
-            .write_close(code, reason.map(ToOwned::to_owned), self.max_frame_bytes)
+        SharedWriter(writer)
+            .end(code, reason.map(ToOwned::to_owned), self.max_frame_bytes)
             .await;
-        writer.shut_down().await;
     }
 }
 
@@ -256,10 +265,7 @@ where
     async fn close(self, code: u16, reason: Option<String>) {
         // The farewell of §10 first, then the end of the writable half: a peer
         // reading a stream that simply stops has no way to learn the code.
-        self.writer
-            .write_close(code, reason, self.max_frame_bytes)
-            .await;
-        self.writer.shut_down().await;
+        self.writer.end(code, reason, self.max_frame_bytes).await;
     }
 }
 
@@ -358,9 +364,8 @@ where
         let reason = error.to_string();
         self.closure = Some(PortClosure::ProtocolError { error, code });
         self.writer
-            .write_close(code, Some(reason), self.max_frame_bytes)
+            .end(code, Some(reason), self.max_frame_bytes)
             .await;
-        self.writer.shut_down().await;
     }
 }
 
@@ -372,7 +377,22 @@ where
 /// port hands the halves to different tasks, so the sharing is a mutex rather
 /// than a borrow.
 #[derive(Debug)]
-struct SharedWriter<W>(Arc<Mutex<WriterState<W>>>);
+struct SharedWriter<W>(Arc<WriterShared<W>>);
+
+/// What the two halves and any [`PortCloser`] share: the writable handle
+/// behind a mutex, and the signal that takes it away from them.
+///
+/// The signal is why it is not the mutex alone. A pipe write is not bounded:
+/// a peer that stopped reading holds `write_all` for as long as it likes, and
+/// the mutex is fair, so every other user of this writer — the farewell of a
+/// refusal, a listener's `close`, the shutdown that drops the handle — would
+/// queue behind a write that never completes. Ending the port flips this
+/// first, which makes the stuck write give up and release the guard.
+#[derive(Debug)]
+struct WriterShared<W> {
+    state: Mutex<WriterState<W>>,
+    ending: watch::Sender<bool>,
+}
 
 #[derive(Debug)]
 struct WriterState<W> {
@@ -394,10 +414,13 @@ impl<W> Clone for SharedWriter<W> {
 
 impl<W: AsyncWrite + Unpin + Send> SharedWriter<W> {
     fn new(writer: W) -> Self {
-        Self(Arc::new(Mutex::new(WriterState {
-            writer: Some(writer),
-            writable: true,
-        })))
+        Self(Arc::new(WriterShared {
+            state: Mutex::new(WriterState {
+                writer: Some(writer),
+                writable: true,
+            }),
+            ending: watch::Sender::new(false),
+        }))
     }
 
     /// Encodes and writes one record. A frame the codec refuses is
@@ -409,20 +432,50 @@ impl<W: AsyncWrite + Unpin + Send> SharedWriter<W> {
             Ok(line) => line,
             Err(error) => return SendOutcome::Refused(error),
         };
-        let mut state = self.0.lock().await;
+        let mut ending = self.0.ending.subscribe();
+        if *ending.borrow_and_update() {
+            return SendOutcome::Closed;
+        }
+        let mut state = self.0.state.lock().await;
         if !state.writable {
             return SendOutcome::Closed;
         }
         let Some(writer) = state.writer.as_mut() else {
             return SendOutcome::Closed;
         };
-        match write_record(writer, &line).await {
+        // A peer that stopped reading would hold this write, and the guard
+        // with it, for the life of the process. Whoever ends the port evicts
+        // it instead; the half-written line does not matter, because the
+        // handle is about to be dropped.
+        let written = tokio::select! {
+            written = write_record(writer, &line) => written,
+            () = ended(&mut ending) => {
+                state.writable = false;
+                return SendOutcome::Closed;
+            }
+        };
+        match written {
             Ok(()) => SendOutcome::Sent,
             Err(_) => {
                 state.writable = false;
                 SendOutcome::Closed
             }
         }
+    }
+
+    /// The farewell of §10 and then the end of the writable half: the one
+    /// sequence a closing port runs, whether the close came from this side,
+    /// from a record the decoder refused, or from a listener shutting down.
+    ///
+    /// The farewell is bounded by [`CLOSE_FLUSH_GRACE`]; the end of the half
+    /// is not bounded at all, because it evicts whatever is in the way.
+    async fn end(&self, code: u16, reason: Option<String>, max_frame_bytes: usize) {
+        let _ = tokio::time::timeout(
+            CLOSE_FLUSH_GRACE,
+            self.write_close(code, reason, max_frame_bytes),
+        )
+        .await;
+        self.shut_down().await;
     }
 
     /// Writes the farewell of §10, best effort: the pipe may already be gone,
@@ -432,13 +485,20 @@ impl<W: AsyncWrite + Unpin + Send> SharedWriter<W> {
             code,
             reason: reason.map(|reason| clamp_reason(&reason)),
         });
-        let Ok(line) = encode_line(&frame, max_frame_bytes) else {
-            // The code is not one a `close` frame may carry, or the reason
-            // outgrew the limit even clamped. Neither changes what the port
-            // does next, and the stream still has to be ended.
+        // The reason is the part that may not fit: it is clamped by
+        // characters, and JSON escapes one NUL into six bytes, so a schema-
+        // valid reason can still outgrow a lowered frame limit. The code is
+        // what the peer needs — dropping the whole record for the sake of its
+        // reason would leave a refused peer reading a plain release.
+        let Ok(line) = encode_line(&frame, max_frame_bytes)
+            .or_else(|_| encode_line(&Frame::Close(Close { code, reason: None }), max_frame_bytes))
+        else {
+            // The code itself is not one a `close` frame may carry. That does
+            // not change what the port does next, and the stream still has to
+            // be ended.
             return;
         };
-        let mut state = self.0.lock().await;
+        let mut state = self.0.state.lock().await;
         if !state.writable {
             return;
         }
@@ -457,7 +517,11 @@ impl<W: AsyncWrite + Unpin + Send> SharedWriter<W> {
     /// treats end of file as the session ending — which spawn.md says a
     /// conforming child does — only ever sees it because the handle went.
     async fn shut_down(&self) {
-        let mut state = self.0.lock().await;
+        // Flipped before the lock is asked for, never after: a write blocked
+        // on a peer that stopped reading holds the guard, and the whole point
+        // of ending a port is that it does not wait for that peer.
+        self.0.ending.send_replace(true);
+        let mut state = self.0.state.lock().await;
         state.writable = false;
         let Some(mut writer) = state.writer.take() else {
             return;
@@ -465,6 +529,14 @@ impl<W: AsyncWrite + Unpin + Send> SharedWriter<W> {
         let _ = writer.shutdown().await;
         drop(writer);
     }
+}
+
+/// Resolves the first time the port is marked as ending.
+///
+/// A sender that is gone means the shared writer is gone, which is the same
+/// answer: nothing is left to write through.
+async fn ended(ending: &mut watch::Receiver<bool>) {
+    let _ = ending.changed().await;
 }
 
 async fn write_record<W: AsyncWrite + Unpin>(writer: &mut W, line: &[u8]) -> std::io::Result<()> {
@@ -491,8 +563,15 @@ mod tests {
     use crate::port::{Inbound, Port, PortClosure, PortRx, PortTx, SendOutcome};
     use crate::validate::MAX_REASON_CHARS;
     use serde_json::Value;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf, duplex};
+    use tokio::io::{
+        AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf,
+        duplex,
+    };
+    use tokio::sync::watch;
 
     type DuplexRead = ReadHalf<DuplexStream>;
     type DuplexWrite = WriteHalf<DuplexStream>;
@@ -752,5 +831,150 @@ mod tests {
         let clamped = clamp_reason(&long);
         assert_eq!(clamped.chars().count(), MAX_REASON_CHARS);
         assert_eq!(clamp_reason("short"), "short");
+    }
+
+    /// A sink that accepts the write and then never completes it, which is
+    /// what a pipe whose peer stopped reading does. `touched` reports the
+    /// first poll, so a test can know the write is in flight — and holding
+    /// the shared writer — before it does anything else.
+    struct StalledSink {
+        touched: watch::Sender<bool>,
+    }
+
+    impl StalledSink {
+        fn new() -> (Self, watch::Receiver<bool>) {
+            let (touched, in_flight) = watch::channel(false);
+            (Self { touched }, in_flight)
+        }
+    }
+
+    impl AsyncWrite for StalledSink {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.touched.send_replace(true);
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A reader that never produces a byte and never ends, so a port built on
+    /// it only ever closes for a reason the test arranged.
+    struct SilentSource;
+
+    impl AsyncRead for SilentSource {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    /// Waits for the stalled sink to be holding the shared writer.
+    async fn in_flight(watcher: &mut watch::Receiver<bool>) {
+        while !*watcher.borrow_and_update() {
+            watcher.changed().await.expect("the sink outlives the wait");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_is_reported_though_a_send_is_stuck_on_a_peer_that_stopped_reading() {
+        // The shared writer is a mutex, and a pipe write is not bounded. A
+        // send blocked on a peer that stopped reading used to hold that mutex
+        // for the life of the process, so the farewell a refused record owes
+        // the peer — and with it the `Inbound::Closed` the session driver is
+        // waiting on — never came.
+        let (mut peer_writer, port_reader) = duplex(1024);
+        let (sink, mut sending) = StalledSink::new();
+        let (mut tx, mut rx) = NdjsonPort::new(port_reader, sink).split();
+
+        let stuck = tokio::spawn(async move { tx.send(Frame::Ping).await });
+        in_flight(&mut sending).await;
+
+        peer_writer
+            .write_all(b"{\"type\":\"nope\"}\n")
+            .await
+            .expect("the peer half takes the line");
+
+        let reported = tokio::time::timeout(Duration::from_secs(60), rx.recv())
+            .await
+            .expect("the refusal is reported without waiting out the stuck send");
+        match reported {
+            Some(Inbound::Closed(PortClosure::ProtocolError { code, .. })) => {
+                assert_eq!(code, close_codes::PROTOCOL_ERROR);
+            }
+            other => panic!(
+                "expected Inbound::Closed(ProtocolError {{ code: {} }}), got {other:?}",
+                close_codes::PROTOCOL_ERROR
+            ),
+        }
+        assert_eq!(
+            stuck.await.expect("the stuck send is evicted, not leaked"),
+            SendOutcome::Closed,
+            "a send the port ended under is the transport being gone"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listener_closing_a_port_is_not_held_by_a_stuck_send() {
+        // `IpcListener::close` writes the farewell through one of these. A
+        // listener that cannot leave until every accepted peer drains is a
+        // listener one idle client can pin open.
+        let (sink, mut sending) = StalledSink::new();
+        let port = NdjsonPort::new(SilentSource, sink);
+        let closer = port.closer();
+        let (mut tx, _rx) = port.split();
+
+        let stuck = tokio::spawn(async move { tx.send(Frame::Ping).await });
+        in_flight(&mut sending).await;
+
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            closer.close(close_codes::RELEASED, Some("listener closing")),
+        )
+        .await
+        .expect("the listener leaves without waiting out the stuck send");
+        assert_eq!(
+            stuck.await.expect("the stuck send is evicted, not leaked"),
+            SendOutcome::Closed
+        );
+    }
+
+    #[tokio::test]
+    async fn a_close_keeps_its_code_when_the_reason_will_not_fit_the_frame_limit() {
+        // A reason is clamped by characters, but JSON escapes one NUL into six
+        // bytes, so a schema-valid reason can still outgrow a lowered limit.
+        // The code is the part the peer needs.
+        let mut raw = raw_peer();
+        let (tx, rx) = raw
+            .port
+            .take()
+            .expect("the port is split once")
+            .with_max_frame_bytes(512)
+            .split();
+        drop(rx);
+
+        tx.close(
+            close_codes::PROTOCOL_ERROR,
+            Some("\0".repeat(MAX_REASON_CHARS)),
+        )
+        .await;
+
+        assert_eq!(
+            raw.read_all().await,
+            "{\"type\":\"close\",\"code\":4400}\n",
+            "the farewell keeps its code and loses only the reason"
+        );
     }
 }

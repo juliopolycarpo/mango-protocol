@@ -129,11 +129,7 @@ impl IpcListener {
     /// kept for each of them; a peer then reads an announced release rather
     /// than inferring one from a socket that vanished.
     pub async fn close(self) {
-        for accepted in &self.accepted {
-            accepted
-                .close(close_codes::RELEASED, Some("listener closing"))
-                .await;
-        }
+        super::tell_accepted(self.accepted, close_codes::RELEASED, "listener closing").await;
         drop(self.listener);
         // Best effort: an address already gone, or replaced by a newer
         // listener that bound after this one stopped, is not this one's to

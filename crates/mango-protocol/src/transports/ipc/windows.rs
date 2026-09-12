@@ -152,11 +152,7 @@ impl IpcListener {
     /// [`IpcListener::accept`], so this writes the farewell through the handle
     /// kept for each of them.
     pub async fn close(self) {
-        for accepted in &self.accepted {
-            accepted
-                .close(close_codes::RELEASED, Some("listener closing"))
-                .await;
-        }
+        super::tell_accepted(self.accepted, close_codes::RELEASED, "listener closing").await;
         drop(self.idle);
     }
 

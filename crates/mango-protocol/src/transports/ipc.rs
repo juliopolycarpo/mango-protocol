@@ -31,6 +31,11 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use tokio::io::AsyncWrite;
+use tokio::task::JoinSet;
+
+use crate::transports::ndjson::PortCloser;
+
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
@@ -145,6 +150,22 @@ pub fn ipc_path(name: &str) -> Result<PathBuf, IpcNameError> {
         });
     }
     Ok(platform::address_for(name))
+}
+
+/// Tells every session a listener accepted why it is going, all at once.
+///
+/// One at a time would stack each port's close-flush grace, so a single peer
+/// that stopped reading would hold the listener — and the address it is about
+/// to release — open for the sake of every other session's farewell.
+async fn tell_accepted<W>(accepted: Vec<PortCloser<W>>, code: u16, reason: &'static str)
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let mut farewells = JoinSet::new();
+    for port in accepted {
+        farewells.spawn(async move { port.close(code, Some(reason)).await });
+    }
+    farewells.join_all().await;
 }
 
 #[cfg(test)]
