@@ -32,6 +32,13 @@ if (!rsOnly) {
     ])
   );
   tasks.push(task('fixtures:chunks', ['bun', './scripts/fixtures/generate-chunks.ts', '--check']));
+  tasks.push(
+    task('fixtures:catalog-example', [
+      'bun',
+      './scripts/fixtures/generate-catalog-example.ts',
+      '--check',
+    ])
+  );
 }
 if (!tsOnly) {
   if (hasCargo()) {
