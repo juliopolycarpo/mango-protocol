@@ -32,7 +32,8 @@ use super::ndjson::NdjsonPort;
 /// let peer = PeerInfo { name: "my-runtime".into(), version: "1.0.0".into(), role: "runtime".into() };
 /// let (session, driver) = Session::spawn(stdio_port(), SessionOptions::new(peer));
 /// let remote = session.ready().await.expect("the launcher completes the handshake");
-/// println!("connected to {}", remote.peer.name);
+/// // stdout is the frame stream; diagnostics go to stderr.
+/// eprintln!("connected to {}", remote.peer.name);
 /// let _ = driver.await;
 /// # }
 /// ```
