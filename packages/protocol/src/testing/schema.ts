@@ -7,7 +7,10 @@
  * - `$ref` to `#/$defs/<name>` is inlined (sibling keywords kept), as is a
  *   cross-file `other.json#/$defs/<name>` when the caller merged that file in;
  * - `$schema`, `$id`, `title`, `description`, `$comment`, `examples` and
- *   `format` are dropped;
+ *   `format` are dropped where they are keywords, never where they are the
+ *   *name* of a member (inside `properties`, `patternProperties`,
+ *   `dependentSchemas`, `$defs` or `definitions`): `catalog.json` declares a
+ *   member called `description`, and dropping it would hide a divergence;
  * - `additionalProperties: true` is dropped (objects are open by default);
  * - a TypeBox `anyOf` whose branches carry distinct `type` consts becomes
  *   `oneOf`;
@@ -28,6 +31,21 @@ const ANNOTATION_KEYS = new Set(['$schema', '$id', 'title', 'description', '$com
 
 /** Keys dropped during normalisation. */
 const DROPPED_KEYS = new Set([...ANNOTATION_KEYS, 'format']);
+
+/**
+ * Keywords whose value maps a *name* to a schema rather than being a schema.
+ * Their keys are data — `catalog.json` declares a member literally called
+ * `description` — so the rules above must apply to the schemas inside, never
+ * to the names holding them. Dropping a name that collides with an annotation
+ * keyword would hide a real divergence between two emitters.
+ */
+const SCHEMA_MAP_KEYS = new Set([
+  'properties',
+  'patternProperties',
+  'dependentSchemas',
+  '$defs',
+  'definitions',
+]);
 
 function isObject(value: Json | undefined): value is JsonObject {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -125,7 +143,26 @@ export function normalizeSchema(schema: Json, definitions: Definitions): Json {
       result.oneOf = normalizeSchema(value, definitions);
       continue;
     }
+    if (SCHEMA_MAP_KEYS.has(key) && isObject(value)) {
+      result[key] = normalizeSchemaMap(value, definitions);
+      continue;
+    }
     result[key] = normalizeSchema(value, definitions);
+  }
+  return result;
+}
+
+/**
+ * Normalises each schema of a name-to-schema map, leaving every name exactly
+ * as it was: a member called `description` or `format` is data, not an
+ * annotation this normaliser may drop.
+ */
+function normalizeSchemaMap(map: JsonObject, definitions: Definitions): JsonObject {
+  const result: JsonObject = {};
+  for (const name of Object.keys(map).sort()) {
+    const member = map[name];
+    if (member === undefined) continue;
+    result[name] = normalizeSchema(member, definitions);
   }
   return result;
 }

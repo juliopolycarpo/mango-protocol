@@ -81,6 +81,47 @@ describe('normalizeSchema', () => {
     });
   });
 
+  it('keeps a member whose name collides with a dropped keyword', () => {
+    // catalog.json declares a member literally called `description`. Dropping
+    // annotation keywords inside `properties` erased it from both sides, so
+    // two emitters that disagreed about it compared equal.
+    const schema = {
+      type: 'object',
+      properties: {
+        description: { type: 'string' },
+        format: { type: 'string' },
+        name: { type: 'string', description: 'dropped: this one is an annotation' },
+      },
+    };
+
+    expect(normalizeSchema(schema, {})).toEqual({
+      properties: {
+        description: { type: 'string' },
+        format: { type: 'string' },
+        name: { type: 'string' },
+      },
+      type: 'object',
+    });
+  });
+
+  it('reports a divergence in a member called description', () => {
+    const mine = { type: 'object', properties: { description: { type: 'string' } } };
+    const theirs = { type: 'object', properties: { description: { type: 'number' } } };
+
+    expect(schemaDifferences(normalizeSchema(mine, {}), normalizeSchema(theirs, {}))).toEqual([
+      '/properties/description/type: expected "string", got "number"',
+    ]);
+  });
+
+  it('resolves a $ref inside a member whose name is a dropped keyword', () => {
+    const schema = { type: 'object', properties: { description: { $ref: '#/$defs/id' } } };
+
+    expect(normalizeSchema(schema, definitions)).toEqual({
+      properties: { description: { minLength: 1, type: 'string' } },
+      type: 'object',
+    });
+  });
+
   it('inlines a cross-file $ref through merged definitions', () => {
     const merged = {
       ...crossFileDefinitions('protocol.json', definitions),

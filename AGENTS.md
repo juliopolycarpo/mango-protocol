@@ -59,7 +59,9 @@ rule is a review flag, not a quick fix.
 Normaliser rules (`packages/protocol/src/testing/schema.ts`, re-exported from
 `@mangostudio/protocol/testing` as `normalizeSchema` so a consumer applies the same ones):
 `$ref` to `#/$defs/<name>` is inlined;
-`$schema`, `$id`, `title`, `description`, `$comment`, `examples` and `format` are dropped;
+`$schema`, `$id`, `title`, `description`, `$comment`, `examples` and `format` are dropped where
+they are keywords, never where they are a member's name (inside `properties`, `patternProperties`,
+`dependentSchemas`, `$defs` or `definitions`);
 `additionalProperties: true` is dropped; a TypeBox `anyOf` whose branches carry distinct `type`
 consts becomes `oneOf`; the `null` alternative schemars adds to an `Option` member is stripped;
 key order is ignored. Nothing else is tolerated.
