@@ -187,3 +187,70 @@ explicitly:
 cargo build --locked --example conformance_peer --features testing,websocket,spawn
 MANGO_INTEROP=1 bun test packages/protocol/tests/interop
 ```
+
+## Property tests and fuzzing
+
+The fixture corpus and the transport suite prove fixed cases; two more layers, Rust-only, prove
+the codec and the session hold for inputs neither suite enumerates.
+
+### Property tests
+
+`crates/mango-protocol/tests/properties.rs` uses `proptest` to check three round trips against
+arbitrary, schema-valid input rather than the corpus's fixed cases:
+
+- `decode_line(encode_line(f)) == f` for an arbitrary frame. The generators build a
+  schema-valid frame directly — the method/topic grammar, id and name length ceilings, and the
+  close-code range are baked into the strategies rather than filtered after the fact — so a
+  refusal here is a codec bug, not a generator bug.
+- `reassemble(encode_chunks(frame, cap)) == frame` for every message cap the chunk framing
+  allows, plus a focused case that lands the final chunk exactly on the 1024-byte
+  minimum-payload boundary that only applies to non-final chunks.
+- `negotiate(a, b)` and `negotiate(b, a)` agree on the effective minor, or both close with
+  `4426`, for arbitrary major/minor pairs.
+
+Run it with `cargo test --test properties`; it is part of `cargo test --all-targets
+--all-features`, so `bun run test` already runs it. Case counts are kept modest (64 to 256 per
+property) so the suite finishes in well under a second.
+
+### Fuzzing
+
+`fuzz/` is a `cargo-fuzz` crate with six libFuzzer targets under `fuzz/fuzz_targets/`:
+
+| Target                   | Exercises                                                                                                                                              |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `decode_line`            | `decode_line` over arbitrary bytes, at a bounded frame ceiling                                                                                         |
+| `line_decoder_push`      | `LineDecoder::push` fed the same bytes whole and split at random boundaries; the two must decode identical frames and agree on any refusal             |
+| `chunk_reassembler_push` | `ChunkReassembler::push` over an arbitrary message sequence; a refusal must always leave the reassembler reset                                         |
+| `validate`               | `validate` over a `Frame`, most of them built directly from structured input (`fuzz/src/lib.rs`'s `Script`) rather than hoping raw bytes parse as JSON |
+| `catalog_parse`          | `Catalog` parsing from arbitrary JSON bytes                                                                                                            |
+| `session_frames`         | a `Session` driven by a fuzzed frame stream over a scripted port, behind the crate's `tokio` feature                                                   |
+
+Every target is panic-free by construction: none calls `unwrap()` on fuzzer-controlled data.
+`session_frames` drives its `Session` over a port whose receive half replays a bounded,
+fuzzer-chosen sequence of frames and then a vanished-link closure, so termination is structural
+— the driver's loop ends the moment the scripted port runs out, the same way it would for a real
+peer that hung up — rather than depending on a wall-clock timeout.
+
+`fuzz/` is a cargo-fuzz crate, which needs nightly and libFuzzer; it carries its own `[workspace]`
+table and the root `Cargo.toml` excludes it, so it is never pulled into the stable build this
+repository otherwise targets. Run it with the nightly toolchain explicitly, from `fuzz/`:
+
+```console
+rustup toolchain install nightly
+cargo install cargo-fuzz
+cd fuzz
+cargo +nightly fuzz run decode_line -- -max_total_time=60
+# session_frames needs the tokio feature:
+cargo +nightly fuzz run --features tokio session_frames -- -max_total_time=60
+```
+
+A nightly `fuzz.yml` workflow runs all six targets for five minutes each and uploads their
+corpus and any crashing input as build artifacts; trigger it manually from the Actions tab
+(`workflow_dispatch`) to check a change before waiting for the schedule. It is deliberately not
+part of `ci.yml`'s `gate` job: a fuzz run's pass/fail is about coverage found that run, not a
+merge gate.
+
+A bug either layer finds becomes an `n_` or `i_` case under `spec/fixtures/1/` (see "The fixture
+corpus" above for the naming convention and which files are generated) plus the fix, with a
+regression test that fails first with the expected shape — the same rule as any other bug in this
+repository.
