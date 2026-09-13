@@ -129,6 +129,13 @@ async fn a_peer_that_stops_reading_is_closed_with_4400_rather_than_waited_on() {
             if tx.send(frame).await != SendOutcome::Sent {
                 return index;
             }
+            // Without this the writer task is never scheduled: `send_frame`
+            // finishes in one poll, so a sender that only awaits it holds the
+            // runtime for the whole loop and the port never attempts a single
+            // socket write. The queue would then pass the limit with nothing
+            // ever learned about the socket, and this case would be proving
+            // the counter rather than the stalled peer it is named for.
+            tokio::task::yield_now().await;
         }
         panic!("the port accepted 2048 frames without ever reporting the peer as gone");
     };
