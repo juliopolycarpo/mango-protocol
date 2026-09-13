@@ -188,6 +188,22 @@ pub struct PortCloser<W> {
 impl<W: AsyncWrite + Unpin + Send + 'static> PortCloser<W> {
     /// False once the port it refers to has been dropped, so a caller holding
     /// a list of these can forget the ones nobody is using any more.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_protocol::transports::ndjson::NdjsonPort;
+    ///
+    /// let (one, two) = tokio::io::duplex(64);
+    /// let (read, _unused) = tokio::io::split(one);
+    /// let (_unused, write) = tokio::io::split(two);
+    /// let port = NdjsonPort::new(read, write);
+    /// let closer = port.closer();
+    ///
+    /// assert!(closer.is_open());
+    /// drop(port);
+    /// assert!(!closer.is_open(), "the port this refers to is gone");
+    /// ```
     #[must_use]
     pub fn is_open(&self) -> bool {
         self.writer.strong_count() > 0
@@ -197,6 +213,29 @@ impl<W: AsyncWrite + Unpin + Send + 'static> PortCloser<W> {
     ///
     /// A port that is already gone is a no-op: the session it belonged to has
     /// ended, and there is nobody left to tell.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
+    /// use mango_protocol::close::close_codes;
+    /// use mango_protocol::transports::ndjson::NdjsonPort;
+    ///
+    /// let (one, two) = tokio::io::duplex(1024);
+    /// let (read, _unused) = tokio::io::split(one);
+    /// let (_unused, write) = tokio::io::split(two);
+    /// let port = NdjsonPort::new(read, write);
+    /// let closer = port.closer();
+    ///
+    /// closer.close(close_codes::RELEASED, Some("listener closing")).await;
+    ///
+    /// // A listener ending twice, or ending a port whose session already
+    /// // left, is a no-op rather than an error.
+    /// drop(port);
+    /// closer.close(close_codes::RELEASED, None).await;
+    /// # }
+    /// ```
     pub async fn close(&self, code: u16, reason: Option<&str>) {
         let Some(writer) = self.writer.upgrade() else {
             return;

@@ -806,6 +806,21 @@ impl LaunchedPeer {
     ///
     /// Read it next to [`LaunchedPeer::exited`]; the very last chunk of a
     /// child that died mid-write is best effort, as any tail of a pipe is.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
+    /// use mango_protocol::transports::spawn::{SpawnOptions, spawn_port};
+    ///
+    /// let (_port, peer) = spawn_port(SpawnOptions::new(["mango-runtime"])).expect("an argv");
+    /// let status = peer.exited().await;
+    /// if status.code != Some(0) {
+    ///     eprintln!("the child left with {status}, saying: {}", peer.stderr_tail());
+    /// }
+    /// # }
+    /// ```
     #[must_use]
     pub fn stderr_tail(&self) -> String {
         self.tail
@@ -816,6 +831,22 @@ impl LaunchedPeer {
     /// Waits for the child to exit and says how it ended. A child that never
     /// started reports no status at all; [`LaunchedPeer::stderr_tail`] carries
     /// the reason.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
+    /// use mango_protocol::transports::spawn::{SpawnOptions, spawn_port};
+    ///
+    /// let (port, peer) = spawn_port(SpawnOptions::new(["mango-runtime"])).expect("an argv");
+    /// // Closing the port ends the child's stdin, which is what a conforming
+    /// // peer leaves on; this then resolves without a signal being needed.
+    /// drop(port);
+    /// let status = peer.exited().await;
+    /// println!("{:?} {:?}", status.code, status.signal);
+    /// # }
+    /// ```
     pub async fn exited(&self) -> ExitStatus {
         let mut exit = self.exit.clone();
         wait_for_exit(&mut exit).await
@@ -828,6 +859,23 @@ impl LaunchedPeer {
     /// not start its target exits at once — but the pipe closing and the exit
     /// are not ordered, and a caller reading the status before it lands would
     /// see nothing at all.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
+    /// use mango_protocol::transports::spawn::{SpawnOptions, spawn_port};
+    ///
+    /// let (_port, peer) = spawn_port(SpawnOptions::new(["mango-runtime"])).expect("an argv");
+    /// // `None` takes the default grace; the launcher's own reading of why
+    /// // the command never became a process, not the child's bytes.
+    /// let refused = peer.start_error(None).await;
+    /// if refused.spawn_error == Some(std::io::ErrorKind::NotFound) {
+    ///     eprintln!("no such command: {}", refused.stderr_line);
+    /// }
+    /// # }
+    /// ```
     pub async fn start_error(&self, grace: Option<Duration>) -> SpawnStartError {
         let mut exit = self.exit.clone();
         let grace = grace.unwrap_or(DEFAULT_START_ERROR_GRACE);
@@ -849,6 +897,22 @@ impl LaunchedPeer {
     /// still ends the child, but by way of `SIGTERM` once the first grace has
     /// run out rather than by the end of file a conforming peer would have
     /// left on.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
+    /// use mango_protocol::transports::spawn::{SpawnOptions, spawn_port};
+    ///
+    /// let (port, peer) = spawn_port(SpawnOptions::new(["mango-runtime"])).expect("an argv");
+    /// // Step 1 belongs to the port: dropping it ends the child's stdin, so
+    /// // a conforming child leaves before any signal is reached for.
+    /// drop(port);
+    /// let status = peer.terminate().await;
+    /// println!("the child left with {status}");
+    /// # }
+    /// ```
     pub async fn terminate(&self) -> ExitStatus {
         self.terminator.start();
         let mut exit = self.exit.clone();
