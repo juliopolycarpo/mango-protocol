@@ -278,6 +278,12 @@ describe('Session close', () => {
 
   it('a handler awaiting its own close() stalls to the grace, not forever', async () => {
     const ports = createInProcessPortPair();
+    let started = 0;
+    let finished = 0;
+    let handlerSettled: () => void = () => undefined;
+    const handlerDone = new Promise<void>((resolve) => {
+      handlerSettled = resolve;
+    });
     const responder = new Session(ports.b, {
       peer: RUNTIME,
       livenessIntervalMs: false,
@@ -285,13 +291,16 @@ describe('Session close', () => {
       handlers: {
         // `close()` waits on every in-flight handler, this one included: it
         // cannot tell "called from inside a running handler" apart from any
-        // other caller, so this resolves only once the grace elapses.
+        // other caller, so this call resolves only once the grace elapses.
         'test.closes-itself': async (_params, context) => {
           // A prior await, matching the shape that actually stalls: it lets
           // this handler's own dispatch promise land in `#dispatches` before
           // `close()` is called, so `close()` ends up waiting on it.
           await Promise.resolve();
+          started = Date.now();
           await context.session.close();
+          finished = Date.now();
+          handlerSettled();
           return null;
         },
       },
@@ -299,11 +308,12 @@ describe('Session close', () => {
     const hub = new Session(ports.a, { peer: HUB, livenessIntervalMs: false });
     await Promise.all([hub.ready, responder.ready]);
     void hub.request('test.closes-itself', {}).catch(() => undefined);
-    await tick();
 
-    const before = Date.now();
-    await responder.close();
-    expect(Date.now() - before).toBeGreaterThanOrEqual(15);
+    // Timed on the handler's own call, not a second close() from here: a
+    // second call would race the first and could resolve sooner than a full
+    // grace period, which is not the property this test is pinning down.
+    await handlerDone;
+    expect(finished - started).toBeGreaterThanOrEqual(15);
     hub.closeNow();
   });
 
