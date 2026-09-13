@@ -120,6 +120,44 @@ describe('defineContract', () => {
     b.close();
   });
 
+  it('refuses rpc.discover params that are not an object', async () => {
+    const { a, b } = sessions();
+    contract.serve(b, {
+      'text.echo': ({ text }) => ({ text }),
+      'math.add': ({ a: x, b: y }) => x + y,
+    });
+    // §6.4 defines rpc.discover's parameters as an object; a raw request
+    // that sends anything else must not reach the catalog.
+    await expect(a.request('rpc.discover', null)).rejects.toMatchObject({
+      code: RESERVED_ERROR_CODES.INVALID_PARAMS,
+    });
+    a.close();
+    b.close();
+  });
+
+  it('builds the catalog before registering any method handler', async () => {
+    const { a, b } = sessions();
+    // Not eagerly checked by `defineContract`: only method/topic names are.
+    const badContract = defineContract({
+      name: '',
+      version: '1',
+      methods: {
+        'text.echo': {
+          params: Type.Object({ text: Type.String() }),
+          result: Type.Object({ text: Type.String() }),
+        },
+      },
+    });
+    expect(() => badContract.serve(b, { 'text.echo': ({ text }) => ({ text }) })).toThrow();
+    // If a method handler had already been registered before the catalog
+    // build failed, this would answer instead of refusing.
+    await expect(a.request('text.echo', { text: 'hi' })).rejects.toMatchObject({
+      code: RESERVED_ERROR_CODES.METHOD_UNSUPPORTED,
+    });
+    a.close();
+    b.close();
+  });
+
   it('leaves rpc.discover unanswered when the catalog is not offered', async () => {
     const { a, b } = sessions();
     contract.serve(

@@ -183,37 +183,54 @@ export function defineContract<M extends MethodMap, E extends EventMap = Record<
       },
     }),
     serve: (session, handlers, options = {}) => {
-      const removers: (() => void)[] = Object.entries(definition.methods).map(([method, entry]) =>
-        session.handle(method, async (params, context) => {
-          // Validation first, guard second: a policy that logs or counts a
-          // refusal should never see parameters the contract already refuses,
-          // and this is the order the Rust SDK's `Guard` has always run in.
-          assertParams(method, params);
-          if (options.guard) {
-            await options.guard(method, entry.capabilities ?? [], {
-              ...context,
-              params,
-              inFlight: context.session.inFlight,
-              remote: context.session.remote,
-            });
-          }
-          const handler = handlers[method as keyof M];
-          const result = await handler(params as never, context);
-          if (options.validateResults && !Value.Check(entry.result, result)) {
-            const first = firstViolation(entry.result, result);
-            throw new RemoteError(
-              RESERVED_ERROR_CODES.INTERNAL,
-              `Result of "${method}" does not match the contract${first ? ` at ${first.path}: ${first.message}` : ''}.`,
-              { method, ...(first ? { path: first.path, reason: first.message } : {}) }
-            );
-          }
-          return result;
-        })
-      );
+      const removers: (() => void)[] = [];
+      // Built, and validated, before any handler is registered: a catalog
+      // that fails to build must leave nothing behind to unregister.
       if (options.discover !== false) {
         const catalog = buildCatalog(definition);
-        removers.push(session.handle(RPC_DISCOVER, () => catalog));
+        removers.push(
+          session.handle(RPC_DISCOVER, (params) => {
+            if (typeof params !== 'object' || params === null || Array.isArray(params)) {
+              throw new RemoteError(
+                RESERVED_ERROR_CODES.INVALID_PARAMS,
+                `Parameters of "${RPC_DISCOVER}" must be an object.`,
+                { method: RPC_DISCOVER }
+              );
+            }
+            return catalog;
+          })
+        );
       }
+      removers.push(
+        ...Object.entries(definition.methods).map(([method, entry]) =>
+          session.handle(method, async (params, context) => {
+            // Validation first, guard second: a policy that logs or counts a
+            // refusal should never see parameters the contract already
+            // refuses, and this is the order the Rust SDK's `Guard` has
+            // always run in.
+            assertParams(method, params);
+            if (options.guard) {
+              await options.guard(method, entry.capabilities ?? [], {
+                ...context,
+                params,
+                inFlight: context.session.inFlight,
+                remote: context.session.remote,
+              });
+            }
+            const handler = handlers[method as keyof M];
+            const result = await handler(params as never, context);
+            if (options.validateResults && !Value.Check(entry.result, result)) {
+              const first = firstViolation(entry.result, result);
+              throw new RemoteError(
+                RESERVED_ERROR_CODES.INTERNAL,
+                `Result of "${method}" does not match the contract${first ? ` at ${first.path}: ${first.message}` : ''}.`,
+                { method, ...(first ? { path: first.path, reason: first.message } : {}) }
+              );
+            }
+            return result;
+          })
+        )
+      );
       return () => {
         for (const remove of removers) remove();
       };
