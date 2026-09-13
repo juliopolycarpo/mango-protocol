@@ -169,8 +169,8 @@ async fn serve_websocket(address: &str, token: Option<&str>) -> Result<(), Strin
         let expected = token.map(ToOwned::to_owned);
         tokio::spawn(async move {
             let accepted =
-                accept_websocket(socket, WebSocketOptions::default(), |offered| {
-                    match (&expected, offered) {
+                accept_websocket(socket, WebSocketOptions::default(), |upgrade| {
+                    match (&expected, upgrade.bearer()) {
                         (None, _) => Ok(()),
                         (Some(expected), Some(offered)) if expected == offered => Ok(()),
                         _ => Err(close_codes::UNAUTHORIZED),

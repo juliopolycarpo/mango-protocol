@@ -45,11 +45,34 @@ that cap with them. Frames are therefore split above the socket:
 Transport-level, at the upgrade. The reference mechanism is `Authorization: Bearer <token>` on
 the upgrade request; the accepting side verifies it before or immediately after the upgrade
 and closes with `4401` (unknown, malformed or revoked) or `4403` (known but disabled) without
-sending `hello`. Rate limiting closes with `4429` after the upgrade so the dialler can read a
+sending `hello`, as [§5.1](../mango-protocol-1.md#51-hello) requires of every acceptor that
+authenticates. Rate limiting closes with `4429` after the upgrade so the dialler can read a
 code, since a refused upgrade reaches it as a socket that failed to open.
 
 Applications MAY define other credentials for peers that cannot set headers. The token never
 appears inside a frame.
+
+### Origin
+
+A browser attaches `Origin` to the upgrade and will not let a page forge it, but it also
+attaches the user's ambient credentials to a cross-site WebSocket dial — the same-origin policy
+does not apply to one. An acceptor reachable by a browser MUST therefore refuse an upgrade whose
+`Origin` it does not allow-list: at the HTTP layer where it owns the upgrade, and otherwise by
+closing the socket with `4403` before it sends `hello`. Either way the page learns nothing and
+sends nothing the session acts on; `4403` is in the fatal set, so a dialler does not retry.
+
+- An absent `Origin` is not a browser. Whether to serve such a dialler is the acceptor's policy:
+  a native client is the normal case, and an acceptor that only ever serves native clients
+  refuses every `Origin` it sees.
+- The comparison is exact on the serialised origin (`https://app.example:8443`), never a suffix
+  or substring match: `https://app.example.attacker.test` ends with neither, and
+  `https://evil/?x=https://app.example` contains one.
+- The allow-list is the acceptor's configuration, never a wildcard the SDK supplies by default.
+  An SDK that does not own the upgrade — it is handed an already-upgraded socket — MUST still
+  expose the comparison, so the framework that does own it applies the same rule rather than
+  writing a fourth version of it.
+- `spec/fixtures/1/origins.json` is the corpus for that comparison; an implementation that
+  offers the check runs it.
 
 ## Liveness
 

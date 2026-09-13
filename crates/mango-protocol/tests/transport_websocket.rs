@@ -17,7 +17,9 @@ use mango_protocol::session::{Session, SessionClosure, SessionOptions};
 use mango_protocol::testing::{ConformancePair, Fixture, RawConnection, run_conformance_suite};
 use mango_protocol::transports::deadline::{ConnectDeadline, ConnectError};
 use mango_protocol::transports::websocket::client::{WebSocketConnectOptions, connect_websocket};
-use mango_protocol::transports::websocket::server::{AcceptError, accept_websocket};
+use mango_protocol::transports::websocket::server::{
+    AcceptError, AcceptOptions, accept_websocket, is_origin_allowed,
+};
 use mango_protocol::transports::websocket::{WebSocketOptions, WebSocketPort};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -49,7 +51,7 @@ impl Acceptor {
 
     async fn accept(&self) -> Result<WebSocketPort<TcpStream>, AcceptError> {
         let (socket, _address) = self.listener.accept().await.expect("a dialler arrives");
-        accept_websocket(socket, self.options, |token| match token {
+        accept_websocket(socket, self.options, |upgrade| match upgrade.bearer() {
             Some(TOKEN) => Ok(()),
             _ => Err(close_codes::UNAUTHORIZED),
         })
@@ -378,4 +380,130 @@ async fn an_acceptor_that_selects_nothing_refuses_the_dial() {
         }
         other => panic!("expected a refusal, got {other:?}"),
     }
+}
+
+/// The corpus, not this crate, is where the origin comparison is written
+/// down; `packages/protocol/tests/fixtures-origins.test.ts` reads the same
+/// file and must agree case for case.
+#[test]
+fn every_origin_case_agrees_with_the_corpus() {
+    let corpus: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../spec/fixtures/1/origins.json"
+    )))
+    .expect("origins.json is valid JSON");
+    let cases = corpus["cases"].as_array().expect("a cases array");
+    assert!(!cases.is_empty(), "the corpus has cases");
+
+    for case in cases {
+        let name = case["name"].as_str().expect("a name");
+        let allowed: Vec<String> = case["allowed"]
+            .as_array()
+            .expect("an allow-list")
+            .iter()
+            .map(|entry| entry.as_str().expect("an origin").to_string())
+            .collect();
+        let expected = match case["verdict"].as_str().expect("a verdict") {
+            "accept" => true,
+            "reject" => false,
+            other => panic!("{name}: unknown verdict {other:?}"),
+        };
+        assert_eq!(
+            is_origin_allowed(case["origin"].as_str(), &allowed),
+            expected,
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_origin_outside_the_allow_list_is_refused_before_hello() {
+    use tokio_tungstenite::tungstenite::handshake::client::generate_key;
+    use tokio_tungstenite::tungstenite::http::{Request as HttpRequest, header};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+    let address = listener.local_addr().expect("a bound address");
+    let accepting = tokio::spawn(async move {
+        let (socket, _from) = listener.accept().await.expect("a dialler arrives");
+        accept_websocket(
+            socket,
+            AcceptOptions::default().with_allowed_origins(["https://app.example"]),
+            |_upgrade| Ok(()),
+        )
+        .await
+        .map(|_port| ())
+    });
+
+    // Built by hand rather than through `connect_websocket`: the dialler this
+    // case needs is a browser, and only a browser attaches `Origin`.
+    let request = HttpRequest::builder()
+        .uri(format!("ws://{address}/conformance"))
+        .header(header::HOST, address.to_string())
+        .header(header::CONNECTION, "Upgrade")
+        .header(header::UPGRADE, "websocket")
+        .header(header::SEC_WEBSOCKET_VERSION, "13")
+        .header(header::SEC_WEBSOCKET_KEY, generate_key())
+        .header(header::ORIGIN, "https://app.example.attacker.test")
+        .header(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            mango_protocol::transports::websocket::WEBSOCKET_SUBPROTOCOL,
+        )
+        .body(())
+        .expect("a request");
+    let dialling = tokio::spawn(async move { tokio_tungstenite::connect_async(request).await });
+
+    let refusal = accepting
+        .await
+        .expect("the acceptor task runs")
+        .expect_err("a suffix of an allowed origin is not that origin");
+    match refusal {
+        AcceptError::Origin { origin } => {
+            assert_eq!(origin, "https://app.example.attacker.test");
+        }
+        other => panic!("expected an origin refusal, got {other}"),
+    }
+
+    // The upgrade completed, so the page is owed a code it can read; the
+    // acceptor sent no hello, so it never learned who was listening.
+    let (mut dialled, _response) = dialling
+        .await
+        .expect("the dial task runs")
+        .expect("the upgrade itself succeeds");
+    let mut code = None;
+    let mut greeting = None;
+    while let Some(Ok(message)) = dialled.next().await {
+        match message {
+            tokio_tungstenite::tungstenite::Message::Close(frame) => {
+                code = frame.map(|frame| u16::from(frame.code));
+                break;
+            }
+            tokio_tungstenite::tungstenite::Message::Binary(_)
+            | tokio_tungstenite::tungstenite::Message::Text(_) => {
+                greeting = Some(message);
+                break;
+            }
+            _ => continue,
+        }
+    }
+    assert!(
+        greeting.is_none(),
+        "the acceptor greeted a refused origin: {greeting:?}"
+    );
+    assert_eq!(code, Some(close_codes::FORBIDDEN));
+}
+
+#[tokio::test]
+async fn a_dialler_without_an_origin_is_not_treated_as_a_browser() {
+    let acceptor = Acceptor::bind(WebSocketOptions::default()).await;
+    let url = acceptor.url();
+    let dialling =
+        tokio::spawn(async move { dial(&url, WebSocketOptions::default(), Some(TOKEN)).await });
+
+    // The default allow-list is empty, which admits no browser — and a native
+    // dialler attaches no Origin, so the empty list does not touch it.
+    acceptor
+        .accept()
+        .await
+        .expect("a dialler that sent no Origin is judged on its credential alone");
+    let _ = dialling.await.expect("the dial task runs");
 }

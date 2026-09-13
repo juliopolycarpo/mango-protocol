@@ -10,6 +10,7 @@
 
 export {
   createWebSocketPort,
+  isOriginAllowed,
   outcomeOfBunSend,
   type SendOutcome,
   WEBSOCKET_SUBPROTOCOL,

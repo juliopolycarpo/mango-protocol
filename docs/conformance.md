@@ -7,7 +7,7 @@ over each transport. All three live in this repository and all three run in CI.
 
 ## The fixture corpus
 
-`spec/fixtures/1/` holds six JSON files. Each case has a `name`, a `verdict` and the input;
+`spec/fixtures/1/` holds seven JSON files. Each case has a `name`, a `verdict` and the input;
 `accept` cases also carry `expected`, the decoded value as a recursive subset (every member of
 `expected` must equal the decoded member; extra members are allowed, because envelopes are
 open).
@@ -18,6 +18,7 @@ open).
 | `ndjson.json`       | The line decoder: buffering, blank lines, CR, oversized partial lines | `pieces`, `finish`, `maxFrameBytes`    |
 | `chunks.json`       | The WebSocket chunk reassembler: header, count, index, minimums       | `messages` (base64), `maxMessageBytes` |
 | `negotiation.json`  | Version negotiation: majors, minors, the close code on mismatch       | `local`, `remote`, `expected`          |
+| `origins.json`      | The WebSocket acceptor's `Origin` allow-list: exact, never a prefix   | `origin`?, `allowed`                   |
 | `ssh-argv.json`     | The `ssh` launcher preset: every option, the quoting, the refusals    | `options`, `argv` or `reason`          |
 | `legacy-hello.json` | The greeting of a `runtime-protocol` 1.0.1 peer, refused with `4426`  | `line`, `chunks` (base64), `closeCode` |
 
@@ -42,6 +43,12 @@ builder; `bun run check` fails when either file is stale. Edit the generator, ne
 the wire spec's §5.2, the close code, and the exact reason a peer that never greeted is closed
 with. Both SDKs assert their own defaults against it, so the number lives in one place rather
 than three.
+
+`origins.json` has no decoder behind it — it is the corpus for one comparison, and an
+implementation that offers the check (`isOriginAllowed`, `is_origin_allowed`) runs every case.
+Its reject cases are chosen to catch the three comparisons a reviewer reaches for first: a
+prefix match admits `https://app.example.attacker.test`, a host-suffix match admits
+`https://notapp.example`, and a substring match admits both.
 
 `legacy-hello.json` is the one file nobody may regenerate. Its bytes were captured from the
 `runtime-protocol` 1.0.1 codec before that codec was deleted, and there is nothing left to

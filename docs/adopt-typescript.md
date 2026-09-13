@@ -104,6 +104,7 @@ before the port exists.
 import {
   connectWebSocket,
   createWebSocketPort,
+  isOriginAllowed,
   outcomeOfBunSend,
   WEBSOCKET_SUBPROTOCOL,
   webSocketPort,
@@ -122,6 +123,12 @@ const { port, onMessage, onDrain, onClose } = createWebSocketPort({
 
 // a WHATWG WebSocket object on either side
 const port = webSocketPort(socket);
+
+// your framework owns the upgrade, so it owns the Origin check; this is the
+// comparison spec/fixtures/1/origins.json pins — exact, never a prefix.
+if (!isOriginAllowed(request.headers.get('origin') ?? undefined, ALLOWED_ORIGINS)) {
+  return new Response(null, { status: 403 });
+}
 ```
 
 The sink reports each send as sent, buffered or dropped, so the port can pause its queue under

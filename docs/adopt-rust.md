@@ -185,7 +185,7 @@ already run:
 
 ```rust
 use mango_protocol::transports::websocket::client::{WebSocketConnectOptions, connect_websocket};
-use mango_protocol::transports::websocket::server::accept_websocket;
+use mango_protocol::transports::websocket::server::{AcceptOptions, accept_websocket};
 use mango_protocol::transports::websocket::{WebSocketOptions, websocket_port};
 
 let options = WebSocketConnectOptions::default().with_bearer(token);
@@ -194,11 +194,20 @@ let port = connect_websocket("wss://hub.example/runtime", &options, &deadline).a
 // Accepting: the credential is checked before any hello, so a peer whose
 // token is no good never learns who you are. It reads the code off the close
 // because the upgrade completed first.
-let port = accept_websocket(socket, WebSocketOptions::default(), |token| match token {
-    Some(t) if known(t) => Ok(()),
-    _ => Err(close_codes::UNAUTHORIZED),
+let port = accept_websocket(socket, WebSocketOptions::default(), |upgrade| {
+    match upgrade.bearer() {
+        Some(t) if known(t) => Ok(()),
+        _ => Err(close_codes::UNAUTHORIZED),
+    }
 })
 .await?;
+
+// An acceptor a browser dials says which sites it serves. The default list is
+// empty, which refuses every upgrade that carries an Origin at all — right for
+// a hub only native clients reach, wrong to leave in place for one a page dials.
+let options = AcceptOptions::from(WebSocketOptions::default())
+    .with_allowed_origins(["https://app.example"]);
+let port = accept_websocket(socket, options, |upgrade| authorize(upgrade.bearer())).await?;
 
 // Or, if you already upgraded the socket yourself:
 let port = websocket_port(already_upgraded, WebSocketOptions::default());
