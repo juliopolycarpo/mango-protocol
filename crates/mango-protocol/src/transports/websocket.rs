@@ -680,7 +680,28 @@ async fn drive<S>(
             }
         }
     }
+    release_unwritten(&mut commands, &queued_bytes);
     let _ = sink.close().await;
+}
+
+/// Takes the bytes of everything still queued back out of the counter.
+///
+/// Both ways out of the writer's loop leave commands behind it: a write that
+/// failed, and a close that ends the port with frames still waiting. The
+/// counter says what is queued and not yet written, and abandoning those bytes
+/// in it makes the one number this transport's backpressure rule reads say
+/// something untrue for the rest of the port's life.
+///
+/// Nothing observes it by then — a sender past this point finds the port
+/// closed and never reaches the counter — so this keeps an invariant rather
+/// than fixing a behaviour.
+fn release_unwritten(commands: &mut mpsc::UnboundedReceiver<WriteCommand>, queued: &AtomicUsize) {
+    commands.close();
+    while let Ok(command) = commands.try_recv() {
+        if let WriteCommand::Chunks { bytes, .. } = command {
+            queued.fetch_sub(bytes, Ordering::AcqRel);
+        }
+    }
 }
 
 /// Writes one frame's chunks contiguously. False once the socket refused one,
