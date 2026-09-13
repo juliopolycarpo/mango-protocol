@@ -435,6 +435,18 @@ struct SocketWriter {
     /// False once anything closed the socket; every later send is reported as
     /// the transport being gone rather than queued behind a dead one.
     open: Arc<AtomicBool>,
+    /// True while the socket has answered `Pending` to a write — it is holding
+    /// what it was given rather than taking more.
+    ///
+    /// This is the "while the socket is not draining" half of websocket.md's
+    /// Backpressure rule, and the counterpart of the TypeScript port's
+    /// `#paused`. It stays true for as long as one write remains stuck, so
+    /// every `send_frame` call in that window gets its own chance to see a
+    /// backlog that grew past the limit *after* the write it is behind
+    /// stalled — a single check made only at the instant of stalling could
+    /// not see that growth, since nothing re-polls a write already suspended
+    /// on the socket to notice the queue behind it changing shape.
+    paused: Arc<AtomicBool>,
     /// Held, never read: dropping the last handle aborts the writer task, so
     /// one still stuck on a socket that will not take the farewell cannot
     /// outlive the port.
@@ -477,17 +489,20 @@ impl SocketWriter {
         let (commands, receiver) = mpsc::unbounded_channel();
         let queued_bytes = Arc::new(AtomicUsize::new(0));
         let open = Arc::new(AtomicBool::new(true));
+        let paused = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn(drive(
             sink,
             receiver,
             Arc::clone(&queued_bytes),
             Arc::clone(&open),
+            Arc::clone(&paused),
             options,
         ));
         Self {
             commands,
             queued_bytes,
             open,
+            paused,
             _task: Arc::new(AbortOnDrop(task)),
             options,
         }
@@ -498,13 +513,16 @@ impl SocketWriter {
     /// Reports [`SendOutcome::Sent`] once they are the writer's, the way the
     /// TypeScript port reports a message the socket buffered. A queue that has
     /// passed one frame limit *while the socket is not draining* is a peer
-    /// that is not reading: the writer task closes the socket with `4400`
-    /// itself (see `drive`) rather than every pending response being held for
-    /// a socket that may never drain, and a later call here sees `open` false.
-    /// The decision cannot be made here: this function has no await on its
-    /// happy path, so a burst of sends can queue arbitrarily far past the
-    /// limit before the writer task ever runs to notice the socket is not
-    /// draining.
+    /// that is not reading: the socket is closed with `4400` and the session
+    /// is told the transport is gone, rather than every pending response being
+    /// held for a socket that may never drain. Both halves are required — a
+    /// backlog on a socket that is still taking bytes is just a busy sender.
+    ///
+    /// This is not the only place that rule is judged: this function has no
+    /// await on its happy path, so a caller that never sends again after the
+    /// backlog passes the limit would never trigger this check at all. `drive`
+    /// judges the same rule itself the instant a write answers `Pending`, for
+    /// exactly that case.
     async fn send_frame(&self, frame: &Frame) -> SendOutcome {
         if !self.open.load(Ordering::Acquire) {
             return SendOutcome::Closed;
@@ -518,7 +536,10 @@ impl SocketWriter {
             Err(error) => return SendOutcome::Refused(error),
         };
         let bytes: usize = messages.iter().map(Vec::len).sum();
-        self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
+        // What was already waiting, this frame excluded. A frame is never
+        // measured against the limit by its own size: one of exactly the frame
+        // limit is legal, and its chunk headers would push any total over.
+        let waiting = self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
         if self
             .commands
             .send(WriteCommand::Chunks { messages, bytes })
@@ -526,6 +547,18 @@ impl SocketWriter {
         {
             self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
             self.open.store(false, Ordering::Release);
+            return SendOutcome::Closed;
+        }
+        // Both halves of the rule, never the backlog alone: a queue over the
+        // limit is only a peer that stopped reading if the socket is also not
+        // taking what it is given.
+        if waiting > self.options.max_frame_bytes && self.paused.load(Ordering::Acquire) {
+            self.close(
+                close_codes::PROTOCOL_ERROR,
+                Some("the send queue outgrew one frame limit while the socket was not draining"),
+                true,
+            )
+            .await;
             return SendOutcome::Closed;
         }
         SendOutcome::Sent
@@ -615,6 +648,7 @@ async fn drive<S>(
     mut commands: mpsc::UnboundedReceiver<WriteCommand>,
     queued_bytes: Arc<AtomicUsize>,
     open: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     options: WebSocketOptions,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -626,25 +660,31 @@ async fn drive<S>(
                 // written: what the counter measures is the queue behind the
                 // socket, and the frame being written is no longer in it.
                 queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
-                // "Not draining" is the socket itself answering `Pending` —
-                // it has the bytes and will not take more yet, the same thing
-                // the TypeScript port's `#paused` records when its sink
-                // reports a chunk as buffered rather than sent. A write that
-                // completes in one poll never raises it, so a busy sender is
-                // never mistaken for a stalled socket.
+                // Raised only while the socket itself has answered `Pending` —
+                // it has the bytes and will not take more yet. That is what
+                // "not draining" means to a sender deciding whether a backlog
+                // is a peer that stopped reading, and it is the same thing the
+                // TypeScript port's `#paused` records when its sink reports a
+                // chunk as buffered rather than sent. A write that completes
+                // in one poll never raises it, so a busy sender is never
+                // mistaken for a stalled socket. `send_frame` reads this on
+                // every call it makes for as long as one write stays stuck,
+                // which is what catches a backlog that grows past the limit
+                // only after the write behind it stalled.
                 //
-                // Both halves of the rule are judged right here, the instant
-                // the socket answers `Pending` — not by the sender: a sender
-                // has no await on its happy path, so a burst can queue
-                // arbitrarily far past the limit before this task next runs,
-                // and by then whatever tipped it over is long gone.
+                // The instant of stalling is also judged right here, for the
+                // caller that never calls `send_frame` again to ask: nothing
+                // re-polls a write already suspended on the socket, so this is
+                // the only chance to notice the backlog was already over the
+                // limit before anything else changes.
                 let mut give_up = false;
                 let written = {
                     let mut write = pin!(write_chunks(&mut sink, messages));
                     poll_fn(|cx| {
                         let polled = write.as_mut().poll(cx);
-                        if polled.is_pending()
-                            && queued_bytes.load(Ordering::Acquire) > options.max_frame_bytes
+                        let pending = polled.is_pending();
+                        paused.store(pending, Ordering::Release);
+                        if pending && queued_bytes.load(Ordering::Acquire) > options.max_frame_bytes
                         {
                             give_up = true;
                             // Set the instant the rule fires, not after this
@@ -681,13 +721,16 @@ async fn drive<S>(
     let _ = sink.close().await;
 }
 
-/// Gives up on a peer whose queue outgrew one frame limit while the socket
-/// was not draining: the farewell of §10 first, unless the caller turned it
-/// off, then the native `close` carrying the same code.
+/// Gives up on a peer whose queue outgrew one frame limit before its very
+/// first stall was even noticed: the farewell of §10 first, unless the caller
+/// turned it off, then the native `close` carrying the same code.
 ///
-/// Called by the writer task on its own initiative, not by a caller of
-/// [`SocketWriter::send_frame`] waiting on the outcome of one send — nothing
-/// else may ever call `send_frame` again for this to run.
+/// Called by the writer task on its own initiative. [`SocketWriter::close`]
+/// reaches the same close by queuing a [`WriteCommand::Close`] instead, for
+/// every other caller that decides to stop — including
+/// [`SocketWriter::send_frame`]'s own check on `paused`, which is what still
+/// catches a backlog that only grows past the limit after a write already
+/// stalled.
 async fn close_stalled_peer<S>(
     sink: &mut SplitSink<WebSocketStream<S>, Message>,
     options: WebSocketOptions,
