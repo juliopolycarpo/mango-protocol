@@ -15,17 +15,31 @@ frame limit enforced per line, refused line ends the session with `4400`.
   socket with owner-only permissions (`0600`) and removes a stale file at the same path before
   binding.
 - Windows: `\\.\pipe\<name>`, spelled with backslashes. Forward slashes are not equivalent.
-  The listener creates the pipe in byte mode. The pipe carries no per-user ACL: the socket API
-  the reference SDK builds on cannot attach a security descriptor, so every local user may
-  connect.
+  The listener creates the pipe in byte mode. A named pipe admits every local user unless the
+  listener attaches a security descriptor, so a listener SHOULD create the pipe with a DACL
+  admitting only the pipe's owner.
+
+A listener that publishes its address must not be connectable by a stranger for even one
+instant, and neither platform lets the address and its permissions be created in one step. A
+listener therefore SHOULD create the endpoint somewhere only it can reach and publish it at the
+final address afterwards: on POSIX, bind inside a directory created `0700` and hard-link the
+socket out to the address, so traversal denial — not the socket's own mode, which `bind` takes
+from the umask — is what refuses a stranger in the window before `chmod`; on Windows, attach the
+descriptor in the `CreateNamedPipe` call that creates the pipe, which has no such window.
 
 ## Authentication
 
-On POSIX the socket file's permissions admit only the owner. On Windows the pipe admits every
-local user, so a listener that needs more than same-machine trust MUST authenticate the peer
-before serving requests: it reads the credentials the operating system offers (the pipe
-client's token, `SO_PEERCRED`, `getpeereid`) or requires an application credential carried in
-`hello.capabilities`, and refuses a peer with `close` `4401`. On POSIX that check is a MAY.
+Same-machine trust is the floor, not the credential. Reading the credentials the operating
+system offers — the pipe client's token, `SO_PEERCRED`, `getpeereid` — is the reference check on
+both platforms, and an SDK that exposes peer credentials at all SHOULD expose them to the
+listener before the first frame.
+
+A listener that cannot restrict its address to the owner — a POSIX path on a filesystem that
+ignores permissions, a Windows pipe created without a descriptor — MUST authenticate the peer
+before it serves any request: peer credentials, or an application credential carried in
+`hello.capabilities`. A peer that fails the check is refused with `close` `4401` and, per
+[§5.1](../mango-protocol-1.md#51-hello), before this side sends its own `hello`. Where the
+address is already owner-only, that check is a MAY.
 
 ## Liveness
 
@@ -34,7 +48,10 @@ Protocol `ping`/`pong` both ways on a fixed cadence, as for stdio.
 ## Close
 
 `close` then socket shutdown. A connection that ends without a `close` frame is a `4000`
-release. A listener shutting down sends `close` `4000` to every session first.
+release. A listener shutting down sends `close` `4000` to every session it still owns first. A
+listener that hands each accepted port to its caller no longer owns those sessions; it SHOULD
+keep a weak handle per accepted connection so it can still send that farewell, and a session
+whose owner dropped it simply ends as a `4000` release when the socket does.
 
 ## Notes
 
