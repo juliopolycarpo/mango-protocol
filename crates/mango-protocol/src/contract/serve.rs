@@ -252,9 +252,16 @@ pub(super) fn serve(
     if options.discover {
         let catalog = contract.catalog();
         guards.push(
-            session.handle(RPC_DISCOVER, move |_params: Value, _context| {
+            session.handle(RPC_DISCOVER, move |params: Value, _context| {
                 let catalog = catalog.clone();
                 async move {
+                    if !params.is_object() {
+                        return Err(RemoteError::new(
+                            codes::INVALID_PARAMS,
+                            format!("Parameters of \"{RPC_DISCOVER}\" must be an object."),
+                        )
+                        .with_detail("method", RPC_DISCOVER.to_string()));
+                    }
                     serde_json::to_value(catalog).map_err(|error| {
                         RemoteError::new(
                             codes::INTERNAL,

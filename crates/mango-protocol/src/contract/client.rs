@@ -40,17 +40,19 @@ impl<'a> ContractClient<'a> {
             .await
     }
 
-    /// Asks the peer for the contract it serves (`rpc.discover`, §6.4) and
-    /// decodes the answer as a [`Catalog`].
+    /// Asks the peer for the contract it serves (`rpc.discover`, §6.4),
+    /// decodes the answer as a [`Catalog`] and validates it.
     ///
-    /// The catalog is the peer's, not this side's, so a caller that intends
-    /// to act on it compiles it with [`super::Contract::from_catalog`], which
-    /// runs the same checks a contract built here passes.
+    /// The catalog is the peer's, not this side's; a caller that intends to
+    /// compile it into a [`super::Contract`] still does so with
+    /// [`super::Contract::from_catalog`], which runs the same checks against
+    /// the already-validated document.
     ///
     /// # Errors
     /// `INVALID_REQUEST` against a peer below wire minor 1,
     /// `METHOD_UNSUPPORTED` when the peer serves no contract, and `INTERNAL`
-    /// when what came back is not a catalog document.
+    /// when what came back is not a catalog document or fails
+    /// [`Catalog::validate`].
     pub async fn discover(&self) -> Result<Catalog, RemoteError> {
         self.discover_with(RequestOptions::default()).await
     }
@@ -58,9 +60,21 @@ impl<'a> ContractClient<'a> {
     /// [`ContractClient::discover`], tuned by `options`.
     ///
     /// # Errors
-    /// The same as [`ContractClient::discover`].
+    /// The same as [`ContractClient::discover`], plus `INTERNAL` when the
+    /// catalog decodes but fails [`Catalog::validate`] — a constraint Serde
+    /// cannot express, the same check the TypeScript SDK's `assertCatalog`
+    /// runs on its side of this call.
     pub async fn discover_with(&self, options: RequestOptions) -> Result<Catalog, RemoteError> {
-        self.request_with(RPC_DISCOVER, json!({}), options).await
+        let catalog: Catalog = self.request_with(RPC_DISCOVER, json!({}), options).await?;
+        catalog.validate().map_err(|error| {
+            RemoteError::new(
+                codes::INTERNAL,
+                format!(
+                    "The peer's catalog does not satisfy the checks Serde cannot express: {error}."
+                ),
+            )
+        })?;
+        Ok(catalog)
     }
 
     /// [`ContractClient::request`], tuned by `options`.

@@ -303,6 +303,56 @@ async fn answers_rpc_discover_with_the_served_catalog() {
     assert_eq!(error.code, codes::METHOD_UNSUPPORTED);
 }
 
+/// §6.4 defines `rpc.discover`'s parameters as an object; a raw request that
+/// sends anything else (here `null`) must not reach the catalog.
+#[tokio::test]
+async fn rpc_discover_refuses_non_object_params() {
+    let (session_a, session_b) = sessions().await;
+    let contract = example();
+    let _guard = contract
+        .serve(&session_b, plain_handlers(), ServeOptions::default())
+        .expect("both methods are declared");
+
+    let error = within(
+        "rpc.discover with null params",
+        session_a.request(mango_protocol::validate::RPC_DISCOVER, json!(null)),
+    )
+    .await
+    .expect_err("null is not an object");
+    assert_eq!(error.code, codes::INVALID_PARAMS);
+}
+
+/// A peer's `rpc.discover` answer can decode into `Catalog` through Serde and
+/// still violate constraints Serde cannot express — an invalid method name,
+/// here. The client checks it with the same [`Catalog::validate`] the
+/// TypeScript SDK's `assertCatalog` runs, rather than handing the caller a
+/// document [`Contract::from_catalog`] would refuse.
+#[tokio::test]
+async fn client_discover_refuses_a_catalog_that_fails_validation() {
+    let (session_a, session_b) = sessions().await;
+    let bad_catalog = json!({
+        "name": "c",
+        "version": "1",
+        "methods": [{ "name": "bad", "params": {}, "result": {} }],
+    });
+    let _guard = session_b.handle(
+        mango_protocol::validate::RPC_DISCOVER,
+        move |_params, _context| {
+            let bad_catalog = bad_catalog.clone();
+            async move { Ok(bad_catalog) }
+        },
+    );
+
+    let contract = example();
+    let error = within(
+        "rpc.discover with an invalid catalog",
+        contract.client(&session_a).discover(),
+    )
+    .await
+    .expect_err("\"bad\" is not a dotted method name");
+    assert_eq!(error.code, codes::INTERNAL);
+}
+
 #[tokio::test]
 async fn leaves_rpc_discover_unanswered_when_the_catalog_is_not_offered() {
     let (session_a, session_b) = sessions().await;
