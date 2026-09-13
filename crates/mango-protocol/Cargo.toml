@@ -66,6 +66,7 @@ nix = { version = "0.31", optional = true, default-features = false, features = 
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Pipes"] }
 
 [dev-dependencies]
+proptest = { version = "1.11", default-features = false, features = ["std"] }
 tokio = { version = "1.53", features = ["macros", "rt", "rt-multi-thread", "test-util"] }
 
 [[example]]

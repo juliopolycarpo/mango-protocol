@@ -16,8 +16,19 @@ pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 pub const DEFAULT_LIVENESS_INTERVAL: Duration = Duration::from_secs(20);
 /// 5 seconds: the default [`SessionOptions::handler_grace`].
 pub const DEFAULT_HANDLER_GRACE: Duration = Duration::from_secs(5);
+/// 256: the default [`SessionOptions::max_in_flight`] (§11.2).
+pub const DEFAULT_MAX_IN_FLIGHT: usize = 256;
+/// 1024: the default [`SessionOptions::max_stream_keys`] (§11.2).
+pub const DEFAULT_MAX_STREAM_KEYS: usize = 1024;
+/// `error.details.kind` on the refusal that says the responder is full (§11.2).
+pub const IN_FLIGHT_LIMIT_KIND: &str = "in_flight_limit";
+/// `error.details.kind` on the local refusal of one stream key too many (§11.2).
+pub const STREAM_KEY_LIMIT_KIND: &str = "stream_key_limit";
 /// `"r"`: the default [`SessionOptions::request_id_prefix`].
 pub const DEFAULT_REQUEST_ID_PREFIX: &str = "r";
+/// The close reason the specification's §5.2 puts on a handshake that ran
+/// out of time, spelled exactly as the peer's log will show it.
+pub const HANDSHAKE_TIMEOUT_REASON: &str = "handshake timeout";
 
 /// How to open a [`crate::session::Session`]: who this side is, and every
 /// tunable the handshake and the driver need.
@@ -48,6 +59,15 @@ pub struct SessionOptions {
     /// Largest frame this side accepts. `None` defers to the port's own
     /// ceiling, then to [`crate::codec::ndjson::DEFAULT_MAX_FRAME_BYTES`].
     pub max_frame_bytes: Option<usize>,
+    /// How many requests this side will answer at once. Past it a `req` is
+    /// refused with `UNAVAILABLE` and `details.kind` of `in_flight_limit`,
+    /// which the requester may retry. Announced in `hello.limits.maxInFlight`
+    /// so the peer can pace itself.
+    pub max_in_flight: usize,
+    /// How many stream keys this side will emit on at once. A new key past it
+    /// is refused locally and nothing is sent. Local, never announced:
+    /// reaching it means this side leaked stream ids.
+    pub max_stream_keys: usize,
     /// How long to wait for the peer's `hello`.
     pub handshake_timeout: Duration,
     /// Ping cadence after the handshake; `None` disables liveness checking
@@ -57,8 +77,8 @@ pub struct SessionOptions {
     /// Prefix of generated request ids.
     pub request_id_prefix: String,
     /// How long `close()` waits for in-flight handlers to settle before
-    /// abandoning them. Rust-only; the TypeScript SDK has no equivalent since
-    /// it never awaits its own teardown.
+    /// abandoning them. The TypeScript SDK spells the same thing
+    /// `handlerGraceMs`.
     pub handler_grace: Duration,
     pub(super) handlers: Vec<(String, Arc<dyn Handler>)>,
 }
@@ -74,6 +94,8 @@ impl std::fmt::Debug for SessionOptions {
             .field("capabilities", &self.capabilities)
             .field("protocol", &self.protocol)
             .field("max_frame_bytes", &self.max_frame_bytes)
+            .field("max_in_flight", &self.max_in_flight)
+            .field("max_stream_keys", &self.max_stream_keys)
             .field("handshake_timeout", &self.handshake_timeout)
             .field("liveness_interval", &self.liveness_interval)
             .field("request_id_prefix", &self.request_id_prefix)
@@ -103,6 +125,8 @@ impl SessionOptions {
             capabilities: Map::new(),
             protocol: PROTOCOL_VERSION,
             max_frame_bytes: None,
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+            max_stream_keys: DEFAULT_MAX_STREAM_KEYS,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             liveness_interval: Some(DEFAULT_LIVENESS_INTERVAL),
             request_id_prefix: DEFAULT_REQUEST_ID_PREFIX.to_string(),
@@ -129,6 +153,42 @@ impl SessionOptions {
     #[must_use]
     pub fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Self {
         self.max_frame_bytes = Some(max_frame_bytes);
+        self
+    }
+
+    /// Sets how many requests this side will answer at once (§11.2).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_protocol::frame::PeerInfo;
+    /// use mango_protocol::session::SessionOptions;
+    ///
+    /// let peer = PeerInfo { name: "hub".into(), version: "1.0.0".into(), role: "hub".into() };
+    /// let options = SessionOptions::new(peer).with_max_in_flight(8);
+    /// assert_eq!(options.max_in_flight, 8);
+    /// ```
+    #[must_use]
+    pub const fn with_max_in_flight(mut self, max_in_flight: usize) -> Self {
+        self.max_in_flight = max_in_flight;
+        self
+    }
+
+    /// Sets how many stream keys this side will emit on at once (§11.2).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_protocol::frame::PeerInfo;
+    /// use mango_protocol::session::SessionOptions;
+    ///
+    /// let peer = PeerInfo { name: "hub".into(), version: "1.0.0".into(), role: "hub".into() };
+    /// let options = SessionOptions::new(peer).with_max_stream_keys(4);
+    /// assert_eq!(options.max_stream_keys, 4);
+    /// ```
+    #[must_use]
+    pub const fn with_max_stream_keys(mut self, max_stream_keys: usize) -> Self {
+        self.max_stream_keys = max_stream_keys;
         self
     }
 

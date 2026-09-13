@@ -46,10 +46,10 @@ import {
   compareDefinitions,
   crossFileDefinitions,
   type Definitions,
-  differences,
   type Json,
   type JsonObject,
-  normalise,
+  normalizeSchema,
+  schemaDifferences,
 } from './schema-equality';
 
 /** The TypeScript SDK's schemas, keyed like the spec's `$defs`. */
@@ -179,9 +179,9 @@ const compared = ['typescript'];
  */
 function compareCatalog(label: string, emitted: CatalogDocument): string[] {
   const result = compareDefinitions(label, emitted.definitions, CATALOG_REQUIRED, CATALOG_SPEC);
-  const diff = differences(
-    normalise(catalogRoot as Json, CATALOG_SPEC),
-    normalise(emitted.root, emitted.definitions)
+  const diff = schemaDifferences(
+    normalizeSchema(catalogRoot as Json, CATALOG_SPEC),
+    normalizeSchema(emitted.root, emitted.definitions)
   );
   return [...result, ...diff.map((line) => `${label}: root${line}`)];
 }

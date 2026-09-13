@@ -14,7 +14,8 @@ use mango_protocol::frame::{
 };
 use mango_protocol::port::{Inbound, PortClosure, port_pair};
 use mango_protocol::session::{
-    CallContext, EventInput, RequestOptions, Session, SessionOptions, SessionState,
+    CallContext, DEFAULT_HANDSHAKE_TIMEOUT, EventInput, HANDSHAKE_TIMEOUT_REASON, RequestOptions,
+    Session, SessionOptions, SessionState,
 };
 use mango_protocol::{CodecError, Frame};
 use serde_json::Value;
@@ -86,7 +87,73 @@ async fn times_out_when_the_peer_never_says_hello() {
 
     let closure = within("closed()", session.closed()).await;
     assert_eq!(closure.code, close_codes::PROTOCOL_ERROR);
-    assert_eq!(closure.reason.as_deref(), Some("handshake timeout"));
+    assert_eq!(closure.reason.as_deref(), Some(HANDSHAKE_TIMEOUT_REASON));
+}
+
+/// The corpus, not this crate, is where the 15-second budget and the exact
+/// close reason are written down; the TypeScript suite reads the same file.
+#[test]
+fn the_handshake_budget_matches_the_corpus() {
+    let corpus: Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../spec/fixtures/1/negotiation.json"
+    )))
+    .expect("negotiation.json is valid JSON");
+    let handshake = &corpus["handshake"];
+
+    let millis = u64::try_from(DEFAULT_HANDSHAKE_TIMEOUT.as_millis()).expect("fits in u64");
+    assert_eq!(millis, handshake["timeoutMs"].as_u64().expect("a budget"));
+    assert_eq!(
+        u64::from(close_codes::PROTOCOL_ERROR),
+        handshake["closeCode"].as_u64().expect("a close code")
+    );
+    assert_eq!(
+        HANDSHAKE_TIMEOUT_REASON,
+        handshake["reason"].as_str().expect("a reason")
+    );
+}
+
+/// §6.1: a requester never reuses an id within a session, including after the
+/// response arrived. The generated ids are what proves it — a responder cannot.
+#[tokio::test]
+async fn never_reuses_a_request_id_within_a_session() {
+    let (a, b) = port_pair();
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    let (session, driver_a) = Session::spawn(a, SessionOptions::new(peer("a")));
+    let (peer_session, driver_b) = Session::spawn(
+        b,
+        SessionOptions::new(peer("b")).handle(
+            "test.echo",
+            move |params: Value, context: CallContext| {
+                let recorder = Arc::clone(&recorder);
+                async move {
+                    recorder
+                        .lock()
+                        .expect("recorder")
+                        .push(context.id().to_string());
+                    Ok::<_, RemoteError>(params)
+                }
+            },
+        ),
+    );
+    within("ready()", session.ready()).await.expect("handshake");
+
+    for _ in 0..4 {
+        let answer = within("request()", session.request("test.echo", Value::Null))
+            .await
+            .expect("echo answers");
+        assert_eq!(answer, Value::Null);
+    }
+
+    let ids = seen.lock().expect("recorder").clone();
+    assert_eq!(ids.len(), 4, "every request settled: {ids:?}");
+    let distinct: std::collections::HashSet<&String> = ids.iter().collect();
+    assert_eq!(distinct.len(), ids.len(), "an id was reused: {ids:?}");
+
+    session.close_now(close_codes::RELEASED, None);
+    peer_session.close_now(close_codes::RELEASED, None);
+    let _ = tokio::join!(driver_a, driver_b);
 }
 
 /// The driver's `select!` is `biased`, so whichever branch comes first wins
@@ -267,7 +334,8 @@ async fn announces_its_frame_ceiling_and_honours_the_lower_one() {
     assert_eq!(
         sent_hello.limits,
         Some(Limits {
-            max_frame_bytes: Some(8192)
+            max_frame_bytes: Some(8192),
+            max_in_flight: None,
         })
     );
 
@@ -277,6 +345,7 @@ async fn announces_its_frame_ceiling_and_honours_the_lower_one() {
         capabilities: Default::default(),
         limits: Some(Limits {
             max_frame_bytes: Some(4096),
+            max_in_flight: None,
         }),
     }))
     .await;
@@ -392,9 +461,12 @@ async fn rejects_an_invalid_or_reserved_method_name_locally() {
     .expect_err("refused locally");
     assert_eq!(invalid.code, "INVALID_REQUEST");
 
+    // `rpc.nowhere`, not `rpc.discover`: a reserved name this wire *defines*
+    // is refused only once the effective minor is known, so it waits for the
+    // handshake and would hang here. Every other rpc. name never can be.
     let reserved = within(
         "a reserved method name",
-        session.request("rpc.discover", Value::Null),
+        session.request("rpc.nowhere", Value::Null),
     )
     .await
     .expect_err("refused locally");

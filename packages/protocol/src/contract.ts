@@ -3,9 +3,9 @@ import type { TLocalizedValidationError } from 'typebox/error';
 import Value from 'typebox/value';
 import { RESERVED_ERROR_CODES, RemoteError } from './errors';
 import { assertCatalog, type Catalog } from './schemas/catalog';
-import { isReservedMethodName, isValidMethodName } from './schemas/common';
+import { isReservedMethodName, isValidMethodName, RPC_DISCOVER } from './schemas/common';
 import type { EventFrame } from './schemas/frames';
-import type { HandlerContext, RequestOptions, Session } from './session';
+import type { HandlerContext, RemotePeer, RequestOptions, Session } from './session';
 import type { ProtocolVersion } from './version';
 
 export interface MethodDefinition<P extends TSchema = TSchema, R extends TSchema = TSchema> {
@@ -50,6 +50,13 @@ export interface ContractClient<M extends MethodMap> {
     params: MethodParams<M, K>,
     options?: RequestOptions
   ): Promise<MethodResult<M, K>>;
+  /**
+   * Asks the peer for the contract it serves (`rpc.discover`, §6.4) and
+   * validates the answer against `catalog.json` before returning it. Rejects
+   * with `INVALID_REQUEST` against a peer below wire minor 1, and with
+   * `METHOD_UNSUPPORTED` when the peer serves no contract.
+   */
+  discover(options?: RequestOptions): Promise<Catalog>;
 }
 
 export type ContractHandlers<M extends MethodMap> = {
@@ -59,16 +66,45 @@ export type ContractHandlers<M extends MethodMap> = {
   ) => MethodResult<M, K> | Promise<MethodResult<M, K>>;
 };
 
+/**
+ * Everything a policy decision needs beyond the method name and its declared
+ * capabilities: the parameters **after** they passed the method's schema, how
+ * many requests this side is already answering, and who the peer said it is.
+ *
+ * Extends the handler's own context, so a guard also has the request id, the
+ * abort signal and the session itself.
+ */
+export interface GuardContext extends HandlerContext {
+  /** The request's parameters, already validated against the method's schema. */
+  readonly params: unknown;
+  /** Requests this side is answering right now, this one included. */
+  readonly inFlight: number;
+  /** What the peer announced in its `hello`, plus the negotiated minor. */
+  readonly remote: RemotePeer;
+}
+
 export interface ServeOptions {
   /**
-   * Runs before every handler with the method's declared capability list.
-   * Throw a `RemoteError` (normally `DENIED`) to refuse; the SDK adds no policy
-   * of its own because consent, authorisation and their audit belong to the
-   * application.
+   * Runs after the parameters passed the method's schema and before the
+   * handler, with the method's declared capability list and everything else a
+   * policy needs. Throw a `RemoteError` (normally `DENIED`) to refuse; the SDK
+   * adds no policy of its own because consent, authorisation and their audit
+   * belong to the application.
    */
-  readonly guard?: (method: string, capabilities: readonly string[]) => void | Promise<void>;
+  readonly guard?: (
+    method: string,
+    capabilities: readonly string[],
+    context: GuardContext
+  ) => void | Promise<void>;
   /** Validate results against the schema before sending; off by default. */
   readonly validateResults?: boolean;
+  /**
+   * Answer `rpc.discover` with this contract's catalog. On by default: a peer
+   * that serves a contract SHOULD say so (§6.4). Set `false` where the
+   * catalog itself is privileged, and the method goes back to answering
+   * `METHOD_UNSUPPORTED`.
+   */
+  readonly discover?: boolean;
 }
 
 export interface ContractEvents<E extends EventMap> {
@@ -138,24 +174,62 @@ export function defineContract<M extends MethodMap, E extends EventMap = Record<
     client: (session) => ({
       request: (method, params, options) =>
         session.request(method, params, options) as Promise<MethodResult<M, typeof method>>,
+      discover: async (options) => {
+        const answer = await session.request(RPC_DISCOVER, {}, options);
+        // A peer's catalog is the peer's, not ours: check it before a caller
+        // reads a member off it.
+        assertCatalog(answer);
+        return answer;
+      },
     }),
     serve: (session, handlers, options = {}) => {
-      const removers = Object.entries(definition.methods).map(([method, entry]) =>
-        session.handle(method, async (params, context) => {
-          if (options.guard) await options.guard(method, entry.capabilities ?? []);
-          assertParams(method, params);
-          const handler = handlers[method as keyof M];
-          const result = await handler(params as never, context);
-          if (options.validateResults && !Value.Check(entry.result, result)) {
-            const first = firstViolation(entry.result, result);
-            throw new RemoteError(
-              RESERVED_ERROR_CODES.INTERNAL,
-              `Result of "${method}" does not match the contract${first ? ` at ${first.path}: ${first.message}` : ''}.`,
-              { method, ...(first ? { path: first.path, reason: first.message } : {}) }
-            );
-          }
-          return result;
-        })
+      const removers: (() => void)[] = [];
+      // Built, and validated, before any handler is registered: a catalog
+      // that fails to build must leave nothing behind to unregister.
+      if (options.discover !== false) {
+        const catalog = buildCatalog(definition);
+        removers.push(
+          session.handle(RPC_DISCOVER, (params) => {
+            if (typeof params !== 'object' || params === null || Array.isArray(params)) {
+              throw new RemoteError(
+                RESERVED_ERROR_CODES.INVALID_PARAMS,
+                `Parameters of "${RPC_DISCOVER}" must be an object.`,
+                { method: RPC_DISCOVER }
+              );
+            }
+            return catalog;
+          })
+        );
+      }
+      removers.push(
+        ...Object.entries(definition.methods).map(([method, entry]) =>
+          session.handle(method, async (params, context) => {
+            // Validation first, guard second: a policy that logs or counts a
+            // refusal should never see parameters the contract already
+            // refuses, and this is the order the Rust SDK's `Guard` has
+            // always run in.
+            assertParams(method, params);
+            if (options.guard) {
+              await options.guard(method, entry.capabilities ?? [], {
+                ...context,
+                params,
+                inFlight: context.session.inFlight,
+                remote: context.session.remote,
+              });
+            }
+            const handler = handlers[method as keyof M];
+            const result = await handler(params as never, context);
+            if (options.validateResults && !Value.Check(entry.result, result)) {
+              const first = firstViolation(entry.result, result);
+              throw new RemoteError(
+                RESERVED_ERROR_CODES.INTERNAL,
+                `Result of "${method}" does not match the contract${first ? ` at ${first.path}: ${first.message}` : ''}.`,
+                { method, ...(first ? { path: first.path, reason: first.message } : {}) }
+              );
+            }
+            return result;
+          })
+        )
       );
       return () => {
         for (const remove of removers) remove();

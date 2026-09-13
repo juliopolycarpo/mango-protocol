@@ -7,7 +7,7 @@ over each transport. All three live in this repository and all three run in CI.
 
 ## The fixture corpus
 
-`spec/fixtures/1/` holds six JSON files. Each case has a `name`, a `verdict` and the input;
+`spec/fixtures/1/` holds seven JSON files. Each case has a `name`, a `verdict` and the input;
 `accept` cases also carry `expected`, the decoded value as a recursive subset (every member of
 `expected` must equal the decoded member; extra members are allowed, because envelopes are
 open).
@@ -18,6 +18,7 @@ open).
 | `ndjson.json`       | The line decoder: buffering, blank lines, CR, oversized partial lines | `pieces`, `finish`, `maxFrameBytes`    |
 | `chunks.json`       | The WebSocket chunk reassembler: header, count, index, minimums       | `messages` (base64), `maxMessageBytes` |
 | `negotiation.json`  | Version negotiation: majors, minors, the close code on mismatch       | `local`, `remote`, `expected`          |
+| `origins.json`      | The WebSocket acceptor's `Origin` allow-list: exact, never a prefix   | `origin`?, `allowed`                   |
 | `ssh-argv.json`     | The `ssh` launcher preset: every option, the quoting, the refusals    | `options`, `argv` or `reason`          |
 | `legacy-hello.json` | The greeting of a `runtime-protocol` 1.0.1 peer, refused with `4426`  | `line`, `chunks` (base64), `closeCode` |
 
@@ -37,6 +38,17 @@ JSON Test Suite convention.
 `chunks.json` and `ssh-argv.json` are generated — by `scripts/fixtures/generate-chunks.ts` from
 the reference chunker, and by `scripts/fixtures/generate-ssh-argv.ts` from the reference argv
 builder; `bun run check` fails when either file is stale. Edit the generator, never the file.
+
+`negotiation.json` also carries a `handshake` object beside its `cases`: the 15-second budget of
+the wire spec's §5.2, the close code, and the exact reason a peer that never greeted is closed
+with. Both SDKs assert their own defaults against it, so the number lives in one place rather
+than three.
+
+`origins.json` has no decoder behind it — it is the corpus for one comparison, and an
+implementation that offers the check (`isOriginAllowed`, `is_origin_allowed`) runs every case.
+Its reject cases are chosen to catch the three comparisons a reviewer reaches for first: a
+prefix match admits `https://app.example.attacker.test`, a host-suffix match admits
+`https://notapp.example`, and a substring match admits both.
 
 `legacy-hello.json` is the one file nobody may regenerate. Its bytes were captured from the
 `runtime-protocol` 1.0.1 codec before that codec was deleted, and there is nothing left to
@@ -87,12 +99,25 @@ describe('my transport', () => {
 
 The suite runs the same scenarios against every transport: simultaneous handshake in both
 directions, minor negotiation, major mismatch answered with `4426`, requests in both directions
-and concurrently, unsupported methods, handler errors with codes and details, reserved method
-names, stream ordering and `end`, per-topic sequence numbers, ping in both directions, cancel,
+and concurrently, unsupported methods, handler errors with codes and details, a request past the
+responder's in-flight ceiling refused as retryable, reserved method names, `rpc.discover`
+refused below the minor that defines it, stream ordering and
+`end`, per-topic sequence numbers, one stream key past the local ceiling refused before anything
+is sent, ping in both directions — with the
+periodic ping switched off, which is how the suite proves §9's rule that a peer running no
+cadence of its own still answers one — cancel,
 local timeouts, dropped links failing in-flight requests with `UNAVAILABLE`, close reason
 propagation including fatal codes, `FRAME_TOO_LARGE` without ending the session, honouring a
 lower announced frame limit, and, with `connectRaw`, a schema-invalid `hello` answered with
 `4426` and unknown members ignored.
+
+`@mangostudio/protocol/testing` also exports `normalizeSchema`, `schemaDifferences` and
+`crossFileDefinitions`, the rules this repository's own schema-equality check runs on. A consumer
+that emits a JSON Schema of its own — from TypeBox on one side and schemars on the other, say —
+compares the two by those rules rather than by a fourth copy of them, and a rule this repository
+adds reaches it with the next package release instead of drifting. `crossFileDefinitions` is what
+makes a cross-file `other.json#/$defs/<name>` resolvable: it keys one file's `$defs` by that
+reference so the caller can merge them into the definitions it passes `normalizeSchema`.
 
 Assert a rejection with `rejectionOf` from the same entry rather than Bun's `expect().rejects`:
 that matcher does not pump libuv-backed I/O on Windows while it waits, so a request whose answer
@@ -150,7 +175,9 @@ The conformance suite itself cannot run here — it drives both sessions, and on
 in another process — so each direction runs the list that can be proven from one side alone: the
 handshake and the peer it names, `test.echo`, a 512 KiB `test.bulk` result, an unsupported
 method, `test.refuse`'s chosen code and details, a cancelled `test.forever`, and the peer
-exiting when the session closes. Each transport also writes the frozen 1.0.1 hello as raw bytes
+exiting when the session closes, and `rpc.discover` answering with the shared example catalog —
+the Rust peer publishes `spec/fixtures/1/catalog-example.json` and the TypeScript side compares
+what came off the wire against that same file. Each transport also writes the frozen 1.0.1 hello as raw bytes
 and asserts the Rust peer answers `4426`; the WebSocket direction additionally asserts a
 credential the acceptor does not know is refused with `4401` before any `hello`.
 
@@ -162,3 +189,70 @@ explicitly:
 cargo build --locked --example conformance_peer --features testing,websocket,spawn
 MANGO_INTEROP=1 bun test packages/protocol/tests/interop
 ```
+
+## Property tests and fuzzing
+
+The fixture corpus and the transport suite prove fixed cases; two more layers, Rust-only, prove
+the codec and the session hold for inputs neither suite enumerates.
+
+### Property tests
+
+`crates/mango-protocol/tests/properties.rs` uses `proptest` to check three round trips against
+arbitrary, schema-valid input rather than the corpus's fixed cases:
+
+- `decode_line(encode_line(f)) == f` for an arbitrary frame. The generators build a
+  schema-valid frame directly — the method/topic grammar, id and name length ceilings, and the
+  close-code range are baked into the strategies rather than filtered after the fact — so a
+  refusal here is a codec bug, not a generator bug.
+- `reassemble(encode_chunks(frame, cap)) == frame` for every message cap the chunk framing
+  allows, plus a focused case that lands the final chunk exactly on the 1024-byte
+  minimum-payload boundary that only applies to non-final chunks.
+- `negotiate(a, b)` and `negotiate(b, a)` agree on the effective minor, or both close with
+  `4426`, for arbitrary major/minor pairs.
+
+Run it with `cargo test --test properties`; it is part of `cargo test --all-targets
+--all-features`, so `bun run test` already runs it. Case counts are kept modest (64 to 256 per
+property) so the suite finishes in well under a second.
+
+### Fuzzing
+
+`fuzz/` is a `cargo-fuzz` crate with six libFuzzer targets under `fuzz/fuzz_targets/`:
+
+| Target                   | Exercises                                                                                                                                              |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `decode_line`            | `decode_line` over arbitrary bytes, at a bounded frame ceiling                                                                                         |
+| `line_decoder_push`      | `LineDecoder::push` fed the same bytes whole and split at random boundaries; the two must decode identical frames and agree on any refusal             |
+| `chunk_reassembler_push` | `ChunkReassembler::push` over an arbitrary message sequence; a refusal must always leave the reassembler reset                                         |
+| `validate`               | `validate` over a `Frame`, most of them built directly from structured input (`fuzz/src/lib.rs`'s `Script`) rather than hoping raw bytes parse as JSON |
+| `catalog_parse`          | `Catalog` parsing from arbitrary JSON bytes                                                                                                            |
+| `session_frames`         | a `Session` driven by a fuzzed frame stream over a scripted port, behind the crate's `tokio` feature                                                   |
+
+Every target is panic-free by construction: none calls `unwrap()` on fuzzer-controlled data.
+`session_frames` drives its `Session` over a port whose receive half replays a bounded,
+fuzzer-chosen sequence of frames and then a vanished-link closure, so termination is structural
+— the driver's loop ends the moment the scripted port runs out, the same way it would for a real
+peer that hung up — rather than depending on a wall-clock timeout.
+
+`fuzz/` is a cargo-fuzz crate, which needs nightly and libFuzzer; it carries its own `[workspace]`
+table and the root `Cargo.toml` excludes it, so it is never pulled into the stable build this
+repository otherwise targets. Run it with the nightly toolchain explicitly, from `fuzz/`:
+
+```console
+rustup toolchain install nightly
+cargo install cargo-fuzz
+cd fuzz
+cargo +nightly fuzz run decode_line -- -max_total_time=60
+# session_frames needs the tokio feature:
+cargo +nightly fuzz run --features tokio session_frames -- -max_total_time=60
+```
+
+A nightly `fuzz.yml` workflow runs all six targets for five minutes each and uploads their
+corpus and any crashing input as build artifacts; trigger it manually from the Actions tab
+(`workflow_dispatch`) to check a change before waiting for the schedule. It is deliberately not
+part of `ci.yml`'s `gate` job: a fuzz run's pass/fail is about coverage found that run, not a
+merge gate.
+
+A bug either layer finds becomes an `n_` or `i_` case under `spec/fixtures/1/` (see "The fixture
+corpus" above for the naming convention and which files are generated) plus the fix, with a
+regression test that fails first with the expected shape — the same rule as any other bug in this
+repository.

@@ -104,6 +104,7 @@ before the port exists.
 import {
   connectWebSocket,
   createWebSocketPort,
+  isOriginAllowed,
   outcomeOfBunSend,
   WEBSOCKET_SUBPROTOCOL,
   webSocketPort,
@@ -122,6 +123,12 @@ const { port, onMessage, onDrain, onClose } = createWebSocketPort({
 
 // a WHATWG WebSocket object on either side
 const port = webSocketPort(socket);
+
+// your framework owns the upgrade, so it owns the Origin check; this is the
+// comparison spec/fixtures/1/origins.json pins — exact, never a prefix.
+if (!isOriginAllowed(request.headers.get('origin') ?? undefined, ALLOWED_ORIGINS)) {
+  return new Response(null, { status: 403 });
+}
 ```
 
 The sink reports each send as sent, buffered or dropped, so the port can pause its queue under
@@ -153,11 +160,48 @@ const off = session.onEvent((frame) => console.log(frame.topic, frame.seq));
 session.onClose(({ code, reason, fatal }) => {
   if (!fatal) scheduleReconnect();
 });
-session.close(4000, 'released');
+// Resolves once every handler this side was running has settled, bounded by
+// `handlerGraceMs`; `closeNow` is the synchronous form for a caller that cannot await.
+await session.close(4000, 'released');
 ```
 
 Use the contract helper for typed calls; the raw API is for tooling and for the reserved
-`rpc.*` space the protocol may add.
+`rpc.*` space, of which the protocol defines one method:
+
+```ts
+// Serving a contract answers rpc.discover with its catalog, unless you say not to.
+contract.serve(session, handlers); // { discover: false } opts out
+
+// Reading the other side's: validated against catalog.json before it comes back.
+const catalog = await contract.client(session).discover();
+```
+
+`discover()` rejects with `METHOD_UNSUPPORTED` against a peer that serves no contract, and with
+`INVALID_REQUEST` against a wire 1.0 peer, which cannot have meant the method.
+
+## Resource caps
+
+A session bounds what the peer can make it hold, so a peer that opens requests and never
+cancels them cannot grow this side without limit.
+
+```ts
+const session = new Session(port, {
+  peer,
+  maxInFlight: 32, // requests this side answers at once; 256 by default
+  maxStreamKeys: 64, // stream keys this side emits on at once; 1024 by default
+});
+
+// What the peer said it will answer at once, so a caller can pace itself
+// instead of discovering the ceiling by being refused.
+const budget = session.remoteMaxInFlight;
+```
+
+`maxInFlight` is announced in `hello.limits`. Past it, a request is answered with `UNAVAILABLE`
+and `details.kind` of `in_flight_limit`; that refusal is **retryable** — send the same call
+again once one of yours has settled, and never latch on it the way you would on
+`METHOD_UNSUPPORTED`. `maxStreamKeys` is local and never announced: `emit` throws when a new key
+would pass it, because reaching it means this side leaked stream ids rather than that the peer
+did anything.
 
 ## Errors
 

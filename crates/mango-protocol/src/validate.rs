@@ -33,6 +33,11 @@ pub const MAX_REASON_CHARS: usize = 1024;
 pub const MIN_ANNOUNCED_FRAME_BYTES: u64 = 4096;
 /// Highest `limits.maxFrameBytes` the schema allows.
 pub const MAX_ANNOUNCED_FRAME_BYTES: u64 = 2_147_483_647;
+/// Lowest `limits.maxInFlight` the schema allows: a peer that answers nothing
+/// closes instead of announcing zero (§11.2).
+pub const MIN_ANNOUNCED_IN_FLIGHT: u64 = 1;
+/// Highest `limits.maxInFlight` the schema allows.
+pub const MAX_ANNOUNCED_IN_FLIGHT: u64 = 2_147_483_647;
 
 /// A frame member that broke a rule the JSON Schema states and serde cannot.
 ///
@@ -145,8 +150,9 @@ pub fn is_valid_method_name(name: &str) -> bool {
 
 /// True when `name` sits under the reserved `rpc.` segment.
 ///
-/// Such a name is schema-valid but a session refuses it: a method answers
-/// with `INVALID_REQUEST`, since wire 1.0 defines none there.
+/// Such a name belongs to the specification, never to an application. One the
+/// effective minor defines is served (see [`is_defined_reserved_method`]);
+/// every other is answered with `INVALID_REQUEST`.
 ///
 /// # Example
 ///
@@ -159,6 +165,32 @@ pub fn is_valid_method_name(name: &str) -> bool {
 #[must_use]
 pub fn is_reserved_method_name(name: &str) -> bool {
     name.starts_with(RPC_RESERVED_PREFIX)
+}
+
+/// The reserved method that answers with the responder's catalog (§6.4).
+pub const RPC_DISCOVER: &str = "rpc.discover";
+
+/// Effective minor from which [`RPC_DISCOVER`] is part of the wire.
+pub const RPC_DISCOVER_MINOR: u32 = 1;
+
+/// True when `name` is a reserved method this wire defines at
+/// `effective_minor`.
+///
+/// Every other `rpc.` name is refused with `INVALID_REQUEST`, `rpc.discover`
+/// against a 1.0 peer included: that peer cannot have meant this method.
+///
+/// # Example
+///
+/// ```
+/// use mango_protocol::validate::is_defined_reserved_method;
+///
+/// assert!(is_defined_reserved_method("rpc.discover", 1));
+/// assert!(!is_defined_reserved_method("rpc.discover", 0));
+/// assert!(!is_defined_reserved_method("rpc.unknown", 1));
+/// ```
+#[must_use]
+pub fn is_defined_reserved_method(name: &str, effective_minor: u32) -> bool {
+    name == RPC_DISCOVER && effective_minor >= RPC_DISCOVER_MINOR
 }
 
 /// True when the role matches `^[a-z][a-z0-9-]*$` and fits [`MAX_CODE_CHARS`].
@@ -240,17 +272,38 @@ fn check_method_name(field: &str, value: &str) -> Result<(), ValidationError> {
 }
 
 fn validate_limits(limits: &Limits) -> Result<(), ValidationError> {
-    let Some(bytes) = limits.max_frame_bytes else {
+    check_range(
+        "hello.limits.maxFrameBytes",
+        limits.max_frame_bytes,
+        MIN_ANNOUNCED_FRAME_BYTES,
+        MAX_ANNOUNCED_FRAME_BYTES,
+    )?;
+    check_range(
+        "hello.limits.maxInFlight",
+        limits.max_in_flight,
+        MIN_ANNOUNCED_IN_FLIGHT,
+        MAX_ANNOUNCED_IN_FLIGHT,
+    )
+}
+
+/// An optional announced ceiling, refused when it is present and outside its
+/// range. Absent is always fine: an absent limit is the default, not a zero.
+fn check_range(
+    field: &str,
+    value: Option<u64>,
+    minimum: u64,
+    maximum: u64,
+) -> Result<(), ValidationError> {
+    let Some(value) = value else {
         return Ok(());
     };
-    let minimum = MIN_ANNOUNCED_FRAME_BYTES;
-    if (minimum..=MAX_ANNOUNCED_FRAME_BYTES).contains(&bytes) {
+    if (minimum..=maximum).contains(&value) {
         return Ok(());
     }
     Err(ValidationError::new(
-        "hello.limits.maxFrameBytes",
-        bytes.to_string(),
-        format!("an integer from {minimum} to {MAX_ANNOUNCED_FRAME_BYTES}"),
+        field,
+        value.to_string(),
+        format!("an integer from {minimum} to {maximum}"),
     ))
 }
 
@@ -487,6 +540,7 @@ mod tests {
     fn hello_refuses_a_frame_ceiling_below_the_floor() {
         let limits = Limits {
             max_frame_bytes: Some(4095),
+            max_in_flight: None,
         };
         let error = validate(&hello_with("tool", Some(limits))).expect_err("4095 is refused");
         assert_eq!(error.field, "hello.limits.maxFrameBytes");
@@ -495,7 +549,30 @@ mod tests {
             validate(&hello_with(
                 "tool",
                 Some(Limits {
-                    max_frame_bytes: Some(4096)
+                    max_frame_bytes: Some(4096),
+                    max_in_flight: None,
+                })
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn hello_refuses_an_in_flight_ceiling_of_zero() {
+        let limits = Limits {
+            max_frame_bytes: None,
+            max_in_flight: Some(0),
+        };
+        let error = validate(&hello_with("tool", Some(limits))).expect_err("0 is refused");
+        assert_eq!(error.field, "hello.limits.maxInFlight");
+        assert_eq!(error.received, "0");
+        // Absent is the default, not a zero, and 1 is the floor a peer may say.
+        assert!(
+            validate(&hello_with(
+                "tool",
+                Some(Limits {
+                    max_frame_bytes: None,
+                    max_in_flight: Some(1),
                 })
             ))
             .is_ok()

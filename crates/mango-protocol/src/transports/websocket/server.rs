@@ -23,6 +23,91 @@ use crate::close::close_codes;
 
 use super::{WEBSOCKET_SUBPROTOCOL, WebSocketOptions, WebSocketPort, websocket_port};
 
+/// What an acceptor admits, beyond the port settings themselves.
+///
+/// `allowed_origins` is empty by default, which admits **no browser**: every
+/// upgrade carrying an `Origin` is refused with `4403`. That is the right
+/// configuration for an acceptor that only ever serves native clients, and the
+/// wrong one to leave in place for a hub a page dials — see
+/// `spec/transports/websocket.md`, Origin.
+///
+/// # Example
+///
+/// ```
+/// use mango_protocol::transports::websocket::WebSocketOptions;
+/// use mango_protocol::transports::websocket::server::AcceptOptions;
+///
+/// let options = AcceptOptions::from(WebSocketOptions::default())
+///     .with_allowed_origins(["https://app.example"]);
+/// assert_eq!(options.allowed_origins, ["https://app.example"]);
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct AcceptOptions {
+    /// How this connection chunks, reassembles and closes.
+    pub socket: WebSocketOptions,
+    /// Serialised origins a browser may dial from. Empty admits no browser.
+    pub allowed_origins: Vec<String>,
+}
+
+impl From<WebSocketOptions> for AcceptOptions {
+    fn from(socket: WebSocketOptions) -> Self {
+        Self {
+            socket,
+            allowed_origins: Vec::new(),
+        }
+    }
+}
+
+impl AcceptOptions {
+    /// Replaces the origin allow-list.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_protocol::transports::websocket::server::AcceptOptions;
+    ///
+    /// let options = AcceptOptions::default().with_allowed_origins(["https://app.example:8443"]);
+    /// assert!(options.allowed_origins.iter().any(|origin| origin.ends_with(":8443")));
+    /// ```
+    #[must_use]
+    pub fn with_allowed_origins<I, S>(mut self, allowed_origins: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allowed_origins = allowed_origins.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+/// True when `allowed` admits the `Origin` an upgrade carried.
+///
+/// The comparison is exact on the serialised origin, never a prefix, suffix or
+/// substring: `https://app.example.attacker.test` ends with no entry of
+/// `["https://app.example"]` and must not be admitted by one. There is no
+/// wildcard — an entry is one origin — and an empty list admits no browser.
+///
+/// An absent `Origin` is not a browser: no user agent attached one, so this
+/// check passes it through and the credential is what governs such a dialler.
+///
+/// # Example
+///
+/// ```
+/// use mango_protocol::transports::websocket::server::is_origin_allowed;
+///
+/// let allowed = ["https://app.example".to_string()];
+/// assert!(is_origin_allowed(Some("https://app.example"), &allowed));
+/// assert!(!is_origin_allowed(Some("https://app.example.attacker.test"), &allowed));
+/// assert!(is_origin_allowed(None, &[]));
+/// ```
+#[must_use]
+pub fn is_origin_allowed(origin: Option<&str>, allowed: &[String]) -> bool {
+    let Some(origin) = origin else {
+        return true;
+    };
+    allowed.iter().any(|entry| entry == origin)
+}
+
 /// Why an upgrade did not become a session.
 ///
 /// Every variant but [`AcceptError::Handshake`] happens *after* the upgrade
@@ -53,6 +138,13 @@ pub enum AcceptError {
         /// The close code the dialler can read.
         code: u16,
     },
+    /// The upgrade carried an `Origin` the acceptor does not allow-list, so a
+    /// page dialled this acceptor from a site it does not serve. The socket
+    /// was closed with `4403` and no `hello` was sent.
+    Origin {
+        /// The origin the upgrade carried, as the browser serialised it.
+        origin: String,
+    },
 }
 
 impl fmt::Display for AcceptError {
@@ -68,6 +160,12 @@ impl fmt::Display for AcceptError {
                 formatter,
                 "the credential was refused; the socket was closed with {code} and no hello was sent"
             ),
+            Self::Origin { origin } => write!(
+                formatter,
+                "the upgrade carried origin {origin:?}, which this acceptor does not allow-list; \
+                 the socket was closed with {} and no hello was sent",
+                close_codes::FORBIDDEN
+            ),
         }
     }
 }
@@ -75,17 +173,21 @@ impl fmt::Display for AcceptError {
 impl std::error::Error for AcceptError {}
 
 /// Completes the upgrade on `io` and returns the port, having selected the
-/// subprotocol and put the credential to `authorize`.
+/// subprotocol, applied the origin allow-list and put the upgrade to
+/// `authorize`.
 ///
-/// `authorize` is handed the bearer token from `Authorization: Bearer
-/// <token>`, or `None` when the dialler sent no credential, and answers with
-/// the close code to refuse it with. It runs **before** any `hello`, which is
-/// the guarantee websocket.md asks for: a peer whose credential is no good
-/// never sees this side's identity.
+/// `authorize` is handed what the upgrade said — the bearer token from
+/// `Authorization: Bearer <token>`, the `Origin` — and answers with the close
+/// code to refuse it with. It runs **before** any `hello`, which is the
+/// guarantee websocket.md asks for: a peer whose credential is no good never
+/// sees this side's identity.
 ///
-/// The subprotocol is echoed only when it was offered. A dialler that offered
-/// nothing is closed with `4400` rather than left on a socket neither side
-/// agrees about.
+/// Two checks run before `authorize` ever does. The subprotocol is echoed only
+/// when it was offered, and a dialler that offered nothing is closed with
+/// `4400` rather than left on a socket neither side agrees about. An upgrade
+/// carrying an `Origin` outside [`AcceptOptions::allowed_origins`] is closed
+/// with `4403`: the default list is empty, so a hub a browser is meant to dial
+/// must say which sites it serves.
 ///
 /// # Example
 ///
@@ -102,8 +204,8 @@ impl std::error::Error for AcceptError {}
 /// let listener = TcpListener::bind("127.0.0.1:0").await?;
 /// let (socket, _address) = listener.accept().await?;
 ///
-/// let port = accept_websocket(socket, WebSocketOptions::default(), |token| {
-///     match token {
+/// let port = accept_websocket(socket, WebSocketOptions::default(), |upgrade| {
+///     match upgrade.bearer() {
 ///         Some("s3cret") => Ok(()),
 ///         _ => Err(close_codes::UNAUTHORIZED),
 ///     }
@@ -119,20 +221,22 @@ impl std::error::Error for AcceptError {}
 /// # Errors
 ///
 /// [`AcceptError`] for an upgrade that failed, a dialler that did not offer
-/// the subprotocol, or a credential `authorize` refused.
+/// the subprotocol, an `Origin` outside the allow-list, or a credential
+/// `authorize` refused.
 #[allow(
     clippy::result_large_err,
     reason = "the handshake callback's error type is tungstenite's own ErrorResponse"
 )]
 pub async fn accept_websocket<S, F>(
     io: S,
-    options: WebSocketOptions,
+    options: impl Into<AcceptOptions>,
     authorize: F,
 ) -> Result<WebSocketPort<S>, AcceptError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    F: FnOnce(Option<&str>) -> Result<(), u16>,
+    F: FnOnce(&Upgrade) -> Result<(), u16>,
 {
+    let options = options.into();
     let observed = Arc::new(Mutex::new(Upgrade::default()));
     let recorder = Arc::clone(&observed);
     let stream = accept_hdr_async_with_config(
@@ -152,7 +256,7 @@ where
             }
             Ok(response)
         },
-        Some(options.socket_config()),
+        Some(options.socket.socket_config()),
     )
     .await
     .map_err(|error| AcceptError::Handshake(error.to_string()))?;
@@ -171,21 +275,70 @@ where
         .await;
         return Err(AcceptError::Subprotocol);
     }
-    if let Err(code) = authorize(upgrade.bearer.as_deref()) {
+    if upgrade.origin_undecodable || !is_origin_allowed(upgrade.origin(), &options.allowed_origins)
+    {
+        let origin = if upgrade.origin_undecodable {
+            "<undecodable>".to_string()
+        } else {
+            upgrade.origin().unwrap_or_default().to_string()
+        };
+        close_with(stream, close_codes::FORBIDDEN, "origin not allowed").await;
+        return Err(AcceptError::Origin { origin });
+    }
+    if let Err(code) = authorize(&upgrade) {
         close_with(stream, code, "credential refused").await;
         return Err(AcceptError::Unauthorized { code });
     }
-    Ok(websocket_port(stream, options))
+    Ok(websocket_port(stream, options.socket))
 }
 
-/// What the upgrade request said, read once inside the handshake callback.
+/// What the upgrade request said, read once inside the handshake callback and
+/// handed to the `authorize` closure of [`accept_websocket`].
 #[derive(Debug, Clone, Default)]
-struct Upgrade {
+#[non_exhaustive]
+pub struct Upgrade {
     offered_subprotocol: bool,
     bearer: Option<String>,
+    origin: Option<String>,
+    /// The upgrade carried an `Origin` header, but its bytes were not valid
+    /// UTF-8 — distinct from no header at all: absent is a native dialler,
+    /// undecodable is a browser sending something [`Upgrade::origin`] cannot
+    /// represent. Refused the same as any origin outside the allow-list,
+    /// never treated as "no origin attached".
+    origin_undecodable: bool,
 }
 
 impl Upgrade {
+    /// The token of an `Authorization: Bearer <token>` header, when the
+    /// dialler sent one this side can read.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_protocol::transports::websocket::server::Upgrade;
+    ///
+    /// assert_eq!(Upgrade::default().bearer(), None);
+    /// ```
+    #[must_use]
+    pub fn bearer(&self) -> Option<&str> {
+        self.bearer.as_deref()
+    }
+
+    /// The `Origin` header, serialised as the browser sent it. `None` means
+    /// no user agent attached one, which is what a native dialler looks like.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_protocol::transports::websocket::server::Upgrade;
+    ///
+    /// assert_eq!(Upgrade::default().origin(), None);
+    /// ```
+    #[must_use]
+    pub fn origin(&self) -> Option<&str> {
+        self.origin.as_deref()
+    }
+
     fn read(request: &Request) -> Self {
         let headers = request.headers();
         let offered_subprotocol = headers
@@ -200,9 +353,16 @@ impl Upgrade {
             .and_then(|value| value.to_str().ok())
             .and_then(bearer_token)
             .map(ToOwned::to_owned);
+        let origin_header = headers.get(header::ORIGIN);
+        let origin = origin_header
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let origin_undecodable = origin_header.is_some() && origin.is_none();
         Self {
             offered_subprotocol,
             bearer,
+            origin,
+            origin_undecodable,
         }
     }
 }
@@ -295,6 +455,24 @@ mod tests {
         assert_eq!(bearer_token("Bearer"), None);
         assert_eq!(bearer_token("Bearer "), None);
         assert_eq!(bearer_token("Basic abc"), None);
+    }
+
+    #[test]
+    fn an_undecodable_origin_is_not_the_same_as_no_origin() {
+        use tokio_tungstenite::tungstenite::http::HeaderValue;
+
+        let absent = Upgrade::read(&request(&[]));
+        assert_eq!(absent.origin(), None);
+        assert!(!absent.origin_undecodable);
+
+        let mut with_undecodable = request(&[]);
+        with_undecodable.headers_mut().insert(
+            header::ORIGIN,
+            HeaderValue::from_bytes(b"\xff\xfe").expect("raw bytes are a valid header value"),
+        );
+        let undecodable = Upgrade::read(&with_undecodable);
+        assert_eq!(undecodable.origin(), None);
+        assert!(undecodable.origin_undecodable);
     }
 
     #[test]

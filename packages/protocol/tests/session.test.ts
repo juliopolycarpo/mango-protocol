@@ -5,6 +5,7 @@ import type { Port, PortClosure } from '../src/port';
 import type { Frame, HelloFrame } from '../src/schemas/frames';
 import { Session, type SessionOptions } from '../src/session';
 import { createInProcessPortPair } from '../src/transports/in-process';
+import { PROTOCOL_MINOR } from '../src/version';
 
 const HUB: SessionOptions['peer'] = { name: 'hub', version: '1.0.0', role: 'hub' };
 const RUNTIME: SessionOptions['peer'] = { name: 'runtime', version: '1.0.0', role: 'runtime' };
@@ -45,6 +46,34 @@ class FakePort implements Port {
 
   report(closure: PortClosure): void {
     this.#closed?.(closure);
+  }
+}
+
+/** Wraps a real port and throws instead of sending when `shouldFail` matches. */
+class FailingSendPort implements Port {
+  readonly #inner: Port;
+  readonly #shouldFail: (frame: Frame) => boolean;
+
+  constructor(inner: Port, shouldFail: (frame: Frame) => boolean) {
+    this.#inner = inner;
+    this.#shouldFail = shouldFail;
+  }
+
+  send(frame: Frame): void {
+    if (this.#shouldFail(frame)) throw new Error('the transport refused this frame');
+    this.#inner.send(frame);
+  }
+
+  onFrame(listener: (frame: Frame) => void): () => void {
+    return this.#inner.onFrame(listener);
+  }
+
+  onClosed(listener: (closure: PortClosure) => void): () => void {
+    return this.#inner.onClosed(listener);
+  }
+
+  close(code: number, reason?: string): void {
+    this.#inner.close(code, reason);
   }
 }
 
@@ -96,7 +125,7 @@ describe('Session handshake', () => {
     expect(fromHub.peer).toEqual(RUNTIME);
     expect(fromRuntime.peer).toEqual(HUB);
     expect(fromRuntime.capabilities).toEqual({ audit: true });
-    expect(hub.remote.effectiveMinor).toBe(0);
+    expect(hub.remote.effectiveMinor).toBe(PROTOCOL_MINOR);
     hub.close();
   });
 
@@ -119,6 +148,27 @@ describe('Session handshake', () => {
       code: CLOSE_CODES.PROTOCOL_ERROR,
       reason: 'handshake timeout',
     });
+  });
+
+  it('never reuses a request id within a session', async () => {
+    const ports = createInProcessPortPair();
+    const recorder = new FrameRecorder(ports.b);
+    const hub = new Session(ports.a, { peer: HUB, livenessIntervalMs: false });
+    const runtime = new Session(ports.b, {
+      peer: RUNTIME,
+      livenessIntervalMs: false,
+      handlers: { 'test.echo': (params) => params },
+    });
+    await Promise.all([hub.ready, runtime.ready]);
+
+    // §6.1 binds the requester, not the responder: each request settles before
+    // the next goes out, so nothing but a fresh id can keep them distinct.
+    for (let index = 0; index < 4; index += 1) await hub.request('test.echo', index);
+
+    const ids = recorder.frames.filter((frame) => frame.type === 'req').map((frame) => frame.id);
+    expect(ids).toHaveLength(4);
+    expect(new Set(ids).size).toBe(ids.length);
+    hub.close();
   });
 
   it('answers a request that arrives before the handshake with UNAVAILABLE', async () => {
@@ -165,13 +215,133 @@ describe('Session handshake', () => {
   });
 });
 
+describe('Session close', () => {
+  it('resolves after every in-flight handler has settled', async () => {
+    const ports = createInProcessPortPair();
+    let released = (): void => undefined;
+    let started = (): void => undefined;
+    const firstCall = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let finished = false;
+    const responder = new Session(ports.b, {
+      peer: RUNTIME,
+      livenessIntervalMs: false,
+      handlers: {
+        'test.slow': async () => {
+          started();
+          await new Promise<void>((resolve) => {
+            released = resolve;
+          });
+          finished = true;
+          return null;
+        },
+      },
+    });
+    const hub = new Session(ports.a, { peer: HUB, livenessIntervalMs: false });
+    await Promise.all([hub.ready, responder.ready]);
+    void hub.request('test.slow', {}).catch(() => undefined);
+    await firstCall;
+
+    const closing = responder.close();
+    // Teardown is synchronous, so the state is already closed; the promise is
+    // about the handler, which is still running.
+    expect(responder.state).toBe('closed');
+    expect(finished).toBe(false);
+    released();
+    const closure = await closing;
+
+    expect(finished).toBe(true);
+    expect(closure.code).toBe(CLOSE_CODES.RELEASED);
+    hub.closeNow();
+  });
+
+  it('gives up on a handler that ignores its abort signal after the grace', async () => {
+    const ports = createInProcessPortPair();
+    const responder = new Session(ports.b, {
+      peer: RUNTIME,
+      livenessIntervalMs: false,
+      handlerGraceMs: 20,
+      // Never settles, and never looks at the signal: the shutdown is delayed
+      // by an unkillable handler but must not be blocked by one.
+      handlers: { 'test.stuck': () => new Promise(() => undefined) },
+    });
+    const hub = new Session(ports.a, { peer: HUB, livenessIntervalMs: false });
+    await Promise.all([hub.ready, responder.ready]);
+    void hub.request('test.stuck', {}).catch(() => undefined);
+    await tick();
+
+    const closure = await responder.close(CLOSE_CODES.RELEASED, 'grace');
+    expect(closure.reason).toBe('grace');
+    hub.closeNow();
+  });
+
+  it('a handler awaiting its own close() stalls to the grace, not forever', async () => {
+    const ports = createInProcessPortPair();
+    let started = 0;
+    let finished = 0;
+    let handlerSettled: () => void = () => undefined;
+    const handlerDone = new Promise<void>((resolve) => {
+      handlerSettled = resolve;
+    });
+    const responder = new Session(ports.b, {
+      peer: RUNTIME,
+      livenessIntervalMs: false,
+      handlerGraceMs: 20,
+      handlers: {
+        // `close()` waits on every in-flight handler, this one included: it
+        // cannot tell "called from inside a running handler" apart from any
+        // other caller, so this call resolves only once the grace elapses.
+        'test.closes-itself': async (_params, context) => {
+          // A prior await, matching the shape that actually stalls: it lets
+          // this handler's own dispatch promise land in `#dispatches` before
+          // `close()` is called, so `close()` ends up waiting on it.
+          await Promise.resolve();
+          started = Date.now();
+          await context.session.close();
+          finished = Date.now();
+          handlerSettled();
+          return null;
+        },
+      },
+    });
+    const hub = new Session(ports.a, { peer: HUB, livenessIntervalMs: false });
+    await Promise.all([hub.ready, responder.ready]);
+    void hub.request('test.closes-itself', {}).catch(() => undefined);
+
+    // Timed on the handler's own call, not a second close() from here: a
+    // second call would race the first and could resolve sooner than a full
+    // grace period, which is not the property this test is pinning down.
+    await handlerDone;
+    expect(finished - started).toBeGreaterThanOrEqual(15);
+    hub.closeNow();
+  });
+
+  it('closeNow tears down without waiting, and closing twice is a no-op', async () => {
+    const { hub, runtime } = pair();
+    await Promise.all([hub.ready, runtime.ready]);
+
+    hub.closeNow(CLOSE_CODES.SUPERSEDED, 'replaced');
+    expect(hub.state).toBe('closed');
+    expect(hub.closure).toMatchObject({ code: CLOSE_CODES.SUPERSEDED, reason: 'replaced' });
+
+    // A second close keeps the first reason; nothing is re-torn-down.
+    const again = await hub.close(CLOSE_CODES.RELEASED, 'later');
+    expect(again).toMatchObject({ code: CLOSE_CODES.SUPERSEDED, reason: 'replaced' });
+    runtime.closeNow();
+  });
+});
+
 describe('Session requests', () => {
   it('rejects an invalid or reserved method name locally', async () => {
     const { hub } = pair();
     await expect(hub.request('nodots', {})).rejects.toMatchObject({
       code: RESERVED_ERROR_CODES.INVALID_REQUEST,
     });
-    await expect(hub.request('rpc.discover', {})).rejects.toMatchObject({
+    // `rpc.nowhere`, not `rpc.discover`: a reserved name this wire *defines*
+    // is refused only once the effective minor is known, so it waits for the
+    // handshake. Every other rpc. name never reaches the wire at all.
+    await expect(hub.request('rpc.nowhere', {})).rejects.toMatchObject({
       code: RESERVED_ERROR_CODES.INVALID_REQUEST,
     });
     hub.close();
@@ -296,6 +466,28 @@ describe('Session events and liveness', () => {
     expect(session.emit({ topic: 'test.ok', payload: 1 })).toBe(true);
     session.close();
     expect(session.emit({ topic: 'test.late', payload: 1 })).toBe(false);
+  });
+
+  it('does not count a stream key whose send failed toward the ceiling', async () => {
+    const ports = createInProcessPortPair();
+    let failNextEvent = false;
+    const port = new FailingSendPort(ports.a, (frame) => failNextEvent && frame.type === 'evt');
+    const session = new Session(port, {
+      peer: HUB,
+      livenessIntervalMs: false,
+      maxStreamKeys: 1,
+    });
+    ports.b.send(rawHello());
+    await session.ready;
+
+    failNextEvent = true;
+    expect(() => session.emit({ topic: 'test.a', payload: null })).toThrow(
+      'the transport refused this frame'
+    );
+    failNextEvent = false;
+    // The failed emit above must not have left "test.a" occupying the one
+    // stream key this session allows: a different key still fits.
+    expect(session.emit({ topic: 'test.b', payload: null })).toBe(true);
   });
 
   it('closes with a liveness timeout when pongs stop', async () => {

@@ -30,7 +30,11 @@ pub use handle::{
     EventInput, EventStream, PongStream, RemotePeer, RequestOptions, Session, SessionState,
 };
 pub use handler::{CallContext, Handler, HandlerFuture, HandlerGuard};
-pub use options::SessionOptions;
+pub use options::{
+    DEFAULT_HANDLER_GRACE, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_LIVENESS_INTERVAL,
+    DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_STREAM_KEYS, DEFAULT_REQUEST_ID_PREFIX,
+    HANDSHAKE_TIMEOUT_REASON, IN_FLIGHT_LIMIT_KIND, STREAM_KEY_LIMIT_KIND, SessionOptions,
+};
 pub use teardown::SessionClosure;
 
 use shared::{Inner, Shared};
@@ -71,6 +75,8 @@ impl Session {
             local_protocol: options.protocol,
             local_capabilities: options.capabilities,
             local_max_frame_bytes,
+            max_in_flight: options.max_in_flight,
+            max_stream_keys: options.max_stream_keys,
             inner: Mutex::new(Inner {
                 state: SessionState::Handshaking,
                 remote: None,

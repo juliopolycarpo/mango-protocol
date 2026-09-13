@@ -9,8 +9,10 @@
 
 import { expect } from 'bun:test';
 import { fileURLToPath } from 'node:url';
+import catalogExample from '../../../../spec/fixtures/1/catalog-example.json';
 import { CLOSE_CODES } from '../../src/close';
 import { CHUNK_HEADER_BYTES } from '../../src/codec/chunk';
+import { assertCatalog } from '../../src/schemas/catalog';
 import type { Session } from '../../src/session';
 import { rejectionOf } from '../../src/testing/rejection';
 
@@ -175,6 +177,14 @@ export async function expectMangoPeerBehaviour(session: Session): Promise<void> 
   expect(
     await rejectionOf(session.request('test.refuse', { code: 'DENIED', message: 'no' }))
   ).toMatchObject({ code: 'DENIED', details: { echoed: true } });
+
+  // The peer publishes the shared example catalog, so both halves compare
+  // what crossed the wire against the same file on disk rather than against
+  // a copy of it. `assertCatalog` is this SDK's own check of the peer's
+  // document, which is the half a cross-language test can really prove.
+  const discovered = await session.request('rpc.discover', {});
+  assertCatalog(discovered);
+  expect(discovered).toEqual(catalogExample);
 
   const controller = new AbortController();
   const cancelled = rejectionOf(session.request('test.forever', {}, { signal: controller.signal }));

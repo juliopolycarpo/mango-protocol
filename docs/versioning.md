@@ -6,7 +6,8 @@ depends on the SDK.
 ## Two numbers
 
 - The **wire version** is what two peers negotiate in `hello`: `{ major, minor }`. Both SDKs
-  export it as `PROTOCOL_VERSION`. Wire 1.0 is the current one.
+  export it as `PROTOCOL_VERSION`. Wire 1.1 is the current one; `spec/versioning.md` lists what
+  each minor added.
 - The **package version** is what you pin in `package.json` or `Cargo.toml`. Both packages
   share it and release together. Its changelog names the highest wire minor each release
   implements.

@@ -137,6 +137,36 @@ let result = a.request("fs.read-file", serde_json::json!({ "path": "README.md" }
 `cargo run --example session_pair --features tokio` runs a fuller version end to end: a request,
 an event stream and a cancelled call between two in-process sessions.
 
+Serving a contract answers `rpc.discover` with its catalog unless `ServeOptions { discover:
+false, .. }` says otherwise, and `ContractClient::discover` reads the other side's:
+
+```rust
+let catalog = contract.client(&session).discover().await?;
+let theirs = Contract::from_catalog(catalog)?; // the peer's document, checked like your own
+```
+
+`discover` fails with `METHOD_UNSUPPORTED` against a peer that serves no contract, and with
+`INVALID_REQUEST` against a wire 1.0 peer, which cannot have meant the method.
+
+A session bounds what the peer can make it hold, so a peer that opens requests and never cancels
+them cannot grow this side without limit:
+
+```rust
+let options = SessionOptions::new(peer("runtime"))
+    .with_max_in_flight(32)   // requests this side answers at once; 256 by default
+    .with_max_stream_keys(64); // stream keys this side emits on at once; 1024 by default
+
+// What the peer said it will answer at once, so a caller can pace itself
+// instead of discovering the ceiling by being refused.
+let budget = a.remote_max_in_flight();
+```
+
+`max_in_flight` is announced in `hello.limits`. Past it, a request is answered with `UNAVAILABLE`
+and `details.kind` of `in_flight_limit`; that refusal is **retryable** — send the same call again
+once one of yours has settled, and never latch on it the way you would on `METHOD_UNSUPPORTED`.
+`max_stream_keys` is local and never announced: `emit` returns `Err` when a new key would pass
+it, because reaching it means this side leaked stream ids rather than that the peer did anything.
+
 ## Serve a contract
 
 A `Contract` (see [Build a contract](build-a-contract.md)) wraps a session with schema
@@ -185,7 +215,7 @@ already run:
 
 ```rust
 use mango_protocol::transports::websocket::client::{WebSocketConnectOptions, connect_websocket};
-use mango_protocol::transports::websocket::server::accept_websocket;
+use mango_protocol::transports::websocket::server::{AcceptOptions, accept_websocket};
 use mango_protocol::transports::websocket::{WebSocketOptions, websocket_port};
 
 let options = WebSocketConnectOptions::default().with_bearer(token);
@@ -194,11 +224,20 @@ let port = connect_websocket("wss://hub.example/runtime", &options, &deadline).a
 // Accepting: the credential is checked before any hello, so a peer whose
 // token is no good never learns who you are. It reads the code off the close
 // because the upgrade completed first.
-let port = accept_websocket(socket, WebSocketOptions::default(), |token| match token {
-    Some(t) if known(t) => Ok(()),
-    _ => Err(close_codes::UNAUTHORIZED),
+let port = accept_websocket(socket, WebSocketOptions::default(), |upgrade| {
+    match upgrade.bearer() {
+        Some(t) if known(t) => Ok(()),
+        _ => Err(close_codes::UNAUTHORIZED),
+    }
 })
 .await?;
+
+// An acceptor a browser dials says which sites it serves. The default list is
+// empty, which refuses every upgrade that carries an Origin at all — right for
+// a hub only native clients reach, wrong to leave in place for one a page dials.
+let options = AcceptOptions::from(WebSocketOptions::default())
+    .with_allowed_origins(["https://app.example"]);
+let port = accept_websocket(socket, options, |upgrade| authorize(upgrade.bearer())).await?;
 
 // Or, if you already upgraded the socket yourself:
 let port = websocket_port(already_upgraded, WebSocketOptions::default());

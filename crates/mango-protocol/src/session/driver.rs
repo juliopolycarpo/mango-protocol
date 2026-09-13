@@ -13,6 +13,7 @@ use crate::codec::ndjson::DEFAULT_MAX_FRAME_BYTES;
 use crate::error::{RemoteError, codes};
 use crate::frame::{Cancel, Frame, Hello, Limits};
 use crate::port::{Inbound, PortClosure, PortRx, PortTx, SendOutcome};
+use crate::session::DEFAULT_MAX_IN_FLIGHT;
 use crate::version::{Negotiation, negotiate};
 
 use super::command::Command;
@@ -233,9 +234,15 @@ impl<Tx: PortTx, Rx: PortRx> SessionDriver<Tx, Rx> {
             protocol: self.shared.local_protocol,
             peer: self.shared.local_peer.clone(),
             capabilities: self.shared.local_capabilities.clone(),
-            limits: (self.shared.local_max_frame_bytes < DEFAULT_MAX_FRAME_BYTES).then(|| Limits {
-                max_frame_bytes: Some(self.shared.local_max_frame_bytes as u64),
-            }),
+            // Announced whole, never gated on the effective minor: nobody
+            // knows it yet, and §4 has a 1.0 peer ignore what it cannot read.
+            limits: Some(Limits {
+                max_frame_bytes: (self.shared.local_max_frame_bytes < DEFAULT_MAX_FRAME_BYTES)
+                    .then(|| self.shared.local_max_frame_bytes as u64),
+                max_in_flight: (self.shared.max_in_flight != DEFAULT_MAX_IN_FLIGHT)
+                    .then(|| self.shared.max_in_flight as u64),
+            })
+            .filter(|limits| limits != &Limits::default()),
         }
     }
 }
@@ -457,6 +464,6 @@ fn on_handshake_timeout(shared: &Shared, handshake_timeout: Duration) -> Teardow
     .with_detail("timeout_ms", millis)));
     Teardown::Local {
         code: close_codes::PROTOCOL_ERROR,
-        reason: Some("handshake timeout".into()),
+        reason: Some(super::options::HANDSHAKE_TIMEOUT_REASON.into()),
     }
 }

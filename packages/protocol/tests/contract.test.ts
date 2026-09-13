@@ -98,6 +98,83 @@ describe('defineContract', () => {
     b.close();
   });
 
+  it('answers rpc.discover with the served catalog', async () => {
+    const { a, b } = sessions();
+    const off = contract.serve(b, {
+      'text.echo': ({ text }) => ({ text }),
+      'math.add': ({ a: x, b: y }) => x + y,
+    });
+
+    const discovered = await contract.client(a).discover();
+    expect(discovered).toEqual(contract.catalog());
+    // The peer's document, checked against catalog.json before a caller reads
+    // a member off it.
+    assertCatalog(discovered);
+
+    // Unregistered with the rest: a peer that stopped serving stops answering.
+    off();
+    await expect(contract.client(a).discover()).rejects.toMatchObject({
+      code: RESERVED_ERROR_CODES.METHOD_UNSUPPORTED,
+    });
+    a.close();
+    b.close();
+  });
+
+  it('refuses rpc.discover params that are not an object', async () => {
+    const { a, b } = sessions();
+    contract.serve(b, {
+      'text.echo': ({ text }) => ({ text }),
+      'math.add': ({ a: x, b: y }) => x + y,
+    });
+    // §6.4 defines rpc.discover's parameters as an object; a raw request
+    // that sends anything else must not reach the catalog.
+    await expect(a.request('rpc.discover', null)).rejects.toMatchObject({
+      code: RESERVED_ERROR_CODES.INVALID_PARAMS,
+    });
+    a.close();
+    b.close();
+  });
+
+  it('builds the catalog before registering any method handler', async () => {
+    const { a, b } = sessions();
+    // Not eagerly checked by `defineContract`: only method/topic names are.
+    const badContract = defineContract({
+      name: '',
+      version: '1',
+      methods: {
+        'text.echo': {
+          params: Type.Object({ text: Type.String() }),
+          result: Type.Object({ text: Type.String() }),
+        },
+      },
+    });
+    expect(() => badContract.serve(b, { 'text.echo': ({ text }) => ({ text }) })).toThrow();
+    // If a method handler had already been registered before the catalog
+    // build failed, this would answer instead of refusing.
+    await expect(a.request('text.echo', { text: 'hi' })).rejects.toMatchObject({
+      code: RESERVED_ERROR_CODES.METHOD_UNSUPPORTED,
+    });
+    a.close();
+    b.close();
+  });
+
+  it('leaves rpc.discover unanswered when the catalog is not offered', async () => {
+    const { a, b } = sessions();
+    contract.serve(
+      b,
+      { 'text.echo': ({ text }) => ({ text }), 'math.add': ({ a: x, b: y }) => x + y },
+      { discover: false }
+    );
+
+    await expect(contract.client(a).discover()).rejects.toMatchObject({
+      code: RESERVED_ERROR_CODES.METHOD_UNSUPPORTED,
+    });
+    // Opting out of the catalog does not opt out of the contract.
+    expect(await contract.client(a).request('text.echo', { text: 'hi' })).toEqual({ text: 'hi' });
+    a.close();
+    b.close();
+  });
+
   it('refuses parameters that fail the schema with INVALID_PARAMS and a path', async () => {
     const { a, b } = sessions();
     contract.serve(b, {
@@ -137,6 +214,55 @@ describe('defineContract', () => {
     expect(seen).toEqual([['text.echo', 'echo'], ['math.add']]);
     a.close();
     b.close();
+  });
+
+  it('gives the guard the validated params, the in-flight count and the peer', async () => {
+    const { a, b } = sessions();
+    const seen: { params: unknown; inFlight: number; peer: string; method: string }[] = [];
+    contract.serve(
+      b,
+      { 'text.echo': ({ text }) => ({ text }), 'math.add': ({ a: x, b: y }) => x + y },
+      {
+        guard: (_method, _capabilities, context) => {
+          seen.push({
+            params: context.params,
+            inFlight: context.inFlight,
+            peer: context.remote.peer.name,
+            method: context.method,
+          });
+        },
+      }
+    );
+
+    expect(await a.request('text.echo', { text: 'hi' })).toEqual({ text: 'hi' });
+    expect(seen).toEqual([{ params: { text: 'hi' }, inFlight: 1, peer: 'a', method: 'text.echo' }]);
+    await a.close();
+    await b.close();
+  });
+
+  it('refuses parameters before the guard ever sees them', async () => {
+    const { a, b } = sessions();
+    let guarded = 0;
+    contract.serve(
+      b,
+      { 'text.echo': ({ text }) => ({ text }), 'math.add': ({ a: x, b: y }) => x + y },
+      {
+        guard: () => {
+          guarded += 1;
+        },
+      }
+    );
+
+    // A policy that logs, counts or audits a refusal must never be handed
+    // parameters the contract itself refuses.
+    await expect(a.request('text.echo', { text: 42 })).rejects.toMatchObject({
+      code: RESERVED_ERROR_CODES.INVALID_PARAMS,
+    });
+    expect(guarded).toBe(0);
+    expect(await a.request('text.echo', { text: 'hi' })).toEqual({ text: 'hi' });
+    expect(guarded).toBe(1);
+    await a.close();
+    await b.close();
   });
 
   it('validates results when asked', async () => {

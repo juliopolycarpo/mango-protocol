@@ -3,9 +3,9 @@ import {
   compareDefinitions,
   crossFileDefinitions,
   type Definitions,
-  differences,
   isConstTaggedUnion,
-  normalise,
+  normalizeSchema,
+  schemaDifferences,
   stripNullAlternative,
 } from './schema-equality';
 
@@ -47,12 +47,12 @@ describe('stripNullAlternative', () => {
   });
 });
 
-describe('normalise', () => {
+describe('normalizeSchema', () => {
   const definitions: Definitions = { id: { type: 'string', minLength: 1, description: 'id' } };
 
   it('inlines $ref, drops annotations and format, and sorts keys', () => {
     expect(
-      normalise(
+      normalizeSchema(
         { $ref: '#/$defs/id', description: 'req id', format: 'uuid', title: 'x' },
         definitions
       )
@@ -61,12 +61,12 @@ describe('normalise', () => {
 
   it('inlines a $ref hidden behind a schemars null alternative', () => {
     const schema = { anyOf: [{ $ref: '#/$defs/id' }, { type: 'null' }] };
-    expect(normalise(schema, definitions)).toEqual({ minLength: 1, type: 'string' });
+    expect(normalizeSchema(schema, definitions)).toEqual({ minLength: 1, type: 'string' });
   });
 
   it('turns a const-tagged anyOf into oneOf and drops additionalProperties: true', () => {
     const schema = { anyOf: [{ ...ping, additionalProperties: true }, pong] };
-    expect(normalise(schema, {})).toEqual({
+    expect(normalizeSchema(schema, {})).toEqual({
       oneOf: [
         { properties: { type: { const: 'ping', type: 'string' } }, type: 'object' },
         { properties: { type: { const: 'pong', type: 'string' } }, type: 'object' },
@@ -75,8 +75,49 @@ describe('normalise', () => {
   });
 
   it('keeps additionalProperties: false, which changes meaning', () => {
-    expect(normalise({ type: 'object', additionalProperties: false }, {})).toEqual({
+    expect(normalizeSchema({ type: 'object', additionalProperties: false }, {})).toEqual({
       additionalProperties: false,
+      type: 'object',
+    });
+  });
+
+  it('keeps a member whose name collides with a dropped keyword', () => {
+    // catalog.json declares a member literally called `description`. Dropping
+    // annotation keywords inside `properties` erased it from both sides, so
+    // two emitters that disagreed about it compared equal.
+    const schema = {
+      type: 'object',
+      properties: {
+        description: { type: 'string' },
+        format: { type: 'string' },
+        name: { type: 'string', description: 'dropped: this one is an annotation' },
+      },
+    };
+
+    expect(normalizeSchema(schema, {})).toEqual({
+      properties: {
+        description: { type: 'string' },
+        format: { type: 'string' },
+        name: { type: 'string' },
+      },
+      type: 'object',
+    });
+  });
+
+  it('reports a divergence in a member called description', () => {
+    const mine = { type: 'object', properties: { description: { type: 'string' } } };
+    const theirs = { type: 'object', properties: { description: { type: 'number' } } };
+
+    expect(schemaDifferences(normalizeSchema(mine, {}), normalizeSchema(theirs, {}))).toEqual([
+      '/properties/description/type: expected "string", got "number"',
+    ]);
+  });
+
+  it('resolves a $ref inside a member whose name is a dropped keyword', () => {
+    const schema = { type: 'object', properties: { description: { $ref: '#/$defs/id' } } };
+
+    expect(normalizeSchema(schema, definitions)).toEqual({
+      properties: { description: { minLength: 1, type: 'string' } },
       type: 'object',
     });
   });
@@ -86,28 +127,28 @@ describe('normalise', () => {
       ...crossFileDefinitions('protocol.json', definitions),
       local: { type: 'number' },
     };
-    expect(normalise({ $ref: 'protocol.json#/$defs/id' }, merged)).toEqual({
+    expect(normalizeSchema({ $ref: 'protocol.json#/$defs/id' }, merged)).toEqual({
       minLength: 1,
       type: 'string',
     });
-    expect(normalise({ $ref: '#/$defs/local' }, merged)).toEqual({ type: 'number' });
+    expect(normalizeSchema({ $ref: '#/$defs/local' }, merged)).toEqual({ type: 'number' });
   });
 
   it('names an unresolvable $ref', () => {
-    expect(() => normalise({ $ref: '#/$defs/nope' }, definitions)).toThrow(
+    expect(() => normalizeSchema({ $ref: '#/$defs/nope' }, definitions)).toThrow(
       'unresolvable $ref #/$defs/nope; expected a #/$defs entry or a merged cross-file key'
     );
   });
 });
 
-describe('differences', () => {
+describe('schemaDifferences', () => {
   it('is empty for equal schemas regardless of key order', () => {
-    expect(differences({ a: 1, b: [1, { c: 2 }] }, { b: [1, { c: 2 }], a: 1 })).toEqual([]);
+    expect(schemaDifferences({ a: 1, b: [1, { c: 2 }] }, { b: [1, { c: 2 }], a: 1 })).toEqual([]);
   });
 
   it('reports changed, missing and unexpected members as JSON pointers', () => {
     expect(
-      differences(
+      schemaDifferences(
         { a: { minimum: 1 }, b: 2, list: [1, 2] },
         { a: { minimum: 0, maximum: 9 }, list: [1] }
       )
@@ -120,7 +161,7 @@ describe('differences', () => {
   });
 
   it('reports a root-level scalar difference at /', () => {
-    expect(differences('a', 'b')).toEqual(['/: expected "a", got "b"']);
+    expect(schemaDifferences('a', 'b')).toEqual(['/: expected "a", got "b"']);
   });
 });
 

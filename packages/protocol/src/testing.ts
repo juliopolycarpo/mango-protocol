@@ -12,3 +12,14 @@ export {
 } from './testing/conformance';
 
 export { rejectionOf } from './testing/rejection';
+
+export {
+  crossFileDefinitions,
+  type Definitions,
+  isConstTaggedUnion,
+  type Json,
+  type JsonObject,
+  normalizeSchema,
+  schemaDifferences,
+  stripNullAlternative,
+} from './testing/schema';

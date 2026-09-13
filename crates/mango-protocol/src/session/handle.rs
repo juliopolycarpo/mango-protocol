@@ -9,7 +9,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{RemoteError, codes};
 use crate::frame::{End, Event, Frame, Limits, PeerInfo, Request};
-use crate::validate::{is_reserved_method_name, is_valid_method_name};
+use crate::validate::{
+    RPC_DISCOVER_MINOR, is_defined_reserved_method, is_reserved_method_name, is_valid_method_name,
+};
 use crate::version::ProtocolVersion;
 
 use super::command::Command;
@@ -249,6 +251,27 @@ impl Session {
         self.shared.send_limit_bytes()
     }
 
+    /// How many requests the peer said it will answer at once, so a requester
+    /// can pace itself rather than discover the ceiling by being refused
+    /// (§11.2). The default until the peer announces otherwise.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_protocol::frame::PeerInfo;
+    /// use mango_protocol::port::port_pair;
+    /// use mango_protocol::session::{DEFAULT_MAX_IN_FLIGHT, Session, SessionOptions};
+    ///
+    /// let (a, _b) = port_pair();
+    /// let peer = PeerInfo { name: "hub".into(), version: "1".into(), role: "hub".into() };
+    /// let (session, _driver) = Session::open(a, SessionOptions::new(peer));
+    /// assert_eq!(session.remote_max_in_flight(), DEFAULT_MAX_IN_FLIGHT);
+    /// ```
+    #[must_use]
+    pub fn remote_max_in_flight(&self) -> usize {
+        self.shared.remote_max_in_flight()
+    }
+
     /// Closes the transport with a reason code and settles everything in
     /// flight, resolving once every handler has settled (bounded by
     /// `handler_grace`) and the port is shut.
@@ -314,7 +337,13 @@ impl Session {
         params: Value,
         options: RequestOptions,
     ) -> Result<Value, RemoteError> {
-        if !is_valid_method_name(method) || is_reserved_method_name(method) {
+        // A reserved name this wire defines is legal to send; whether this
+        // *session* defines it depends on the effective minor, which is not
+        // known until the handshake completes, so that half waits for it.
+        let reserved = is_reserved_method_name(method);
+        if !is_valid_method_name(method)
+            || (reserved && !is_defined_reserved_method(method, u32::from(crate::PROTOCOL_MINOR)))
+        {
             return Err(RemoteError::new(
                 codes::INVALID_REQUEST,
                 format!(
@@ -323,7 +352,19 @@ impl Session {
                 ),
             ));
         }
-        self.ready().await?;
+        let remote = self.ready().await?;
+        if reserved && !is_defined_reserved_method(method, remote.effective_minor) {
+            let effective_minor = remote.effective_minor;
+            return Err(RemoteError::new(
+                codes::INVALID_REQUEST,
+                format!(
+                    "Method \"{method}\" is defined from wire minor {RPC_DISCOVER_MINOR}; this \
+                     session negotiated minor {effective_minor}."
+                ),
+            )
+            .with_detail("method", method.to_string())
+            .with_detail("effectiveMinor", u64::from(effective_minor)));
+        }
         if self.state() == SessionState::Closed {
             return Err(self.unavailable(method));
         }
@@ -449,6 +490,19 @@ impl Session {
         } = event;
         let key = stream_id.clone().unwrap_or_else(|| topic.clone());
         let mut sequences = lock(&self.shared.event_sequences);
+        let limit = self.shared.max_stream_keys;
+        if !sequences.contains_key(&key) && sequences.len() >= limit {
+            return Err(RemoteError::new(
+                codes::UNAVAILABLE,
+                format!(
+                    "Stream key \"{key}\" would be one past the {limit} this session emits on at \
+                     once. End a stream before starting another."
+                ),
+            )
+            .with_detail("kind", super::options::STREAM_KEY_LIMIT_KIND)
+            .with_detail("key", key)
+            .with_detail("limit", u64::try_from(limit).unwrap_or(u64::MAX)));
+        }
         let seq = sequences.get(&key).copied().unwrap_or(0);
         let what = format!("Event \"{topic}\"");
         let frame = Frame::Evt(Event {

@@ -18,7 +18,16 @@ two peers may exchange.
 - There is no wire patch number. A clarification that changes no bytes is an erratum to the
   spec text.
 
-Wire 1.0 is the version described by `spec/mango-protocol-1.md`.
+`spec/mango-protocol-1.md` describes wire major 1 and carries the table of what each minor
+added. The minors so far:
+
+| Minor | Added                                       | Shipped in |
+| ----- | ------------------------------------------- | ---------- |
+| `1.0` | The wire as first published.                | `0.1.0`    |
+| `1.1` | `hello.limits.maxInFlight`, `rpc.discover`. | `0.2.0`    |
+
+A minor is announced, never negotiated away: both peers send the highest they implement and the
+session runs at the lower. There is nothing to turn on.
 
 ## Package version
 

@@ -297,7 +297,20 @@ impl LineDecoder {
             let end = consumed + offset;
             let line = &self.buffer[consumed..end];
             consumed = end + 1;
-            if is_blank(strip_carriage_return(line)) {
+            let content = strip_carriage_return(line);
+            // The size check runs before the blank check, not after: §11's "a
+            // decoder MUST refuse a line that exceeds the limit" names the
+            // line, not the frame it might have held, and a completed blank
+            // line must refuse exactly when the same bytes, still partial (no
+            // `\n` yet), already would have above. Checking blankness first
+            // let an oversized blank line buffer to completion and then be
+            // silently ignored, while the identical bytes arriving in two
+            // pushes were refused the moment they crossed the limit.
+            if content.len() > max_frame_bytes {
+                failure = Some(too_large(content.len(), max_frame_bytes));
+                break;
+            }
+            if is_blank(content) {
                 continue;
             }
             match decode_line(line, max_frame_bytes) {
@@ -493,6 +506,51 @@ mod tests {
         let outcome = decoder.push(&vec![b'x'; MIN_MAX_FRAME_BYTES]);
         assert!(outcome.is_ok());
         assert!(outcome.frames.is_empty());
+    }
+
+    /// The standalone decoder orders the two checks the same way the stream
+    /// decoder does: over the limit is over the limit, blank or not. The
+    /// TypeScript `decodeLine` reported `empty` for this input until the same
+    /// order landed there.
+    #[test]
+    fn an_oversized_blank_line_is_refused_for_its_size_not_its_blankness() {
+        let blank = vec![b' '; MIN_MAX_FRAME_BYTES + 1];
+        let error = decode_line(&blank, MIN_MAX_FRAME_BYTES).expect_err("over the limit");
+        assert_eq!(error.kind, CodecErrorKind::TooLarge);
+
+        let fits = vec![b' '; MIN_MAX_FRAME_BYTES];
+        let error = decode_line(&fits, MIN_MAX_FRAME_BYTES).expect_err("blank");
+        assert_eq!(error.kind, CodecErrorKind::Schema);
+    }
+
+    #[test]
+    fn an_oversized_blank_line_is_refused_whether_it_arrives_whole_or_split() {
+        let mut blank = vec![b' '; MIN_MAX_FRAME_BYTES + 1];
+        blank.push(b'\n');
+
+        let mut whole = LineDecoder::new(MIN_MAX_FRAME_BYTES);
+        let whole_outcome = whole.push(&blank);
+        assert!(whole_outcome.frames.is_empty());
+        assert_eq!(
+            whole_outcome.error.map(|error| error.kind),
+            Some(CodecErrorKind::TooLarge),
+            "a blank line over the limit must be refused, not silently ignored"
+        );
+
+        let (head, tail) = blank.split_at(blank.len() - 1);
+        let mut split = LineDecoder::new(MIN_MAX_FRAME_BYTES);
+        let first = split.push(head);
+        assert!(first.frames.is_empty());
+        assert_eq!(
+            first.error.map(|error| error.kind),
+            Some(CodecErrorKind::TooLarge),
+            "the same bytes, delivered before their terminator, must refuse identically"
+        );
+        let second = split.push(tail);
+        assert_eq!(
+            second.error.map(|error| error.kind),
+            Some(CodecErrorKind::TooLarge)
+        );
     }
 
     #[test]

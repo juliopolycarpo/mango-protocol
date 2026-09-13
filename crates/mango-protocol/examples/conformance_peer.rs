@@ -21,7 +21,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use mango_protocol::close::close_codes;
-use mango_protocol::session::{Session, SessionOptions};
+use mango_protocol::contract::{Contract, ContractHandlers, ServeOptions};
+use mango_protocol::port::Port;
+use mango_protocol::session::{Session, SessionClosure, SessionOptions};
 use mango_protocol::testing::{conformance_b, conformance_options};
 use mango_protocol::transports::deadline::ConnectDeadline;
 use mango_protocol::transports::ipc::{connect_ipc, listen_ipc};
@@ -29,11 +31,45 @@ use mango_protocol::transports::stdio::stdio_port;
 use mango_protocol::transports::websocket::WebSocketOptions;
 use mango_protocol::transports::websocket::client::{WebSocketConnectOptions, connect_websocket};
 use mango_protocol::transports::websocket::server::accept_websocket;
+use tokio::task::JoinHandle;
 
 /// How this peer presents itself. The conformance suite's side `b`, so a
 /// driver written against that suite recognises the peer it is talking to.
 fn options() -> SessionOptions {
     conformance_options(conformance_b())
+}
+
+/// The catalog this peer publishes through `rpc.discover`: the shared example
+/// fixture, which the TypeScript interop suite reads from the same file. A
+/// driver can therefore compare what came off the wire against the document
+/// on disk rather than against a copy of it.
+const CATALOG: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../spec/fixtures/1/catalog-example.json"
+));
+
+/// Spawns a session over `port` and publishes the catalog on it. The contract
+/// declares methods this peer does not implement, which is deliberate: only
+/// `rpc.discover` is registered from it, and a call to a declared method
+/// still answers `METHOD_UNSUPPORTED` — a catalog is a description, not a
+/// promise.
+fn serve<P: Port>(port: P) -> JoinHandle<SessionClosure> {
+    let (session, driver) = Session::spawn(port, options());
+    match publish(&session) {
+        Ok(()) => {}
+        Err(error) => eprintln!("catalog not published: {error}"),
+    }
+    driver
+}
+
+fn publish(session: &Session) -> Result<(), String> {
+    let catalog = serde_json::from_str(CATALOG).map_err(|error| error.to_string())?;
+    let contract = Contract::from_catalog(catalog).map_err(|error| error.to_string())?;
+    contract
+        .serve(session, ContractHandlers::new(), ServeOptions::default())
+        .map_err(|error| error.to_string())?
+        .persist();
+    Ok(())
 }
 
 /// How long a dial may take before this peer gives up and says so.
@@ -124,7 +160,7 @@ async fn serve_stdio(ignore_stdin: bool) -> Result<(), String> {
         eprintln!("ignoring stdin");
         std::future::pending::<()>().await;
     }
-    let (_session, driver) = Session::spawn(stdio_port(), options());
+    let driver = serve(stdio_port());
     let closure = driver.await.map_err(|error| error.to_string())?;
     eprintln!("closed {}", closure.code);
     Ok(())
@@ -144,7 +180,7 @@ async fn serve_ipc(path: &str) -> Result<(), String> {
             .await
             .map_err(|error| format!("accept failed: {error}"))?;
         eprintln!("accepted {identity}");
-        let (_session, driver) = Session::spawn(port, options());
+        let driver = serve(port);
         tokio::spawn(driver);
     }
 }
@@ -169,8 +205,8 @@ async fn serve_websocket(address: &str, token: Option<&str>) -> Result<(), Strin
         let expected = token.map(ToOwned::to_owned);
         tokio::spawn(async move {
             let accepted =
-                accept_websocket(socket, WebSocketOptions::default(), |offered| {
-                    match (&expected, offered) {
+                accept_websocket(socket, WebSocketOptions::default(), |upgrade| {
+                    match (&expected, upgrade.bearer()) {
                         (None, _) => Ok(()),
                         (Some(expected), Some(offered)) if expected == offered => Ok(()),
                         _ => Err(close_codes::UNAUTHORIZED),
@@ -180,7 +216,7 @@ async fn serve_websocket(address: &str, token: Option<&str>) -> Result<(), Strin
             match accepted {
                 Ok(port) => {
                     eprintln!("accepted {from}");
-                    let (_session, driver) = Session::spawn(port, options());
+                    let driver = serve(port);
                     let _ = driver.await;
                 }
                 Err(error) => eprintln!("refused {from}: {error}"),
@@ -202,13 +238,13 @@ async fn connect(target: &str, token: Option<&str>) -> Result<(), String> {
             .await
             .map_err(|error| format!("cannot dial {target}: {error}"))?;
         announce(target);
-        Session::spawn(port, options()).1
+        serve(port)
     } else {
         let port = connect_ipc(target, &deadline)
             .await
             .map_err(|error| format!("cannot dial {target}: {error}"))?;
         announce(target);
-        Session::spawn(port, options()).1
+        serve(port)
     };
 
     let closure = driver.await.map_err(|error| error.to_string())?;

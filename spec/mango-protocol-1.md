@@ -1,8 +1,13 @@
-# Mango Protocol 1.0
+# Mango Protocol 1
 
-Status: draft. This document is normative for wire major 1. `spec/schema/1/protocol.json` is the
-normative JSON Schema for every shape named here; where prose and schema disagree, the schema
-wins and the prose is a bug.
+Status: draft. This document is normative for wire major 1, up to and including minor 1.
+`spec/schema/1/protocol.json` is the normative JSON Schema for every shape named here; where
+prose and schema disagree, the schema wins and the prose is a bug.
+
+| Minor | Added                                                                                                                   |
+| ----- | ----------------------------------------------------------------------------------------------------------------------- |
+| `1.0` | Everything else in this document.                                                                                       |
+| `1.1` | `hello.limits.maxInFlight` ([§11.2](#112-session-limits)) and the `rpc.discover` method ([§6.4](#64-reserved-methods)). |
 
 The key words MUST, MUST NOT, SHOULD and MAY are to be read as in RFC 2119.
 
@@ -99,12 +104,21 @@ As soon as the transport is open, each peer MUST send exactly one `hello`:
   matching `^[a-z][a-z0-9-]*$`.
 - `capabilities` is an object owned by the application contract. The protocol does not define
   its members. It MUST be present; `{}` is valid.
-- `limits.maxFrameBytes`, when present, lowers the frame size ceiling this peer will accept
-  (see [§11](#11-limits)).
+- `limits.maxFrameBytes`, when present, lowers the frame size ceiling this peer will accept,
+  and `limits.maxInFlight` announces how many requests this peer will hold open for the other
+  side at once (see [§11](#11-limits)).
 
 Until a peer has received the other side's `hello`, it MUST NOT send any frame other than
 `hello`, `ping`, `pong`, `close`, or an `err` answering a request the other side sent too
 early (§5.3): the peer's limits and the effective minor are not known yet.
+
+`hello` is sent as soon as the transport is open, with one exception in the other direction:
+where a transport authenticates (a WebSocket upgrade carrying a credential, a local socket
+checking peer credentials), the **acceptor** MUST NOT send `hello` until that check has
+succeeded. A peer whose credential is no good is closed with `4401` or `4403` and never learns
+who was listening. The **dialler** is under no such rule and MAY send `hello` immediately: on a
+refusal the acceptor discards it unread, which is why a refused dial costs one frame and not a
+round trip.
 
 ### 5.2 Negotiation
 
@@ -120,7 +134,11 @@ On receiving the peer's `hello`:
    effective minor.
 
 The handshake is complete for a peer once it has both sent and received `hello`. A peer SHOULD
-bound the wait with a timeout; on expiry it closes with `4400` and the reason `handshake timeout`.
+bound the wait with a timeout; on expiry it closes with `4400` and the reason `handshake timeout`,
+spelled exactly that way so a log on the other side is searchable. The reference budget is
+15 seconds, which `spec/fixtures/1/negotiation.json` records under `handshake` for a conformance
+suite to check against its own default. A launcher that has to open a network connection or start
+a container before the child can greet budgets more (see [spawn](transports/spawn.md)).
 
 ### 5.3 Before the handshake completes
 
@@ -136,13 +154,17 @@ bound the wait with a timeout; on expiry it closes with `4400` and the reason `h
 { "type": "req", "id": "r-42", "method": "fs.read-file", "params": { "path": "/etc/hosts" } }
 ```
 
-- `id` is a string of 1 to 256 characters chosen by the requester. It MUST be unique among the
-  requester's in-flight requests on this session. Reusing an id after its response has arrived
-  is allowed but not recommended.
+- `id` is a string of 1 to 256 characters chosen by the requester. A requester MUST NOT reuse
+  an id within a session, including after its response has arrived: a per-session counter is the
+  reference generator, and both SDKs use one. The rule binds the sender because a responder
+  cannot check it — remembering every id a session has ever carried is exactly the unbounded
+  state [§11](#11-limits) refuses — so a responder enforces only the part it can see, an id that
+  duplicates one still in flight ([§6.2](#62-res-and-err)).
 - `method` matches `^[a-z](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z](?:[a-z0-9-]*[a-z0-9])?)+$` and is
   at most 128 characters: at least two dot-separated segments, each starting with a lowercase
   letter, made of lowercase letters, digits and dashes, and never ending with a dash. Names under
-  the `rpc.` segment are reserved for this specification; none is defined in 1.0.
+  the `rpc.` segment are reserved for this specification and listed in
+  [§6.4](#64-reserved-methods); an application MUST NOT define one.
 - `params` is any JSON value. Contracts SHOULD require an object.
 
 ### 6.2 res and err
@@ -166,21 +188,45 @@ session, including requests it refused, cancelled, or could not route:
 
 ### 6.3 Reserved error codes
 
-| Code                 | Sent when                                                                                                                                                  |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `UNAVAILABLE`        | The session cannot serve requests: handshake not complete, or session closing. Also the local code a requester reports when the transport closes mid-call. |
-| `INVALID_REQUEST`    | The frame is schema-valid but breaks a protocol rule: duplicate in-flight id, method grammar accepted by a lax decoder, reserved `rpc.` method.            |
-| `METHOD_UNSUPPORTED` | The responder has no handler for `method`.                                                                                                                 |
-| `INVALID_PARAMS`     | `params` failed the contract's schema for this method. `details` SHOULD name the failing path.                                                             |
-| `DENIED`             | The method exists but policy refuses it (consent, authorisation). `details` SHOULD say which capability or rule.                                           |
-| `CANCELLED`          | The handler stopped because a `cancel` arrived.                                                                                                            |
-| `TIMEOUT`            | Local: the requester's own deadline passed. A responder MAY also send it when a handler exceeded a server-side budget.                                     |
-| `FRAME_TOO_LARGE`    | The response would exceed the frame limit; the handler's result is replaced by this error.                                                                 |
-| `PROTOCOL_MISMATCH`  | A request that cannot be served at the effective minor. Normally the handshake refuses first and this code is never seen.                                  |
-| `INTERNAL`           | Anything else that failed inside the responder.                                                                                                            |
+| Code                 | Sent when                                                                                                                                                                                                                                                               |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `UNAVAILABLE`        | The session cannot serve requests: handshake not complete, session closing, or already holding `maxInFlight` requests open ([§11.2](#112-session-limits), where `details.kind` says which). Also the local code a requester reports when the transport closes mid-call. |
+| `INVALID_REQUEST`    | The frame is schema-valid but breaks a protocol rule: duplicate in-flight id, method grammar accepted by a lax decoder, reserved `rpc.` method.                                                                                                                         |
+| `METHOD_UNSUPPORTED` | The responder has no handler for `method`.                                                                                                                                                                                                                              |
+| `INVALID_PARAMS`     | `params` failed the contract's schema for this method. `details` SHOULD name the failing path.                                                                                                                                                                          |
+| `DENIED`             | The method exists but policy refuses it (consent, authorisation). `details` SHOULD say which capability or rule.                                                                                                                                                        |
+| `CANCELLED`          | The handler stopped because a `cancel` arrived.                                                                                                                                                                                                                         |
+| `TIMEOUT`            | Local: the requester's own deadline passed. A responder MAY also send it when a handler exceeded a server-side budget.                                                                                                                                                  |
+| `FRAME_TOO_LARGE`    | The response would exceed the frame limit; the handler's result is replaced by this error.                                                                                                                                                                              |
+| `PROTOCOL_MISMATCH`  | A request that cannot be served at the effective minor. Normally the handshake refuses first and this code is never seen.                                                                                                                                               |
+| `INTERNAL`           | Anything else that failed inside the responder.                                                                                                                                                                                                                         |
 
 Applications define any other code. Unknown codes MUST be preserved as received and never
 refused; a consumer narrows them to its own known set.
+
+### 6.4 Reserved methods
+
+Method names under the `rpc.` segment belong to this specification. Each is introduced by a
+minor and is part of the wire, not of any contract:
+
+| Method         | Since | Params                           | Result                                                                            |
+| -------------- | ----- | -------------------------------- | --------------------------------------------------------------------------------- |
+| `rpc.discover` | `1.1` | An object; no member is defined. | The responder's catalog document ([§12](#12-contracts-and-the-catalog-document)). |
+
+- A requester MUST NOT send a reserved method the [effective minor](#52-negotiation) does not
+  define. A responder that receives one answers `INVALID_REQUEST`, which is also what a 1.1
+  peer answers for `rpc.discover` when the effective minor is `0` — the other side is a 1.0
+  peer that cannot have meant this method.
+- `rpc.discover` asks the responder for the contract it serves, so a peer can read the methods,
+  events and capabilities of the other side without an application method of its own, and a
+  diagnostic can report the skew between what a peer offers and what its caller expects. A
+  responder that serves no contract answers `METHOD_UNSUPPORTED`, exactly as it would for any
+  method it has no handler for: serving a catalog is a MAY, and answering `rpc.discover` when
+  you serve one is a SHOULD.
+- The result is the catalog document itself, not a wrapper around one. A requester validates it
+  against `catalog.json` before trusting it.
+- `rpc.` names are otherwise ordinary requests: they count against `maxInFlight`, they are
+  cancellable, and they are refused before the handshake completes like any other.
 
 ## 7. Cancellation
 
@@ -221,6 +267,10 @@ refused; a consumer narrows them to its own known set.
   peer: the sender closes with `4000` and the reason `liveness timeout`.
 - Transport-level keepalives (WebSocket control frames, TCP options) do not replace protocol
   liveness; a transport MAY use them in addition.
+- An implementation MAY run no periodic ping at all on a transport that cannot silently die —
+  an in-process pair, or one whose own liveness the application already trusts. Answering
+  `ping` is not optional either way: a peer that has switched its own cadence off MUST still
+  answer every `ping` it receives, because the other side may not have.
 
 ## 10. Close
 
@@ -254,6 +304,8 @@ peer MUST NOT retry automatically after one of them. Applications add reconnect 
 
 ## 11. Limits
 
+### 11.1 Frame limit
+
 - The **frame limit** bounds one encoded frame: its UTF-8 byte length without any transport
   delimiter. The default is `16777216` bytes (16 MiB).
 - A peer MAY announce a lower ceiling in `hello.limits.maxFrameBytes` (at least `4096`). The
@@ -263,8 +315,46 @@ peer MUST NOT retry automatically after one of them. Applications add reconnect 
 - A received frame that exceeds the limit is a decoder refusal: the transport closes with
   `4400`. Transports that split frames into messages MUST bound reassembly by the same limit and
   by the maximum number of messages one frame can need.
-- `id` is at most 256 characters, `method` and `topic` at most 128, `error.code` at most 64,
-  `close.reason` at most 1024, `peer.name` and `peer.version` at most 128.
+
+### 11.2 Session limits
+
+The frame limit bounds one frame. It does not bound how many a peer may have in the air, and a
+hostile or broken peer does not need an oversized frame to make the other side hold state for
+ever: a request it never cancels and a stream key it never ends both cost the receiver memory
+that no rule above reclaims. Each ceiling below is one a peer enforces on itself, about what the
+*other* side may make it hold.
+
+- **Requests in flight.** `maxInFlight` is the number of requests a responder will hold open for
+  the other side at once. The default is `256`. A peer MAY announce its own value in
+  `hello.limits.maxInFlight` (at least `1`) so a requester can pace itself; absent means the
+  default.
+- A `req` that arrives while the responder already holds `maxInFlight` open is answered with
+  `err` code `UNAVAILABLE` and `details.kind` of `"in_flight_limit"`. The session stays open and
+  the refusal is **retryable**: a requester MUST NOT treat it as a permanent failure the way it
+  treats `METHOD_UNSUPPORTED`, and SHOULD retry once one of its own requests has settled. It is
+  the one reserved code whose meaning depends on `details.kind`, which is why the member is
+  named there rather than left to the application.
+- The count is of requests this side is *answering*, not of requests it sent. A peer that both
+  requests and responds has two independent budgets, and neither side's `maxInFlight` bounds
+  what the announcing peer may send.
+- **Open stream keys.** A peer bounds how many stream keys ([§8](#8-events-and-streams)) it
+  counts for at once; `1024` is the reference. Unlike `maxInFlight` this is local and not
+  announced: it bounds what this side emits, a new key past it is refused before anything is
+  sent, and an `end: true` event releases one. A sender that reaches it has leaked stream ids,
+  which is a defect in the sender rather than a message to the peer.
+- **Pending pings.** One, unchanged: a ping that goes unanswered for one interval closes the
+  session ([§9](#9-liveness)), so a peer never queues a second.
+
+`hello.limits` is the one place a member added in a later minor is sent unconditionally. The
+effective minor is not known until the peer's `hello` has arrived, so a sender cannot gate a
+`hello` member on it; [§4](#4-envelope-and-tolerance) covers the other direction, and a 1.0 peer
+reading a 1.1 `hello` ignores `maxInFlight` and paces itself by nothing — exactly what it did
+before the member existed.
+
+### 11.3 Field lengths
+
+`id` is at most 256 characters, `method` and `topic` at most 128, `error.code` at most 64,
+`close.reason` at most 1024, `peer.name` and `peer.version` at most 128.
 
 ## 12. Contracts and the catalog document
 
@@ -290,8 +380,9 @@ Applications describe their methods, events and capabilities in a **catalog** co
   normally `DENIED`.
 - `protocol` is the lowest wire version the catalog needs.
 
-The catalog is a description, not a wire message. SDKs use it to type clients and validate
-handlers; a peer MAY publish it through an application method.
+The catalog is a description, not a wire message; the one place it crosses the wire is as the
+result of `rpc.discover` ([§6.4](#64-reserved-methods)). SDKs use it to type clients and
+validate handlers.
 
 ## 13. Conformance
 

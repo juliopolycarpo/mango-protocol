@@ -3,7 +3,12 @@ import { DEFAULT_MAX_FRAME_BYTES, measureFrameBytes } from './codec/ndjson';
 import { type CodecError, RESERVED_ERROR_CODES, RemoteError } from './errors';
 import { Listeners } from './listeners';
 import type { Port, PortClosure } from './port';
-import { isReservedMethodName, isValidMethodName } from './schemas/common';
+import {
+  isDefinedReservedMethod,
+  isReservedMethodName,
+  isValidMethodName,
+  RPC_DISCOVER_MINOR,
+} from './schemas/common';
 import type {
   ErrorPayload,
   EventFrame,
@@ -13,7 +18,7 @@ import type {
   PeerInfo,
   RequestFrame,
 } from './schemas/frames';
-import { negotiate, PROTOCOL_VERSION, type ProtocolVersion } from './version';
+import { negotiate, PROTOCOL_MINOR, PROTOCOL_VERSION, type ProtocolVersion } from './version';
 
 /** What the far peer announced in its `hello`, plus the negotiated minor. */
 export interface RemotePeer {
@@ -86,20 +91,57 @@ export interface SessionOptions {
    * lower of both sides' ceilings bounds every frame this side sends.
    */
   readonly maxFrameBytes?: number;
+  /**
+   * How many requests this side will answer at once. Past it a `req` is
+   * refused with `UNAVAILABLE` and `details.kind` of `in_flight_limit`, which
+   * the requester may retry; 256 by default. Announced in
+   * `hello.limits.maxInFlight` so the peer can pace itself.
+   */
+  readonly maxInFlight?: number;
+  /**
+   * How many stream keys this side will emit on at once. A new key past it is
+   * refused locally and nothing is sent; 1024 by default. Local, never
+   * announced: reaching it means this side leaked stream ids.
+   */
+  readonly maxStreamKeys?: number;
   /** How long to wait for the peer's `hello`; 15 seconds by default. */
   readonly handshakeTimeoutMs?: number;
   /** Ping cadence after the handshake; 20 seconds by default, `false` disables. */
   readonly livenessIntervalMs?: number | false;
   /** Initial handlers; `handle()` adds more at any time. */
   readonly handlers?: Readonly<Record<string, RequestHandler>>;
+  /**
+   * How long `close()` waits for in-flight handlers to settle before
+   * abandoning them; 5 seconds by default. Their abort signal fires first, so
+   * a handler that honours it settles long before this matters.
+   */
+  readonly handlerGraceMs?: number;
   /** Prefix of generated request ids; `r` by default. */
   readonly requestIdPrefix?: string;
   /** Injected for tests; the global timers by default. */
   readonly timers?: SessionTimers;
 }
 
-const DEFAULT_HANDSHAKE_TIMEOUT_MS = 15_000;
-const DEFAULT_LIVENESS_INTERVAL_MS = 20_000;
+/** How long a session waits for the peer's `hello` before closing `4400` (§5.2). */
+export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 15_000;
+
+/** The close reason §5.2 puts on a handshake that ran out of time, spelled exactly. */
+export const HANDSHAKE_TIMEOUT_REASON = 'handshake timeout';
+
+/** Default ping cadence once the handshake completes (§9). */
+export const DEFAULT_LIVENESS_INTERVAL_MS = 20_000;
+
+/** Requests one side answers at once before it starts refusing (§11.2). */
+export const DEFAULT_MAX_IN_FLIGHT = 256;
+
+/** Stream keys one side emits on at once before `emit` refuses (§11.2). */
+export const DEFAULT_MAX_STREAM_KEYS = 1024;
+
+/** How long `close()` waits for in-flight handlers before abandoning them. */
+export const DEFAULT_HANDLER_GRACE_MS = 5_000;
+
+/** `error.details.kind` on the refusal that says the responder is full (§11.2). */
+export const IN_FLIGHT_LIMIT_KIND = 'in_flight_limit';
 
 interface PendingRequest {
   readonly method: string;
@@ -135,6 +177,11 @@ export class Session {
   readonly #timers: SessionTimers;
   readonly #localProtocol: ProtocolVersion;
   readonly #localMaxFrameBytes: number;
+  readonly #maxInFlight: number;
+  readonly #maxStreamKeys: number;
+  readonly #handlerGraceMs: number;
+  /** Every inbound request this side is answering, so `close()` can wait. */
+  readonly #dispatches = new Set<Promise<void>>();
   readonly #handlers = new Map<string, RequestHandler>();
   readonly #pending = new Map<string, PendingRequest>();
   readonly #active = new Map<string, AbortController>();
@@ -162,6 +209,9 @@ export class Session {
     this.#localProtocol = options.protocol ?? PROTOCOL_VERSION;
     this.#localMaxFrameBytes =
       options.maxFrameBytes ?? port.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
+    this.#maxInFlight = options.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT;
+    this.#maxStreamKeys = options.maxStreamKeys ?? DEFAULT_MAX_STREAM_KEYS;
+    this.#handlerGraceMs = options.handlerGraceMs ?? DEFAULT_HANDLER_GRACE_MS;
     this.#requestIdPrefix = options.requestIdPrefix ?? 'r';
     for (const [method, handler] of Object.entries(options.handlers ?? {})) {
       this.#handlers.set(method, handler);
@@ -197,10 +247,24 @@ export class Session {
     return this.#closure;
   }
 
+  /** How many inbound requests this side is answering right now. */
+  get inFlight(): number {
+    return this.#active.size;
+  }
+
   /** The frame ceiling this side may send: the lower of both announced limits. */
   get sendLimitBytes(): number {
     const remote = this.#remote?.limits?.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
     return Math.min(this.#localMaxFrameBytes, remote);
+  }
+
+  /**
+   * How many requests the peer said it will answer at once, so a requester can
+   * pace itself instead of discovering the ceiling by being refused. The
+   * default until the peer announces otherwise.
+   */
+  get remoteMaxInFlight(): number {
+    return this.#remote?.limits?.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT;
   }
 
   /** Registers a handler; returns the function that removes it. */
@@ -213,13 +277,27 @@ export class Session {
 
   /** Sends a request and resolves with its `result`, or rejects with a `RemoteError`. */
   async request(method: string, params: unknown, options: RequestOptions = {}): Promise<unknown> {
-    if (!isValidMethodName(method) || isReservedMethodName(method)) {
+    const reserved = isReservedMethodName(method);
+    // A reserved name this wire defines is legal to send; whether this
+    // *session* defines it depends on the effective minor, which is not known
+    // until the handshake completes, so that half of the check waits for it.
+    if (
+      !isValidMethodName(method) ||
+      (reserved && !isDefinedReservedMethod(method, PROTOCOL_MINOR))
+    ) {
       throw new RemoteError(
         RESERVED_ERROR_CODES.INVALID_REQUEST,
         `Method "${method}" is not a valid, unreserved method name; expected two or more dot-separated lowercase segments outside rpc.`
       );
     }
-    await this.ready;
+    const remote = await this.ready;
+    if (reserved && !isDefinedReservedMethod(method, remote.effectiveMinor)) {
+      throw new RemoteError(
+        RESERVED_ERROR_CODES.INVALID_REQUEST,
+        `Method "${method}" is defined from wire minor ${RPC_DISCOVER_MINOR}; this session negotiated minor ${remote.effectiveMinor}.`,
+        { method, effectiveMinor: remote.effectiveMinor }
+      );
+    }
     if (this.#state === 'closed') throw this.#unavailable(method);
 
     const id = `${this.#requestIdPrefix}-${++this.#requestSequence}`;
@@ -273,6 +351,13 @@ export class Session {
   emit(event: EventInput): boolean {
     if (this.#state !== 'ready') return false;
     const key = event.streamId ?? event.topic;
+    if (!this.#eventSequences.has(key) && this.#eventSequences.size >= this.#maxStreamKeys) {
+      throw new RemoteError(
+        RESERVED_ERROR_CODES.UNAVAILABLE,
+        `Stream key "${key}" would be the ${this.#maxStreamKeys + 1}th open on this session; the ceiling is ${this.#maxStreamKeys}. End a stream before starting another.`,
+        { kind: 'stream_key_limit', key, limit: this.#maxStreamKeys }
+      );
+    }
     const seq = this.#eventSequences.get(key) ?? 0;
     const frame: EventFrame = {
       type: 'evt',
@@ -283,9 +368,12 @@ export class Session {
       ...(event.end ? { end: true as const } : {}),
     };
     this.#assertFits(frame, `Event "${event.topic}"`);
+    // Sent before the sequence counter is committed: a port that throws must
+    // leave this stream key exactly as it found it, not occupying a slot
+    // toward `#maxStreamKeys` for a frame that never reached the wire.
+    this.#port.send(frame);
     if (event.end) this.#eventSequences.delete(key);
     else this.#eventSequences.set(key, seq + 1);
-    this.#port.send(frame);
     return true;
   }
 
@@ -317,8 +405,39 @@ export class Session {
     return this.#closeListeners.add(listener);
   }
 
-  /** Closes the transport with a reason code and settles everything in flight. */
-  close(code: number = CLOSE_CODES.RELEASED, reason?: string): void {
+  /**
+   * Closes the transport with a reason code, settles everything in flight and
+   * resolves once every handler this side was running has settled — bounded by
+   * `handlerGraceMs`, so one that ignores its abort signal delays a shutdown
+   * without blocking it.
+   *
+   * A handler that awaits its own `context.session.close()` is one of the
+   * handlers this waits on: the wait cannot distinguish "called from inside
+   * a running handler" from any other caller, so that call resolves only
+   * once `handlerGraceMs` elapses, not sooner. A handler that needs to close
+   * the session without waiting on itself should call `closeNow` instead.
+   *
+   * @example
+   * const closure = await session.close(CLOSE_CODES.RELEASED, 'shutting down');
+   */
+  async close(code: number = CLOSE_CODES.RELEASED, reason?: string): Promise<SessionClosure> {
+    this.closeNow(code, reason);
+    await this.#settleHandlers();
+    return (
+      this.#closure ?? {
+        code,
+        ...(reason !== undefined ? { reason } : {}),
+        fatal: isFatalCloseCode(code),
+      }
+    );
+  }
+
+  /**
+   * [`close`] without the wait: tells the transport and tears down, leaving any
+   * handler that ignores its abort signal running. This is what a synchronous
+   * caller (a signal handler, a `finally` that cannot await) reaches for.
+   */
+  closeNow(code: number = CLOSE_CODES.RELEASED, reason?: string): void {
     if (this.#state === 'closed') return;
     try {
       this.#port.close(code, reason);
@@ -332,15 +451,34 @@ export class Session {
     });
   }
 
+  /** Waits for every in-flight handler, or for the grace period to elapse. */
+  async #settleHandlers(): Promise<void> {
+    if (this.#dispatches.size === 0) return;
+    const running = Promise.allSettled([...this.#dispatches]);
+    await Promise.race([
+      running,
+      new Promise<void>((resolve) => {
+        const timer = this.#timers.setTimeout(resolve, this.#handlerGraceMs);
+        void running.then(() => this.#timers.clearTimeout(timer));
+      }),
+    ]);
+  }
+
   #startHandshake(): void {
+    // `hello.limits` is announced whole, never gated on the effective minor:
+    // nobody knows it yet, and §4 has the peer ignore what it cannot read.
+    const limits: Limits = {
+      ...(this.#localMaxFrameBytes < DEFAULT_MAX_FRAME_BYTES
+        ? { maxFrameBytes: this.#localMaxFrameBytes }
+        : {}),
+      ...(this.#maxInFlight !== DEFAULT_MAX_IN_FLIGHT ? { maxInFlight: this.#maxInFlight } : {}),
+    };
     const hello: HelloFrame = {
       type: 'hello',
       protocol: this.#localProtocol,
       peer: this.#options.peer,
       capabilities: { ...(this.#options.capabilities ?? {}) },
-      ...(this.#localMaxFrameBytes < DEFAULT_MAX_FRAME_BYTES
-        ? { limits: { maxFrameBytes: this.#localMaxFrameBytes } }
-        : {}),
+      ...(Object.keys(limits).length > 0 ? { limits } : {}),
     };
     try {
       this.#port.send(hello);
@@ -367,14 +505,14 @@ export class Session {
           { timeoutMs }
         ),
         CLOSE_CODES.PROTOCOL_ERROR,
-        'handshake timeout'
+        HANDSHAKE_TIMEOUT_REASON
       );
     }, timeoutMs);
   }
 
   #failHandshake(error: RemoteError, code: number, reason: string): void {
     this.#readyDeferred.reject(error);
-    this.close(code, reason);
+    this.closeNow(code, reason);
   }
 
   #receive(frame: Frame): void {
@@ -382,9 +520,12 @@ export class Session {
       case 'hello':
         this.#receiveHello(frame);
         return;
-      case 'req':
-        void this.#dispatch(frame);
+      case 'req': {
+        const settled = this.#dispatch(frame);
+        this.#dispatches.add(settled);
+        void settled.finally(() => this.#dispatches.delete(settled));
         return;
+      }
       case 'res':
         this.#settle(frame.id, (pending) => pending.resolve(frame.result));
         return;
@@ -426,7 +567,7 @@ export class Session {
 
   #receiveHello(frame: HelloFrame): void {
     if (this.#state !== 'handshaking') {
-      this.close(CLOSE_CODES.PROTOCOL_ERROR, 'duplicate hello');
+      this.closeNow(CLOSE_CODES.PROTOCOL_ERROR, 'duplicate hello');
       return;
     }
     const negotiation = negotiate(this.#localProtocol, frame.protocol);
@@ -464,7 +605,7 @@ export class Session {
       // One missed round trip is the signal: the interval is already several
       // times the round trip a healthy peer needs.
       if (this.#awaitingPong) {
-        this.close(CLOSE_CODES.RELEASED, 'liveness timeout');
+        this.closeNow(CLOSE_CODES.RELEASED, 'liveness timeout');
         return;
       }
       this.#awaitingPong = true;
@@ -481,6 +622,16 @@ export class Session {
       });
       return;
     }
+    if (this.#active.size >= this.#maxInFlight) {
+      // Retryable, and the session stays open: the peer is not misbehaving,
+      // it is ahead of what this side agreed to hold (§11.2).
+      this.#respondError(frame.id, {
+        code: RESERVED_ERROR_CODES.UNAVAILABLE,
+        message: `This peer is already answering ${this.#maxInFlight} requests; retry "${frame.method}" once one of yours has settled.`,
+        details: { kind: IN_FLIGHT_LIMIT_KIND, limit: this.#maxInFlight, method: frame.method },
+      });
+      return;
+    }
     if (this.#active.has(frame.id)) {
       this.#respondError(frame.id, {
         code: RESERVED_ERROR_CODES.INVALID_REQUEST,
@@ -489,11 +640,15 @@ export class Session {
       });
       return;
     }
-    if (isReservedMethodName(frame.method)) {
+    const effectiveMinor = this.#remote?.effectiveMinor ?? 0;
+    if (
+      isReservedMethodName(frame.method) &&
+      !isDefinedReservedMethod(frame.method, effectiveMinor)
+    ) {
       this.#respondError(frame.id, {
         code: RESERVED_ERROR_CODES.INVALID_REQUEST,
-        message: `Method "${frame.method}" is reserved; the rpc. segment belongs to the protocol and defines no method in wire 1.0.`,
-        details: { method: frame.method },
+        message: `Method "${frame.method}" is reserved; the rpc. segment belongs to the protocol and defines no such method at wire minor ${effectiveMinor}.`,
+        details: { method: frame.method, effectiveMinor },
       });
       return;
     }

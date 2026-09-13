@@ -73,6 +73,29 @@ export interface WebSocketPortHandle {
 }
 
 /**
+ * True when an acceptor's allow-list admits the `Origin` an upgrade carried.
+ *
+ * The comparison is exact on the serialised origin, never a prefix, suffix or
+ * substring: `https://app.example.attacker.test` ends with no entry of
+ * `['https://app.example']` and must not be admitted by one. There is no
+ * wildcard — an entry is one origin — and an empty list admits no browser at
+ * all, which is the right configuration for an acceptor that only ever serves
+ * native clients.
+ *
+ * An absent `Origin` is not a browser: no user agent attached one, so this
+ * check passes it through and the credential is what governs it
+ * (spec/transports/websocket.md, Origin).
+ *
+ * @example
+ * isOriginAllowed('https://app.example', ['https://app.example']); // true
+ * isOriginAllowed('https://app.example.attacker.test', ['https://app.example']); // false
+ */
+export function isOriginAllowed(origin: string | undefined, allowed: readonly string[]): boolean {
+  if (origin === undefined) return true;
+  return allowed.includes(origin);
+}
+
+/**
  * Maps the number `Bun.ServerWebSocket.send` returns onto a `SendOutcome`:
  * `0` is a dropped message, `-1` is backpressure, anything above zero is the
  * count of bytes sent.

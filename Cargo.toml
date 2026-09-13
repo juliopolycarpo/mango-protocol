@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
 members = ["crates/mango-protocol"]
+# `fuzz/` is its own workspace (see fuzz/Cargo.toml): a cargo-fuzz crate needs
+# nightly and libFuzzer, so it must never be pulled into a stable build. This
+# exclusion is the other half of that split; without it, `cargo clippy
+# --all-targets --all-features` and `cargo hack clippy --feature-powerset`
+# would try to build it on stable and fail.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,6 +14,10 @@ authors = ["Julio Polycarpo"]
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/juliopolycarpo/mango-protocol"
+# Policy: current stable minus two minors (currently 1.96) is the floor we'd allow, but we hold
+# at 1.97 because dropping to the floor buys nothing today - no dependency, feature or fix needs
+# it. The `msrv` CI job installs this version explicitly and runs `cargo +1.97.0 check
+# --all-features --locked` against it, independent of whatever `rust-toolchain.toml` pins.
 rust-version = "1.97.0"
 
 [workspace.lints.rust]

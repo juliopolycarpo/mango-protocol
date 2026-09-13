@@ -1,4 +1,4 @@
-//! Inbound request routing: the four refusal checks, spawning a handler onto
+//! Inbound request routing: the five refusal checks, spawning a handler onto
 //! the driver's `JoinSet`, and turning what it produced into a wire frame.
 
 use std::collections::HashMap;
@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{RemoteError, codes};
 use crate::frame::{ErrorPayload, ErrorResponse, Frame, Request, Response};
 use crate::port::PortTx;
-use crate::validate::is_reserved_method_name;
+use crate::validate::{is_defined_reserved_method, is_reserved_method_name};
 
 use super::driver::Writer;
 use super::handle::{Session, SessionState};
@@ -52,9 +52,9 @@ fn respond_error<Tx: PortTx>(writer: &Writer<Tx>, id: String, error: RemoteError
     }));
 }
 
-/// Routes one inbound `req` frame: the four refusal checks (not ready, a
-/// duplicate id, a reserved method, no handler), then spawns the matched
-/// handler onto `tasks`.
+/// Routes one inbound `req` frame: the five refusal checks (not ready, past
+/// the in-flight ceiling, a duplicate id, a reserved method, no handler), then
+/// spawns the matched handler onto `tasks`.
 pub(super) fn on_request<Tx: PortTx>(
     shared: &Arc<Shared>,
     tracking: &mut RequestTracking,
@@ -84,6 +84,24 @@ pub(super) fn on_request<Tx: PortTx>(
         );
         return;
     };
+    if tracking.active.len() >= shared.max_in_flight {
+        // Retryable, and the session stays open: the peer is not misbehaving,
+        // it is ahead of what this side agreed to hold (§11.2).
+        let limit = shared.max_in_flight;
+        let message = format!(
+            "This peer is already answering {limit} requests; retry \"{method}\" once one of \
+             yours has settled."
+        );
+        respond_error(
+            writer,
+            id,
+            RemoteError::new(codes::UNAVAILABLE, message)
+                .with_detail("kind", super::options::IN_FLIGHT_LIMIT_KIND)
+                .with_detail("limit", u64::try_from(limit).unwrap_or(u64::MAX))
+                .with_detail("method", method),
+        );
+        return;
+    }
     if tracking.active.contains_key(&id) {
         let message = format!(
             "Request id \"{id}\" is already in flight; expected an id unique among the \
@@ -96,15 +114,18 @@ pub(super) fn on_request<Tx: PortTx>(
         );
         return;
     }
-    if is_reserved_method_name(&method) {
+    let effective_minor = remote.effective_minor;
+    if is_reserved_method_name(&method) && !is_defined_reserved_method(&method, effective_minor) {
         let message = format!(
             "Method \"{method}\" is reserved; the rpc. segment belongs to the protocol and \
-             defines no method in wire 1.0."
+             defines no such method at wire minor {effective_minor}."
         );
         respond_error(
             writer,
             id,
-            RemoteError::new(codes::INVALID_REQUEST, message).with_detail("method", method),
+            RemoteError::new(codes::INVALID_REQUEST, message)
+                .with_detail("method", method)
+                .with_detail("effectiveMinor", u64::from(effective_minor)),
         );
         return;
     }

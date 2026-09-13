@@ -110,6 +110,17 @@ describe('decodeLine', () => {
     expect(refusalOf(() => decodeLine('\r')).kind).toBe('empty');
   });
 
+  it('refuses an oversized blank record for its size, not its blankness', () => {
+    // The same order `LineDecoder` and the Rust codec use. Reporting `empty`
+    // here would have one giant blank line answer two different refusals
+    // depending on which decoder read it.
+    const blank = ' '.repeat(4097);
+    expect(refusalOf(() => decodeLine(blank, { maxFrameBytes: 4096 })).kind).toBe('too-large');
+    expect(refusalOf(() => decodeLine(' '.repeat(4096), { maxFrameBytes: 4096 })).kind).toBe(
+      'empty'
+    );
+  });
+
   it('refuses a byte-order mark on the byte path as well as the text path', () => {
     expect(refusalOf(() => decodeLine('﻿{"type":"ping"}')).kind).toBe('invalid-json');
     expect(refusalOf(() => decodeLine(encoder.encode('﻿{"type":"ping"}'))).kind).toBe(
@@ -198,5 +209,24 @@ describe('LineDecoder', () => {
     expect(outcome.frames).toEqual([]);
     expect(outcome.error?.kind).toBe('too-large');
     expect(outcome.error?.message).toContain('partial line is already 4097 bytes');
+  });
+
+  it('refuses an oversized blank line the same whether it arrives whole or split', () => {
+    const blank = `${' '.repeat(4097)}\n`;
+
+    const whole = new LineDecoder({ maxFrameBytes: 4096 });
+    const wholeOutcome = whole.push(blank);
+    expect(wholeOutcome.frames).toEqual([]);
+    expect(wholeOutcome.error?.kind).toBe('too-large');
+    // The line is complete here, terminator and all, so the refusal must not
+    // call it partial: `decodeLine` spells the same measurement this way.
+    expect(wholeOutcome.error?.message).toBe('line is 4097 bytes; expected at most 4096');
+
+    const split = new LineDecoder({ maxFrameBytes: 4096 });
+    const head = split.push(blank.slice(0, -1));
+    expect(head.frames).toEqual([]);
+    expect(head.error?.kind).toBe('too-large');
+    const tail = split.push(blank.slice(-1));
+    expect(tail.error?.kind).toBe('too-large');
   });
 });

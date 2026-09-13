@@ -295,9 +295,9 @@ async fn settled() {
 /// ```
 /// use mango_protocol::testing::CONFORMANCE_CASES;
 ///
-/// assert_eq!(CONFORMANCE_CASES.len(), 20);
+/// assert_eq!(CONFORMANCE_CASES.len(), 23);
 /// ```
-pub const CONFORMANCE_CASES: [&str; 20] = [
+pub const CONFORMANCE_CASES: [&str; 23] = [
     "completes the handshake in both directions and exposes the peers",
     "negotiates the effective minor downward",
     "refuses a different major with 4426 on both sides",
@@ -305,9 +305,12 @@ pub const CONFORMANCE_CASES: [&str; 20] = [
     "serves concurrent requests in both directions",
     "reports an unsupported method without ending the session",
     "carries a handler-chosen error code and its details",
+    "refuses a request past the in-flight ceiling and stays open",
     "refuses a reserved rpc. method before it reaches the wire",
+    "refuses rpc.discover below the minor that defines it",
     "delivers an event stream and its end marker in order",
     "numbers events per topic when no stream id is given",
+    "refuses one stream key past the local ceiling",
     "answers a protocol ping with a pong in both directions",
     "cancels an in-flight request and reports it as cancelled",
     "times out a request locally and ignores the late answer",
@@ -443,14 +446,89 @@ async fn carries_a_handler_chosen_error_code_and_its_details<F: Fixture>(fixture
     pair.close().await;
 }
 
+async fn refuses_a_request_past_the_in_flight_ceiling_and_stays_open<F: Fixture>(fixture: &F) {
+    let mut pair = fixture
+        .connect(
+            conformance_options(conformance_a()),
+            conformance_options(conformance_b()).with_max_in_flight(1),
+        )
+        .await;
+    let cancel = CancellationToken::new();
+    let a = pair.a().clone();
+    let held_options = RequestOptions {
+        cancel: Some(cancel.clone()),
+        ..Default::default()
+    };
+    let held = tokio::spawn(async move {
+        a.request_with("test.forever", json!({}), held_options)
+            .await
+    });
+    settled().await;
+
+    let refused = pair
+        .a()
+        .request("test.echo", json!({ "queued": true }))
+        .await
+        .expect_err("b is already holding its one slot");
+    assert_eq!(refused.code, codes::UNAVAILABLE);
+    let details = refused
+        .details
+        .as_ref()
+        .expect("the refusal names its kind");
+    assert_eq!(details.get("kind"), Some(&json!("in_flight_limit")));
+    assert_eq!(details.get("limit"), Some(&json!(1)));
+
+    // Retryable, not fatal: the slot frees when the held request settles and
+    // the very same call goes through.
+    cancel.cancel();
+    let _ = held.await.expect("the held request task did not panic");
+    settled().await;
+    let answer = pair
+        .a()
+        .request("test.echo", json!({ "queued": true }))
+        .await
+        .expect("the slot freed");
+    assert_eq!(answer, json!({ "queued": true }));
+    pair.close().await;
+}
+
 async fn refuses_a_reserved_rpc_method_before_it_reaches_the_wire<F: Fixture>(fixture: &F) {
     let mut pair = connect_default(fixture).await;
+    // Undefined at every minor, so it never reaches the peer at all.
+    let error = pair
+        .a()
+        .request("rpc.nowhere", json!({}))
+        .await
+        .expect_err("rpc. is reserved");
+    assert_eq!(error.code, codes::INVALID_REQUEST);
+    pair.close().await;
+}
+
+async fn refuses_rpc_discover_below_the_minor_that_defines_it<F: Fixture>(fixture: &F) {
+    let b = conformance_options(conformance_b()).with_protocol(ProtocolVersion::new(1, 0));
+    let mut pair = fixture
+        .connect(conformance_options(conformance_a()), b)
+        .await;
+    let remote = pair.a().ready().await.expect("the handshake succeeds");
+    assert_eq!(remote.effective_minor, 0);
+
+    // A 1.0 peer cannot have meant this method, so the requester never sends
+    // it: the refusal is local and names the minor it needed.
     let error = pair
         .a()
         .request("rpc.discover", json!({}))
         .await
-        .expect_err("rpc. is reserved");
+        .expect_err("rpc.discover is defined from minor 1");
     assert_eq!(error.code, codes::INVALID_REQUEST);
+    let details = error.details.as_ref().expect("the refusal names the minor");
+    assert_eq!(details.get("effectiveMinor"), Some(&json!(0)));
+
+    let answer = pair
+        .a()
+        .request("test.echo", json!({ "alive": true }))
+        .await
+        .expect("the session is unharmed");
+    assert_eq!(answer, json!({ "alive": true }));
     pair.close().await;
 }
 
@@ -549,6 +627,43 @@ async fn numbers_events_per_topic_when_no_stream_id_is_given<F: Fixture>(fixture
     let second = events.recv().await.expect("the stream stays open");
     assert_eq!(first.seq, 0);
     assert_eq!(second.seq, 1);
+    pair.close().await;
+}
+
+async fn refuses_one_stream_key_past_the_local_ceiling<F: Fixture>(fixture: &F) {
+    let mut pair = fixture
+        .connect(
+            conformance_options(conformance_a()).with_max_stream_keys(2),
+            conformance_options(conformance_b()),
+        )
+        .await;
+    pair.a().ready().await.expect("a is ready");
+    pair.b().ready().await.expect("b is ready");
+
+    let emit = |stream: &str, end: bool| EventInput {
+        topic: "test.stream".into(),
+        payload: Value::Null,
+        stream_id: Some(stream.into()),
+        end,
+    };
+    assert_eq!(pair.a().emit(emit("s-1", false)), Ok(true));
+    assert_eq!(pair.a().emit(emit("s-2", false)), Ok(true));
+
+    // Local, so nothing reaches the peer: a sender at this ceiling has leaked
+    // stream ids, which is a defect in the sender.
+    let refused = pair
+        .a()
+        .emit(emit("s-3", false))
+        .expect_err("a third key is one past the ceiling");
+    assert_eq!(refused.code, codes::UNAVAILABLE);
+    let details = refused
+        .details
+        .as_ref()
+        .expect("the refusal names its kind");
+    assert_eq!(details.get("kind"), Some(&json!("stream_key_limit")));
+
+    assert_eq!(pair.a().emit(emit("s-1", true)), Ok(true));
+    assert_eq!(pair.a().emit(emit("s-3", false)), Ok(true));
     pair.close().await;
 }
 
@@ -807,63 +922,72 @@ pub async fn run_conformance_suite<F: Fixture>(fixture: &F) {
     );
     case!(
         7,
-        refuses_a_reserved_rpc_method_before_it_reaches_the_wire(fixture)
+        refuses_a_request_past_the_in_flight_ceiling_and_stays_open(fixture)
     );
     case!(
         8,
-        delivers_an_event_stream_and_its_end_marker_in_order(fixture)
+        refuses_a_reserved_rpc_method_before_it_reaches_the_wire(fixture)
     );
     case!(
         9,
-        numbers_events_per_topic_when_no_stream_id_is_given(fixture)
+        refuses_rpc_discover_below_the_minor_that_defines_it(fixture)
     );
     case!(
         10,
-        answers_a_protocol_ping_with_a_pong_in_both_directions(fixture)
+        delivers_an_event_stream_and_its_end_marker_in_order(fixture)
     );
     case!(
         11,
+        numbers_events_per_topic_when_no_stream_id_is_given(fixture)
+    );
+    case!(12, refuses_one_stream_key_past_the_local_ceiling(fixture));
+    case!(
+        13,
+        answers_a_protocol_ping_with_a_pong_in_both_directions(fixture)
+    );
+    case!(
+        14,
         cancels_an_in_flight_request_and_reports_it_as_cancelled(fixture)
     );
     case!(
-        12,
+        15,
         times_out_a_request_locally_and_ignores_the_late_answer(fixture)
     );
     case!(
-        13,
+        16,
         fails_in_flight_requests_with_unavailable_when_the_connection_drops(fixture)
     );
-    case!(14, propagates_a_close_reason_code_to_the_peer(fixture));
+    case!(17, propagates_a_close_reason_code_to_the_peer(fixture));
     case!(
-        15,
+        18,
         refuses_a_result_past_the_frame_limit_without_ending_the_session(fixture)
     );
     case!(
-        16,
+        19,
         honours_the_lower_announced_frame_limit_when_sending(fixture)
     );
 
     if fixture.chunked() {
         case!(
-            17,
+            20,
             keeps_two_concurrent_oversized_results_from_interleaving(fixture)
         );
     }
     if fixture.supports_raw() {
         case!(
-            18,
+            21,
             closes_with_4426_when_the_peer_sends_a_hello_it_cannot_read(fixture)
         );
-        case!(19, ignores_unknown_envelope_members(fixture));
+        case!(22, ignores_unknown_envelope_members(fixture));
     }
 
-    let mut expected: Vec<&'static str> = CONFORMANCE_CASES[..17].to_vec();
+    let mut expected: Vec<&'static str> = CONFORMANCE_CASES[..20].to_vec();
     if fixture.chunked() {
-        expected.push(CONFORMANCE_CASES[17]);
+        expected.push(CONFORMANCE_CASES[20]);
     }
     if fixture.supports_raw() {
-        expected.push(CONFORMANCE_CASES[18]);
-        expected.push(CONFORMANCE_CASES[19]);
+        expected.push(CONFORMANCE_CASES[21]);
+        expected.push(CONFORMANCE_CASES[22]);
     }
     assert_eq!(
         ran, expected,

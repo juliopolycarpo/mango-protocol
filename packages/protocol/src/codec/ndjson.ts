@@ -153,6 +153,16 @@ export function measureFrameBytes(frame: Frame): number {
 export function decodeLine(line: string | Uint8Array, options?: FrameLimitOptions): Frame {
   const limit = resolveFrameLimit(options);
   const bytes = stripCarriageReturn(typeof line === 'string' ? encoder.encode(line) : line);
+  // Size before blankness, the order `LineDecoder` and the Rust codec both
+  // use: a line past the limit is refused for being past it whether or not
+  // anything but whitespace is in it, so one giant blank line cannot answer
+  // `empty` here and `too-large` everywhere else.
+  if (bytes.byteLength > limit) {
+    throw new CodecError(
+      'too-large',
+      `line is ${bytes.byteLength} bytes; expected at most ${limit}`
+    );
+  }
   const text = decoder.decode(bytes);
   if (BLANK_LINE.test(text)) {
     throw new CodecError('empty', 'line is blank; expected one JSON object');
@@ -201,30 +211,49 @@ export class LineDecoder {
       const record = this.#pending.subarray(0, newline);
       this.#pending = this.#pending.subarray(newline + 1);
       this.#searched = 0;
-      const error = this.#consume(record, frames);
+      // The size check runs before #consume's blank check, not after: a
+      // completed blank line must refuse exactly when the same bytes, still
+      // partial (no `\n` yet), already would have below. Checking blankness
+      // first let an oversized blank line buffer to completion and then be
+      // silently ignored, while the identical bytes arriving in two pushes
+      // were refused the moment they crossed the limit.
+      const content = stripCarriageReturn(record);
+      if (content.byteLength > this.#limit) {
+        return { frames, error: this.#refuse(content.byteLength, false) };
+      }
+      const error = this.#consume(content, frames);
       if (error !== undefined) return { frames, error };
     }
     this.#searched = this.#pending.byteLength;
     if (final) {
-      const rest = this.#pending;
+      const rest = stripCarriageReturn(this.#pending);
       this.#pending = EMPTY_BYTES;
       this.#searched = 0;
       const error = this.#consume(rest, frames);
       return error === undefined ? { frames } : { frames, error };
     }
-    if (this.#pending.byteLength > this.#limit) {
-      return { frames, error: this.#refuse(this.#pending.byteLength) };
+    // Measured without the `\r` a CRLF terminator will leave behind, the way
+    // the completed-line check above and the Rust decoder both measure: a
+    // buffer that is one byte over only because it ends in `\r` is still a
+    // line within the limit whose `\n` is in the next chunk. Measuring the
+    // raw buffer here made the identical bytes decode or refuse depending on
+    // where the chunk boundary happened to fall.
+    const partial = stripCarriageReturn(this.#pending);
+    if (partial.byteLength > this.#limit) {
+      return { frames, error: this.#refuse(partial.byteLength, true) };
     }
     return { frames };
   }
 
-  /** Decodes one record, or latches the refusal that ends the stream. */
-  #consume(record: Uint8Array, frames: Frame[]): CodecError | undefined {
-    const bytes = stripCarriageReturn(record);
-    const text = decoder.decode(bytes);
+  /**
+   * Decodes one record whose terminator — the `\n` and any `\r` before it —
+   * is already stripped, or latches the refusal that ends the stream.
+   */
+  #consume(content: Uint8Array, frames: Frame[]): CodecError | undefined {
+    const text = decoder.decode(content);
     if (BLANK_LINE.test(text)) return undefined;
     try {
-      frames.push(decodeRecord(text, bytes.byteLength, this.#limit));
+      frames.push(decodeRecord(text, content.byteLength, this.#limit));
       return undefined;
     } catch (error) {
       if (!(error instanceof CodecError)) throw error;
@@ -233,11 +262,16 @@ export class LineDecoder {
     }
   }
 
-  /** Refuses a partial line that already passed the limit, before its terminator. */
-  #refuse(byteLength: number): CodecError {
+  /**
+   * Refuses a line past the limit and ends the stream. `partial` says whether
+   * its terminator had arrived yet, so the message describes what was really
+   * measured instead of calling a completed line partial.
+   */
+  #refuse(byteLength: number, partial: boolean): CodecError {
+    const measured = partial ? 'partial line is already' : 'line is';
     const refusal = new CodecError(
       'too-large',
-      `partial line is already ${byteLength} bytes; expected at most ${this.#limit}`
+      `${measured} ${byteLength} bytes; expected at most ${this.#limit}`
     );
     this.#refusal = refusal;
     this.#pending = EMPTY_BYTES;
