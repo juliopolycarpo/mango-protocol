@@ -14,6 +14,11 @@ reads stdin and writes stdout, and nothing about framing, handshake or teardown 
   adds them back explicitly.
 - stdout is the frame stream; stdin is the frame stream in the other direction; stderr is
   captured into a bounded tail (16 KiB is the reference size).
+- **stderr is bytes, and is decoded as UTF-8 lossily.** A child writes whatever its logger and
+  its runtime's own diagnostics produce, and a tail cut at a byte budget routinely ends mid
+  sequence. A launcher MUST NOT refuse a child, or lose the rest of a tail, because some of it
+  did not decode: undecodable bytes become the replacement character and the tail is reported
+  anyway. The tail exists to be pasted into a bug report; it is never parsed.
 - The launcher waits for the child's `hello` with a timeout. The reference budgets are 5 seconds
   for a local child and 20 seconds through a wrapper that has to open a network connection or
   start a container first.

@@ -63,6 +63,13 @@ The WebSocket close code carries the reason code (`4000`–`4999`), so a `close`
 optional on this transport. When both are sent, the frame goes first. The fatal set applies to
 the WebSocket close code exactly as it does to `close.code`.
 
+RFC 6455 caps the close frame's reason at 123 UTF-8 bytes, well under the 1024 characters
+[§11](../mango-protocol-1.md#11-limits) allows. The sender truncates its reason to fit, on a
+character boundary so the bytes stay valid UTF-8, and a receiver MUST treat a truncated reason
+as the reason. A sender whose reason does not fit SHOULD send the `close` frame too: the frame
+carries the reason whole, and it goes first, so the peer has read it by the time the close code
+arrives.
+
 ## Backpressure
 
 One queue per connection. The socket reports each send as **sent**, **buffered under

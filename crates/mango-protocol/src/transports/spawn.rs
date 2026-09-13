@@ -1213,6 +1213,29 @@ mod tests {
         assert_eq!(tail.text(), "defg");
     }
 
+    /// A tail cut at a byte budget routinely lands mid sequence, and a child
+    /// may write bytes that are not UTF-8 at all. spawn.md says the tail is
+    /// decoded lossily and reported anyway; losing it is the failure.
+    #[test]
+    fn a_tail_that_is_not_valid_utf8_is_still_reported() {
+        let mut tail = BoundedTail::new(16);
+        tail.append("permission denied: \u{1f96d}".as_bytes());
+        // Cut the four-byte mango in half, exactly as a byte budget would.
+        let mut split = BoundedTail::new(16);
+        split.append(&"caf\u{e9} \u{1f96d}".as_bytes()[..8]);
+
+        assert!(tail.text().contains("denied"), "{}", tail.text());
+        assert!(
+            split.text().contains('\u{fffd}'),
+            "a half sequence becomes the replacement character: {:?}",
+            split.text()
+        );
+
+        let mut raw = BoundedTail::new(8);
+        raw.append(&[0xff, 0xfe, b'o', b'k']);
+        assert!(raw.text().ends_with("ok"), "{:?}", raw.text());
+    }
+
     #[test]
     fn the_last_line_that_says_anything_is_the_reason() {
         assert_eq!(

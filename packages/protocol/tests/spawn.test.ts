@@ -26,6 +26,7 @@ const STUBBORN_CHILD = fileURLToPath(new URL('./fixtures/stubborn-child.ts', imp
 const MISSING_COMMAND = fileURLToPath(new URL('./fixtures/no-such-binary', import.meta.url));
 
 const decoder = new TextDecoder();
+const encoder = new TextEncoder();
 
 /** A child that never runs: enough of the shape for the launcher to wire it. */
 class FakeChildProcess extends EventEmitter {
@@ -211,6 +212,24 @@ describe('spawn launcher', () => {
       spawnErrorCode: undefined,
       stderrLine: 'still running',
     });
+  });
+
+  it('reports a stderr tail that is not valid UTF-8 rather than losing it', async () => {
+    const recording = new RecordingSpawn();
+    const peer = spawnPort({ argv: ['runtime'] }, recording.spawn);
+    // A child writes whatever its logger produces, and a tail cut at a byte
+    // budget routinely lands mid sequence. spawn.md says the tail is decoded
+    // lossily and reported anyway.
+    const mango = encoder.encode('caf\u00e9 \u{1f96d}');
+    recording.child.stderr.write(Buffer.from([0xff, 0xfe]));
+    recording.child.stderr.write(Buffer.from(mango.slice(0, 8)));
+    recording.child.stderr.write(Buffer.from('ok', 'utf8'));
+    await waitFor(() => peer.stderrTail().endsWith('ok'));
+
+    const tail = peer.stderrTail();
+    expect(tail).toContain('caf\u00e9');
+    expect(tail).toContain('\ufffd');
+    expect(tail.endsWith('ok')).toBe(true);
   });
 
   it('names the spawn error code of a command that never became a process', async () => {
