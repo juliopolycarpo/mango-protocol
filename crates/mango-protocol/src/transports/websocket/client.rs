@@ -142,10 +142,18 @@ pub async fn connect_websocket(
 ) -> Result<DialledWebSocketPort, ConnectError> {
     let request = build_request(url, options)?;
     let config = options.websocket.socket_config();
-    let connector = tls_connector(url)?;
+    // Only a `wss://` dial needs one, and only a `wss://` dial should fail
+    // when the provider will not build: a plain `ws://` carries no TLS at all,
+    // so handing the handshake `None` there is what it already means. The
+    // scheme comes from the parsed request rather than the string, which
+    // `into_client_request` has already normalised.
+    let connector = match request.uri().scheme_str() {
+        Some("wss") => Some(tls_connector(url)?),
+        _ => None,
+    };
 
     let (stream, response) = connect_within(url, deadline, async move {
-        connect_async_tls_with_config(request, Some(config), false, Some(connector))
+        connect_async_tls_with_config(request, Some(config), false, connector)
             .await
             .map_err(|error| handshake_error(url, &error))
     })
