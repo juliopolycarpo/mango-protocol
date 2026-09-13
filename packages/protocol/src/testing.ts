@@ -14,6 +14,7 @@ export {
 export { rejectionOf } from './testing/rejection';
 
 export {
+  crossFileDefinitions,
   type Definitions,
   isConstTaggedUnion,
   type Json,

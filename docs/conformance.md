@@ -111,11 +111,13 @@ propagation including fatal codes, `FRAME_TOO_LARGE` without ending the session,
 lower announced frame limit, and, with `connectRaw`, a schema-invalid `hello` answered with
 `4426` and unknown members ignored.
 
-`@mangostudio/protocol/testing` also exports `normalizeSchema` and `schemaDifferences`, the
-rules this repository's own schema-equality check runs on. A consumer that emits a JSON Schema
-of its own — from TypeBox on one side and schemars on the other, say — compares the two by
-those rules rather than by a fourth copy of them, and a rule this repository adds reaches it
-with the next package release instead of drifting.
+`@mangostudio/protocol/testing` also exports `normalizeSchema`, `schemaDifferences` and
+`crossFileDefinitions`, the rules this repository's own schema-equality check runs on. A consumer
+that emits a JSON Schema of its own — from TypeBox on one side and schemars on the other, say —
+compares the two by those rules rather than by a fourth copy of them, and a rule this repository
+adds reaches it with the next package release instead of drifting. `crossFileDefinitions` is what
+makes a cross-file `other.json#/$defs/<name>` resolvable: it keys one file's `$defs` by that
+reference so the caller can merge them into the definitions it passes `normalizeSchema`.
 
 Assert a rejection with `rejectionOf` from the same entry rather than Bun's `expect().rejects`:
 that matcher does not pump libuv-backed I/O on Windows while it waits, so a request whose answer
