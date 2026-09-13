@@ -167,7 +167,9 @@ The conformance suite itself cannot run here — it drives both sessions, and on
 in another process — so each direction runs the list that can be proven from one side alone: the
 handshake and the peer it names, `test.echo`, a 512 KiB `test.bulk` result, an unsupported
 method, `test.refuse`'s chosen code and details, a cancelled `test.forever`, and the peer
-exiting when the session closes. Each transport also writes the frozen 1.0.1 hello as raw bytes
+exiting when the session closes, and `rpc.discover` answering with the shared example catalog —
+the Rust peer publishes `spec/fixtures/1/catalog-example.json` and the TypeScript side compares
+what came off the wire against that same file. Each transport also writes the frozen 1.0.1 hello as raw bytes
 and asserts the Rust peer answers `4426`; the WebSocket direction additionally asserts a
 credential the acceptor does not know is refused with `4401` before any `hello`.
 
