@@ -211,3 +211,48 @@ async fn a_frame_at_the_limit_is_not_mistaken_for_a_peer_that_stopped_reading() 
         .expect("the acceptor task runs");
     assert_eq!(reassembled, FRAME_LIMIT, "every chunk of the frame arrived");
 }
+
+#[tokio::test]
+async fn two_frames_at_the_limit_in_a_row_reach_a_peer_that_is_reading() {
+    // The queue is a peer that stopped reading only when it grows past a frame
+    // limit *while the socket is not draining*. One frame of exactly the limit
+    // leaves that much behind it, so a second sent before the writer task has
+    // been polled sees a backlog over the limit on a perfectly healthy socket.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+    let address = listener.local_addr().expect("a bound address");
+
+    let acceptor = tokio::spawn(async move {
+        let (socket, _address) = listener.accept().await.expect("a dialler");
+        let mut stream = upgrade(socket).await;
+        let mut payload = 0_usize;
+        while let Some(Ok(message)) = stream.next().await {
+            match message {
+                Message::Binary(bytes) => payload += bytes.len() - 9,
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        payload
+    });
+
+    let port = connect_websocket(
+        &format!("ws://{address}/reading"),
+        &WebSocketConnectOptions::default().with_websocket(options()),
+        &ConnectDeadline::default().with_timeout(Duration::from_secs(5)),
+    )
+    .await
+    .expect("the acceptor selects mango.v1");
+
+    let (mut tx, _rx) = port.split();
+    let first = tx.send(frame_of(FRAME_LIMIT)).await;
+    let second = tx.send(frame_of(FRAME_LIMIT)).await;
+    assert_eq!(first, SendOutcome::Sent, "a frame at the limit is legal");
+    assert_eq!(
+        second,
+        SendOutcome::Sent,
+        "and so is the one after it: this peer is reading, so nothing here is a peer that stopped"
+    );
+
+    tx.close(close_codes::RELEASED, None).await;
+    let _ = tokio::time::timeout(Duration::from_secs(20), acceptor).await;
+}

@@ -10,7 +10,9 @@
 //! [`server`] does the upgrade-time work — the subprotocol and the bearer —
 //! for a peer that has no HTTP stack of its own yet.
 
+use std::future::{Future, poll_fn};
 use std::marker::PhantomData;
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -433,6 +435,15 @@ struct SocketWriter {
     /// False once anything closed the socket; every later send is reported as
     /// the transport being gone rather than queued behind a dead one.
     open: Arc<AtomicBool>,
+    /// True while the socket has answered `Pending` to a write — it is holding
+    /// what it was given rather than taking more.
+    /// This is the "while the socket is not draining" half of websocket.md's
+    /// Backpressure rule, and the counterpart of the TypeScript port's
+    /// `#paused`. Without it a backlog alone condemns a healthy peer: one
+    /// frame of exactly the limit leaves that much behind it, so the next
+    /// frame sent before the writer has been polled sees a queue over the
+    /// limit on a socket that is draining perfectly well.
+    paused: Arc<AtomicBool>,
     /// Held, never read: dropping the last handle aborts the writer task, so
     /// one still stuck on a socket that will not take the farewell cannot
     /// outlive the port.
@@ -475,16 +486,19 @@ impl SocketWriter {
         let (commands, receiver) = mpsc::unbounded_channel();
         let queued_bytes = Arc::new(AtomicUsize::new(0));
         let open = Arc::new(AtomicBool::new(true));
+        let paused = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn(drive(
             sink,
             receiver,
             Arc::clone(&queued_bytes),
             Arc::clone(&open),
+            Arc::clone(&paused),
         ));
         Self {
             commands,
             queued_bytes,
             open,
+            paused,
             _task: Arc::new(AbortOnDrop(task)),
             options,
         }
@@ -494,10 +508,11 @@ impl SocketWriter {
     ///
     /// Reports [`SendOutcome::Sent`] once they are the writer's, the way the
     /// TypeScript port reports a message the socket buffered. A queue that has
-    /// passed one frame limit is a peer that is not reading: the socket is
-    /// closed with `4400` and the session is told the transport is gone,
-    /// rather than every pending response being held for a socket that may
-    /// never drain.
+    /// passed one frame limit *while the socket is not draining* is a peer
+    /// that is not reading: the socket is closed with `4400` and the session
+    /// is told the transport is gone, rather than every pending response being
+    /// held for a socket that may never drain. Both halves are required — a
+    /// backlog on a socket that is still taking bytes is just a busy sender.
     async fn send_frame(&self, frame: &Frame) -> SendOutcome {
         if !self.open.load(Ordering::Acquire) {
             return SendOutcome::Closed;
@@ -524,7 +539,10 @@ impl SocketWriter {
             self.open.store(false, Ordering::Release);
             return SendOutcome::Closed;
         }
-        if waiting > self.options.max_frame_bytes {
+        // Both halves of the rule, never the backlog alone: a queue over the
+        // limit is only a peer that stopped reading if the socket is also not
+        // taking what it is given.
+        if waiting > self.options.max_frame_bytes && self.paused.load(Ordering::Acquire) {
             self.close(
                 close_codes::PROTOCOL_ERROR,
                 Some("the send queue outgrew one frame limit while the socket was not draining"),
@@ -620,6 +638,7 @@ async fn drive<S>(
     mut commands: mpsc::UnboundedReceiver<WriteCommand>,
     queued_bytes: Arc<AtomicUsize>,
     open: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -630,7 +649,21 @@ async fn drive<S>(
                 // written: what the counter measures is the queue behind the
                 // socket, and the frame being written is no longer in it.
                 queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
-                let written = write_chunks(&mut sink, messages).await;
+                // Raised only while the socket itself has answered `Pending` —
+                // it has the bytes and will not take more yet. That is what
+                // "not draining" means to a sender deciding whether a backlog
+                // is a peer that stopped reading, and it is the same thing the
+                // TypeScript port's `#paused` records when its sink reports a
+                // chunk as buffered rather than sent. A write that completes
+                // in one poll never raises it, so a busy sender is never
+                // mistaken for a stalled socket.
+                let mut write = pin!(write_chunks(&mut sink, messages));
+                let written = poll_fn(|cx| {
+                    let polled = write.as_mut().poll(cx);
+                    paused.store(polled.is_pending(), Ordering::Release);
+                    polled
+                })
+                .await;
                 if !written {
                     open.store(false, Ordering::Release);
                     break;
