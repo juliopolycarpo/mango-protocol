@@ -275,8 +275,13 @@ where
         .await;
         return Err(AcceptError::Subprotocol);
     }
-    if !is_origin_allowed(upgrade.origin(), &options.allowed_origins) {
-        let origin = upgrade.origin().unwrap_or_default().to_string();
+    if upgrade.origin_undecodable || !is_origin_allowed(upgrade.origin(), &options.allowed_origins)
+    {
+        let origin = if upgrade.origin_undecodable {
+            "<undecodable>".to_string()
+        } else {
+            upgrade.origin().unwrap_or_default().to_string()
+        };
         close_with(stream, close_codes::FORBIDDEN, "origin not allowed").await;
         return Err(AcceptError::Origin { origin });
     }
@@ -295,6 +300,12 @@ pub struct Upgrade {
     offered_subprotocol: bool,
     bearer: Option<String>,
     origin: Option<String>,
+    /// The upgrade carried an `Origin` header, but its bytes were not valid
+    /// UTF-8 — distinct from no header at all: absent is a native dialler,
+    /// undecodable is a browser sending something [`Upgrade::origin`] cannot
+    /// represent. Refused the same as any origin outside the allow-list,
+    /// never treated as "no origin attached".
+    origin_undecodable: bool,
 }
 
 impl Upgrade {
@@ -342,14 +353,16 @@ impl Upgrade {
             .and_then(|value| value.to_str().ok())
             .and_then(bearer_token)
             .map(ToOwned::to_owned);
-        let origin = headers
-            .get(header::ORIGIN)
+        let origin_header = headers.get(header::ORIGIN);
+        let origin = origin_header
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned);
+        let origin_undecodable = origin_header.is_some() && origin.is_none();
         Self {
             offered_subprotocol,
             bearer,
             origin,
+            origin_undecodable,
         }
     }
 }
@@ -442,6 +455,24 @@ mod tests {
         assert_eq!(bearer_token("Bearer"), None);
         assert_eq!(bearer_token("Bearer "), None);
         assert_eq!(bearer_token("Basic abc"), None);
+    }
+
+    #[test]
+    fn an_undecodable_origin_is_not_the_same_as_no_origin() {
+        use tokio_tungstenite::tungstenite::http::HeaderValue;
+
+        let absent = Upgrade::read(&request(&[]));
+        assert_eq!(absent.origin(), None);
+        assert!(!absent.origin_undecodable);
+
+        let mut with_undecodable = request(&[]);
+        with_undecodable.headers_mut().insert(
+            header::ORIGIN,
+            HeaderValue::from_bytes(b"\xff\xfe").expect("raw bytes are a valid header value"),
+        );
+        let undecodable = Upgrade::read(&with_undecodable);
+        assert_eq!(undecodable.origin(), None);
+        assert!(undecodable.origin_undecodable);
     }
 
     #[test]

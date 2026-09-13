@@ -492,6 +492,67 @@ async fn an_origin_outside_the_allow_list_is_refused_before_hello() {
     assert_eq!(code, Some(close_codes::FORBIDDEN));
 }
 
+/// An `Origin` header a browser sent but whose bytes are not valid UTF-8 must
+/// not fall through `HeaderValue::to_str().ok()` into "absent" — that would
+/// let a garbled header sail past an empty allow-list the same way a native
+/// dialler does. It has to be refused like any other origin the allow-list
+/// does not recognise.
+#[tokio::test]
+async fn an_undecodable_origin_is_refused_not_treated_as_absent() {
+    use tokio_tungstenite::tungstenite::handshake::client::generate_key;
+    use tokio_tungstenite::tungstenite::http::{HeaderValue, Request as HttpRequest, header};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+    let address = listener.local_addr().expect("a bound address");
+    let accepting = tokio::spawn(async move {
+        let (socket, _from) = listener.accept().await.expect("a dialler arrives");
+        accept_websocket(socket, AcceptOptions::default(), |_upgrade| Ok(()))
+            .await
+            .map(|_port| ())
+    });
+
+    let mut request = HttpRequest::builder()
+        .uri(format!("ws://{address}/conformance"))
+        .header(header::HOST, address.to_string())
+        .header(header::CONNECTION, "Upgrade")
+        .header(header::UPGRADE, "websocket")
+        .header(header::SEC_WEBSOCKET_VERSION, "13")
+        .header(header::SEC_WEBSOCKET_KEY, generate_key())
+        .header(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            mango_protocol::transports::websocket::WEBSOCKET_SUBPROTOCOL,
+        )
+        .body(())
+        .expect("a request");
+    request.headers_mut().insert(
+        header::ORIGIN,
+        HeaderValue::from_bytes(b"\xff\xfe").expect("raw bytes are a valid header value"),
+    );
+    let dialling = tokio::spawn(async move { tokio_tungstenite::connect_async(request).await });
+
+    let refusal = accepting
+        .await
+        .expect("the acceptor task runs")
+        .expect_err("the default allow-list admits no browser, undecodable or not");
+    assert!(
+        matches!(refusal, AcceptError::Origin { .. }),
+        "expected an origin refusal, got {refusal}"
+    );
+
+    let (mut dialled, _response) = dialling
+        .await
+        .expect("the dial task runs")
+        .expect("the upgrade itself succeeds");
+    let mut code = None;
+    while let Some(Ok(message)) = dialled.next().await {
+        if let tokio_tungstenite::tungstenite::Message::Close(frame) = message {
+            code = frame.map(|frame| u16::from(frame.code));
+            break;
+        }
+    }
+    assert_eq!(code, Some(close_codes::FORBIDDEN));
+}
+
 #[tokio::test]
 async fn a_dialler_without_an_origin_is_not_treated_as_a_browser() {
     let acceptor = Acceptor::bind(WebSocketOptions::default()).await;
