@@ -86,6 +86,19 @@ export interface SessionOptions {
    * lower of both sides' ceilings bounds every frame this side sends.
    */
   readonly maxFrameBytes?: number;
+  /**
+   * How many requests this side will answer at once. Past it a `req` is
+   * refused with `UNAVAILABLE` and `details.kind` of `in_flight_limit`, which
+   * the requester may retry; 256 by default. Announced in
+   * `hello.limits.maxInFlight` so the peer can pace itself.
+   */
+  readonly maxInFlight?: number;
+  /**
+   * How many stream keys this side will emit on at once. A new key past it is
+   * refused locally and nothing is sent; 1024 by default. Local, never
+   * announced: reaching it means this side leaked stream ids.
+   */
+  readonly maxStreamKeys?: number;
   /** How long to wait for the peer's `hello`; 15 seconds by default. */
   readonly handshakeTimeoutMs?: number;
   /** Ping cadence after the handshake; 20 seconds by default, `false` disables. */
@@ -106,6 +119,15 @@ export const HANDSHAKE_TIMEOUT_REASON = 'handshake timeout';
 
 /** Default ping cadence once the handshake completes (§9). */
 export const DEFAULT_LIVENESS_INTERVAL_MS = 20_000;
+
+/** Requests one side answers at once before it starts refusing (§11.2). */
+export const DEFAULT_MAX_IN_FLIGHT = 256;
+
+/** Stream keys one side emits on at once before `emit` refuses (§11.2). */
+export const DEFAULT_MAX_STREAM_KEYS = 1024;
+
+/** `error.details.kind` on the refusal that says the responder is full (§11.2). */
+export const IN_FLIGHT_LIMIT_KIND = 'in_flight_limit';
 
 interface PendingRequest {
   readonly method: string;
@@ -141,6 +163,8 @@ export class Session {
   readonly #timers: SessionTimers;
   readonly #localProtocol: ProtocolVersion;
   readonly #localMaxFrameBytes: number;
+  readonly #maxInFlight: number;
+  readonly #maxStreamKeys: number;
   readonly #handlers = new Map<string, RequestHandler>();
   readonly #pending = new Map<string, PendingRequest>();
   readonly #active = new Map<string, AbortController>();
@@ -168,6 +192,8 @@ export class Session {
     this.#localProtocol = options.protocol ?? PROTOCOL_VERSION;
     this.#localMaxFrameBytes =
       options.maxFrameBytes ?? port.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
+    this.#maxInFlight = options.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT;
+    this.#maxStreamKeys = options.maxStreamKeys ?? DEFAULT_MAX_STREAM_KEYS;
     this.#requestIdPrefix = options.requestIdPrefix ?? 'r';
     for (const [method, handler] of Object.entries(options.handlers ?? {})) {
       this.#handlers.set(method, handler);
@@ -207,6 +233,15 @@ export class Session {
   get sendLimitBytes(): number {
     const remote = this.#remote?.limits?.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
     return Math.min(this.#localMaxFrameBytes, remote);
+  }
+
+  /**
+   * How many requests the peer said it will answer at once, so a requester can
+   * pace itself instead of discovering the ceiling by being refused. The
+   * default until the peer announces otherwise.
+   */
+  get remoteMaxInFlight(): number {
+    return this.#remote?.limits?.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT;
   }
 
   /** Registers a handler; returns the function that removes it. */
@@ -279,6 +314,13 @@ export class Session {
   emit(event: EventInput): boolean {
     if (this.#state !== 'ready') return false;
     const key = event.streamId ?? event.topic;
+    if (!this.#eventSequences.has(key) && this.#eventSequences.size >= this.#maxStreamKeys) {
+      throw new RemoteError(
+        RESERVED_ERROR_CODES.UNAVAILABLE,
+        `Stream key "${key}" would be the ${this.#maxStreamKeys + 1}th open on this session; the ceiling is ${this.#maxStreamKeys}. End a stream before starting another.`,
+        { kind: 'stream_key_limit', key, limit: this.#maxStreamKeys }
+      );
+    }
     const seq = this.#eventSequences.get(key) ?? 0;
     const frame: EventFrame = {
       type: 'evt',
@@ -339,14 +381,20 @@ export class Session {
   }
 
   #startHandshake(): void {
+    // `hello.limits` is announced whole, never gated on the effective minor:
+    // nobody knows it yet, and §4 has the peer ignore what it cannot read.
+    const limits: Limits = {
+      ...(this.#localMaxFrameBytes < DEFAULT_MAX_FRAME_BYTES
+        ? { maxFrameBytes: this.#localMaxFrameBytes }
+        : {}),
+      ...(this.#maxInFlight !== DEFAULT_MAX_IN_FLIGHT ? { maxInFlight: this.#maxInFlight } : {}),
+    };
     const hello: HelloFrame = {
       type: 'hello',
       protocol: this.#localProtocol,
       peer: this.#options.peer,
       capabilities: { ...(this.#options.capabilities ?? {}) },
-      ...(this.#localMaxFrameBytes < DEFAULT_MAX_FRAME_BYTES
-        ? { limits: { maxFrameBytes: this.#localMaxFrameBytes } }
-        : {}),
+      ...(Object.keys(limits).length > 0 ? { limits } : {}),
     };
     try {
       this.#port.send(hello);
@@ -484,6 +532,16 @@ export class Session {
         code: RESERVED_ERROR_CODES.UNAVAILABLE,
         message:
           'The session handshake has not completed; requests are refused until both hellos have crossed.',
+      });
+      return;
+    }
+    if (this.#active.size >= this.#maxInFlight) {
+      // Retryable, and the session stays open: the peer is not misbehaving,
+      // it is ahead of what this side agreed to hold (§11.2).
+      this.#respondError(frame.id, {
+        code: RESERVED_ERROR_CODES.UNAVAILABLE,
+        message: `This peer is already answering ${this.#maxInFlight} requests; retry "${frame.method}" once one of yours has settled.`,
+        details: { kind: IN_FLIGHT_LIMIT_KIND, limit: this.#maxInFlight, method: frame.method },
       });
       return;
     }

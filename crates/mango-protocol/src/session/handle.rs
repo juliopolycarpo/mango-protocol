@@ -249,6 +249,27 @@ impl Session {
         self.shared.send_limit_bytes()
     }
 
+    /// How many requests the peer said it will answer at once, so a requester
+    /// can pace itself rather than discover the ceiling by being refused
+    /// (§11.2). The default until the peer announces otherwise.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_protocol::frame::PeerInfo;
+    /// use mango_protocol::port::port_pair;
+    /// use mango_protocol::session::{DEFAULT_MAX_IN_FLIGHT, Session, SessionOptions};
+    ///
+    /// let (a, _b) = port_pair();
+    /// let peer = PeerInfo { name: "hub".into(), version: "1".into(), role: "hub".into() };
+    /// let (session, _driver) = Session::open(a, SessionOptions::new(peer));
+    /// assert_eq!(session.remote_max_in_flight(), DEFAULT_MAX_IN_FLIGHT);
+    /// ```
+    #[must_use]
+    pub fn remote_max_in_flight(&self) -> usize {
+        self.shared.remote_max_in_flight()
+    }
+
     /// Closes the transport with a reason code and settles everything in
     /// flight, resolving once every handler has settled (bounded by
     /// `handler_grace`) and the port is shut.
@@ -449,6 +470,19 @@ impl Session {
         } = event;
         let key = stream_id.clone().unwrap_or_else(|| topic.clone());
         let mut sequences = lock(&self.shared.event_sequences);
+        let limit = self.shared.max_stream_keys;
+        if !sequences.contains_key(&key) && sequences.len() >= limit {
+            return Err(RemoteError::new(
+                codes::UNAVAILABLE,
+                format!(
+                    "Stream key \"{key}\" would be one past the {limit} this session emits on at \
+                     once. End a stream before starting another."
+                ),
+            )
+            .with_detail("kind", super::options::STREAM_KEY_LIMIT_KIND)
+            .with_detail("key", key)
+            .with_detail("limit", u64::try_from(limit).unwrap_or(u64::MAX)));
+        }
         let seq = sequences.get(&key).copied().unwrap_or(0);
         let what = format!("Event \"{topic}\"");
         let frame = Frame::Evt(Event {

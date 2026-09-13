@@ -137,6 +137,25 @@ let result = a.request("fs.read-file", serde_json::json!({ "path": "README.md" }
 `cargo run --example session_pair --features tokio` runs a fuller version end to end: a request,
 an event stream and a cancelled call between two in-process sessions.
 
+A session bounds what the peer can make it hold, so a peer that opens requests and never cancels
+them cannot grow this side without limit:
+
+```rust
+let options = SessionOptions::new(peer("runtime"))
+    .with_max_in_flight(32)   // requests this side answers at once; 256 by default
+    .with_max_stream_keys(64); // stream keys this side emits on at once; 1024 by default
+
+// What the peer said it will answer at once, so a caller can pace itself
+// instead of discovering the ceiling by being refused.
+let budget = a.remote_max_in_flight();
+```
+
+`max_in_flight` is announced in `hello.limits`. Past it, a request is answered with `UNAVAILABLE`
+and `details.kind` of `in_flight_limit`; that refusal is **retryable** — send the same call again
+once one of yours has settled, and never latch on it the way you would on `METHOD_UNSUPPORTED`.
+`max_stream_keys` is local and never announced: `emit` returns `Err` when a new key would pass
+it, because reaching it means this side leaked stream ids rather than that the peer did anything.
+
 ## Serve a contract
 
 A `Contract` (see [Build a contract](build-a-contract.md)) wraps a session with schema

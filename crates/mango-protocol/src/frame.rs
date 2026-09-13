@@ -123,6 +123,19 @@ pub struct Limits {
         schemars(schema_with = "crate::schema::constraints::max_frame_bytes")
     )]
     pub max_frame_bytes: Option<u64>,
+    /// How many requests this peer will hold open for the other side at once;
+    /// at least `1`. Absent means the default of 256 (§11.2). Wire minor 1.
+    #[serde(
+        rename = "maxInFlight",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present::option"
+    )]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "crate::schema::constraints::max_in_flight")
+    )]
+    pub max_in_flight: Option<u64>,
 }
 
 /// Handshake frame; both peers send exactly one as soon as the transport opens.
@@ -450,6 +463,7 @@ mod tests {
     fn max_frame_bytes_uses_its_camel_case_name() {
         let limits = Limits {
             max_frame_bytes: Some(4096),
+            max_in_flight: None,
         };
         let text = serde_json::to_string(&limits).expect("serialises");
         assert_eq!(text, r#"{"maxFrameBytes":4096}"#);

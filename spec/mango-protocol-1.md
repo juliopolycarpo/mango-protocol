@@ -1,8 +1,13 @@
-# Mango Protocol 1.0
+# Mango Protocol 1
 
-Status: draft. This document is normative for wire major 1. `spec/schema/1/protocol.json` is the
-normative JSON Schema for every shape named here; where prose and schema disagree, the schema
-wins and the prose is a bug.
+Status: draft. This document is normative for wire major 1, up to and including minor 1.
+`spec/schema/1/protocol.json` is the normative JSON Schema for every shape named here; where
+prose and schema disagree, the schema wins and the prose is a bug.
+
+| Minor | Added                                                      |
+| ----- | ---------------------------------------------------------- |
+| `1.0` | Everything else in this document.                          |
+| `1.1` | `hello.limits.maxInFlight` ([§11.2](#112-session-limits)). |
 
 The key words MUST, MUST NOT, SHOULD and MAY are to be read as in RFC 2119.
 
@@ -99,8 +104,9 @@ As soon as the transport is open, each peer MUST send exactly one `hello`:
   matching `^[a-z][a-z0-9-]*$`.
 - `capabilities` is an object owned by the application contract. The protocol does not define
   its members. It MUST be present; `{}` is valid.
-- `limits.maxFrameBytes`, when present, lowers the frame size ceiling this peer will accept
-  (see [§11](#11-limits)).
+- `limits.maxFrameBytes`, when present, lowers the frame size ceiling this peer will accept,
+  and `limits.maxInFlight` announces how many requests this peer will hold open for the other
+  side at once (see [§11](#11-limits)).
 
 Until a peer has received the other side's `hello`, it MUST NOT send any frame other than
 `hello`, `ping`, `pong`, `close`, or an `err` answering a request the other side sent too
@@ -181,18 +187,18 @@ session, including requests it refused, cancelled, or could not route:
 
 ### 6.3 Reserved error codes
 
-| Code                 | Sent when                                                                                                                                                  |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `UNAVAILABLE`        | The session cannot serve requests: handshake not complete, or session closing. Also the local code a requester reports when the transport closes mid-call. |
-| `INVALID_REQUEST`    | The frame is schema-valid but breaks a protocol rule: duplicate in-flight id, method grammar accepted by a lax decoder, reserved `rpc.` method.            |
-| `METHOD_UNSUPPORTED` | The responder has no handler for `method`.                                                                                                                 |
-| `INVALID_PARAMS`     | `params` failed the contract's schema for this method. `details` SHOULD name the failing path.                                                             |
-| `DENIED`             | The method exists but policy refuses it (consent, authorisation). `details` SHOULD say which capability or rule.                                           |
-| `CANCELLED`          | The handler stopped because a `cancel` arrived.                                                                                                            |
-| `TIMEOUT`            | Local: the requester's own deadline passed. A responder MAY also send it when a handler exceeded a server-side budget.                                     |
-| `FRAME_TOO_LARGE`    | The response would exceed the frame limit; the handler's result is replaced by this error.                                                                 |
-| `PROTOCOL_MISMATCH`  | A request that cannot be served at the effective minor. Normally the handshake refuses first and this code is never seen.                                  |
-| `INTERNAL`           | Anything else that failed inside the responder.                                                                                                            |
+| Code                 | Sent when                                                                                                                                                                                                                                                               |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `UNAVAILABLE`        | The session cannot serve requests: handshake not complete, session closing, or already holding `maxInFlight` requests open ([§11.2](#112-session-limits), where `details.kind` says which). Also the local code a requester reports when the transport closes mid-call. |
+| `INVALID_REQUEST`    | The frame is schema-valid but breaks a protocol rule: duplicate in-flight id, method grammar accepted by a lax decoder, reserved `rpc.` method.                                                                                                                         |
+| `METHOD_UNSUPPORTED` | The responder has no handler for `method`.                                                                                                                                                                                                                              |
+| `INVALID_PARAMS`     | `params` failed the contract's schema for this method. `details` SHOULD name the failing path.                                                                                                                                                                          |
+| `DENIED`             | The method exists but policy refuses it (consent, authorisation). `details` SHOULD say which capability or rule.                                                                                                                                                        |
+| `CANCELLED`          | The handler stopped because a `cancel` arrived.                                                                                                                                                                                                                         |
+| `TIMEOUT`            | Local: the requester's own deadline passed. A responder MAY also send it when a handler exceeded a server-side budget.                                                                                                                                                  |
+| `FRAME_TOO_LARGE`    | The response would exceed the frame limit; the handler's result is replaced by this error.                                                                                                                                                                              |
+| `PROTOCOL_MISMATCH`  | A request that cannot be served at the effective minor. Normally the handshake refuses first and this code is never seen.                                                                                                                                               |
+| `INTERNAL`           | Anything else that failed inside the responder.                                                                                                                                                                                                                         |
 
 Applications define any other code. Unknown codes MUST be preserved as received and never
 refused; a consumer narrows them to its own known set.
@@ -273,6 +279,8 @@ peer MUST NOT retry automatically after one of them. Applications add reconnect 
 
 ## 11. Limits
 
+### 11.1 Frame limit
+
 - The **frame limit** bounds one encoded frame: its UTF-8 byte length without any transport
   delimiter. The default is `16777216` bytes (16 MiB).
 - A peer MAY announce a lower ceiling in `hello.limits.maxFrameBytes` (at least `4096`). The
@@ -282,8 +290,46 @@ peer MUST NOT retry automatically after one of them. Applications add reconnect 
 - A received frame that exceeds the limit is a decoder refusal: the transport closes with
   `4400`. Transports that split frames into messages MUST bound reassembly by the same limit and
   by the maximum number of messages one frame can need.
-- `id` is at most 256 characters, `method` and `topic` at most 128, `error.code` at most 64,
-  `close.reason` at most 1024, `peer.name` and `peer.version` at most 128.
+
+### 11.2 Session limits
+
+The frame limit bounds one frame. It does not bound how many a peer may have in the air, and a
+hostile or broken peer does not need an oversized frame to make the other side hold state for
+ever: a request it never cancels and a stream key it never ends both cost the receiver memory
+that no rule above reclaims. Each ceiling below is one a peer enforces on itself, about what the
+*other* side may make it hold.
+
+- **Requests in flight.** `maxInFlight` is the number of requests a responder will hold open for
+  the other side at once. The default is `256`. A peer MAY announce its own value in
+  `hello.limits.maxInFlight` (at least `1`) so a requester can pace itself; absent means the
+  default.
+- A `req` that arrives while the responder already holds `maxInFlight` open is answered with
+  `err` code `UNAVAILABLE` and `details.kind` of `"in_flight_limit"`. The session stays open and
+  the refusal is **retryable**: a requester MUST NOT treat it as a permanent failure the way it
+  treats `METHOD_UNSUPPORTED`, and SHOULD retry once one of its own requests has settled. It is
+  the one reserved code whose meaning depends on `details.kind`, which is why the member is
+  named there rather than left to the application.
+- The count is of requests this side is *answering*, not of requests it sent. A peer that both
+  requests and responds has two independent budgets, and neither side's `maxInFlight` bounds
+  what the announcing peer may send.
+- **Open stream keys.** A peer bounds how many stream keys ([§8](#8-events-and-streams)) it
+  counts for at once; `1024` is the reference. Unlike `maxInFlight` this is local and not
+  announced: it bounds what this side emits, a new key past it is refused before anything is
+  sent, and an `end: true` event releases one. A sender that reaches it has leaked stream ids,
+  which is a defect in the sender rather than a message to the peer.
+- **Pending pings.** One, unchanged: a ping that goes unanswered for one interval closes the
+  session ([§9](#9-liveness)), so a peer never queues a second.
+
+`hello.limits` is the one place a member added in a later minor is sent unconditionally. The
+effective minor is not known until the peer's `hello` has arrived, so a sender cannot gate a
+`hello` member on it; [§4](#4-envelope-and-tolerance) covers the other direction, and a 1.0 peer
+reading a 1.1 `hello` ignores `maxInFlight` and paces itself by nothing — exactly what it did
+before the member existed.
+
+### 11.3 Field lengths
+
+`id` is at most 256 characters, `method` and `topic` at most 128, `error.code` at most 64,
+`close.reason` at most 1024, `peer.name` and `peer.version` at most 128.
 
 ## 12. Contracts and the catalog document
 

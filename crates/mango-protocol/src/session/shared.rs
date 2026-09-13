@@ -49,6 +49,10 @@ pub(super) struct Shared {
     pub(super) local_protocol: ProtocolVersion,
     pub(super) local_capabilities: Map<String, Value>,
     pub(super) local_max_frame_bytes: usize,
+    /// How many inbound requests this side will answer at once (§11.2).
+    pub(super) max_in_flight: usize,
+    /// How many stream keys this side will emit on at once (§11.2).
+    pub(super) max_stream_keys: usize,
     pub(super) inner: Mutex<Inner>,
     pub(super) ready: watch::Sender<Option<Result<RemotePeer, RemoteError>>>,
     pub(super) closure: watch::Sender<Option<SessionClosure>>,
@@ -82,6 +86,19 @@ impl Shared {
                 usize::try_from(bytes).unwrap_or(usize::MAX)
             });
         self.local_max_frame_bytes.min(remote_limit)
+    }
+
+    /// How many requests the peer announced it will answer at once, or the
+    /// default when it announced nothing.
+    pub(super) fn remote_max_in_flight(&self) -> usize {
+        lock(&self.inner)
+            .remote
+            .as_ref()
+            .and_then(|remote| remote.limits.as_ref())
+            .and_then(|limits| limits.max_in_flight)
+            .map_or(super::options::DEFAULT_MAX_IN_FLIGHT, |count| {
+                usize::try_from(count).unwrap_or(usize::MAX)
+            })
     }
 
     /// Validates `frame` and measures its encoded size against the session's

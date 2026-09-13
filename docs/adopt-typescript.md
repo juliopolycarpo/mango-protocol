@@ -166,6 +166,30 @@ session.close(4000, 'released');
 Use the contract helper for typed calls; the raw API is for tooling and for the reserved
 `rpc.*` space the protocol may add.
 
+## Resource caps
+
+A session bounds what the peer can make it hold, so a peer that opens requests and never
+cancels them cannot grow this side without limit.
+
+```ts
+const session = new Session(port, {
+  peer,
+  maxInFlight: 32, // requests this side answers at once; 256 by default
+  maxStreamKeys: 64, // stream keys this side emits on at once; 1024 by default
+});
+
+// What the peer said it will answer at once, so a caller can pace itself
+// instead of discovering the ceiling by being refused.
+const budget = session.remoteMaxInFlight;
+```
+
+`maxInFlight` is announced in `hello.limits`. Past it, a request is answered with `UNAVAILABLE`
+and `details.kind` of `in_flight_limit`; that refusal is **retryable** — send the same call
+again once one of yours has settled, and never latch on it the way you would on
+`METHOD_UNSUPPORTED`. `maxStreamKeys` is local and never announced: `emit` throws when a new key
+would pass it, because reaching it means this side leaked stream ids rather than that the peer
+did anything.
+
 ## Errors
 
 - A handler throws `RemoteError(code, message, details?)` to answer with a specific code. Any

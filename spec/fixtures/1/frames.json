@@ -50,6 +50,41 @@
       }
     },
     {
+      "name": "y_hello_max_in_flight",
+      "verdict": "accept",
+      "line": "{\"type\":\"hello\",\"protocol\":{\"major\":1,\"minor\":1},\"peer\":{\"name\":\"fixture\",\"version\":\"0.0.0\",\"role\":\"tool\"},\"capabilities\":{},\"limits\":{\"maxFrameBytes\":65536,\"maxInFlight\":16}}",
+      "expected": {
+        "type": "hello",
+        "limits": {
+          "maxFrameBytes": 65536,
+          "maxInFlight": 16
+        }
+      }
+    },
+    {
+      "name": "y_hello_max_in_flight_alone",
+      "verdict": "accept",
+      "line": "{\"type\":\"hello\",\"protocol\":{\"major\":1,\"minor\":1},\"peer\":{\"name\":\"fixture\",\"version\":\"0.0.0\",\"role\":\"tool\"},\"capabilities\":{},\"limits\":{\"maxInFlight\":1}}",
+      "expected": {
+        "type": "hello",
+        "limits": {
+          "maxInFlight": 1
+        }
+      }
+    },
+    {
+      "name": "n_hello_max_in_flight_zero",
+      "verdict": "reject",
+      "reason": "schema",
+      "line": "{\"type\":\"hello\",\"protocol\":{\"major\":1,\"minor\":1},\"peer\":{\"name\":\"fixture\",\"version\":\"0.0.0\",\"role\":\"tool\"},\"capabilities\":{},\"limits\":{\"maxInFlight\":0}}"
+    },
+    {
+      "name": "n_hello_max_in_flight_not_an_integer",
+      "verdict": "reject",
+      "reason": "schema",
+      "line": "{\"type\":\"hello\",\"protocol\":{\"major\":1,\"minor\":1},\"peer\":{\"name\":\"fixture\",\"version\":\"0.0.0\",\"role\":\"tool\"},\"capabilities\":{},\"limits\":{\"maxInFlight\":1.5}}"
+    },
+    {
       "name": "y_hello_future_minor",
       "verdict": "accept",
       "line": "{\"type\":\"hello\",\"protocol\":{\"major\":1,\"minor\":7},\"peer\":{\"name\":\"fixture\",\"version\":\"0.0.0\",\"role\":\"tool\"},\"capabilities\":{}}",

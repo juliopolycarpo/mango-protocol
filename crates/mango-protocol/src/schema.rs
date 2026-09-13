@@ -13,8 +13,9 @@ use crate::catalog::Catalog;
 use crate::close::{MAX_CLOSE_CODE, MIN_CLOSE_CODE};
 use crate::frame::{Cancel, Close, ErrorResponse, Event, Hello, Request, Response};
 use crate::validate::{
-    MAX_ANNOUNCED_FRAME_BYTES, MAX_CODE_CHARS, MAX_ID_CHARS, MAX_NAME_CHARS, MAX_REASON_CHARS,
-    METHOD_NAME_PATTERN, MIN_ANNOUNCED_FRAME_BYTES, MIN_NAME_CHARS,
+    MAX_ANNOUNCED_FRAME_BYTES, MAX_ANNOUNCED_IN_FLIGHT, MAX_CODE_CHARS, MAX_ID_CHARS,
+    MAX_NAME_CHARS, MAX_REASON_CHARS, METHOD_NAME_PATTERN, MIN_ANNOUNCED_FRAME_BYTES,
+    MIN_ANNOUNCED_IN_FLIGHT, MIN_NAME_CHARS,
 };
 
 /// The subschemas the specification states with `pattern`, `minLength`,
@@ -27,9 +28,10 @@ use crate::validate::{
 /// constraints [`crate::validate`] enforces, from the same constants.
 pub(crate) mod constraints {
     use super::{
-        MAX_ANNOUNCED_FRAME_BYTES, MAX_CLOSE_CODE, MAX_CODE_CHARS, MAX_ID_CHARS, MAX_NAME_CHARS,
-        MAX_REASON_CHARS, METHOD_NAME_PATTERN, MIN_ANNOUNCED_FRAME_BYTES, MIN_CLOSE_CODE,
-        MIN_NAME_CHARS, Schema, SchemaGenerator, json_schema,
+        MAX_ANNOUNCED_FRAME_BYTES, MAX_ANNOUNCED_IN_FLIGHT, MAX_CLOSE_CODE, MAX_CODE_CHARS,
+        MAX_ID_CHARS, MAX_NAME_CHARS, MAX_REASON_CHARS, METHOD_NAME_PATTERN,
+        MIN_ANNOUNCED_FRAME_BYTES, MIN_ANNOUNCED_IN_FLIGHT, MIN_CLOSE_CODE, MIN_NAME_CHARS, Schema,
+        SchemaGenerator, json_schema,
     };
 
     /// `req.id`, `res.id`, `err.id`, `cancel.id` and `evt.streamId`.
@@ -98,6 +100,15 @@ pub(crate) mod constraints {
             "type": "integer",
             "minimum": MIN_ANNOUNCED_FRAME_BYTES,
             "maximum": MAX_ANNOUNCED_FRAME_BYTES,
+        })
+    }
+
+    /// `hello.limits.maxInFlight`.
+    pub(crate) fn max_in_flight(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "integer",
+            "minimum": MIN_ANNOUNCED_IN_FLIGHT,
+            "maximum": MAX_ANNOUNCED_IN_FLIGHT,
         })
     }
 

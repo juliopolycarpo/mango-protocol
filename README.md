@@ -6,7 +6,7 @@ and published as a TypeScript SDK (`@mangostudio/protocol`, npm) and a Rust crat
 the same frames over stdio, local sockets, in-process ports or WebSocket without caring which
 language sits on the other end.
 
-> Status: pre-release. Wire version 1.0 is being written; nothing is published yet.
+> Status: pre-release. Wire version 1.1 is being written; nothing is published yet.
 
 ## Why
 

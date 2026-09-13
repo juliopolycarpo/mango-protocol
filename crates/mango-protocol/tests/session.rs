@@ -334,7 +334,8 @@ async fn announces_its_frame_ceiling_and_honours_the_lower_one() {
     assert_eq!(
         sent_hello.limits,
         Some(Limits {
-            max_frame_bytes: Some(8192)
+            max_frame_bytes: Some(8192),
+            max_in_flight: None,
         })
     );
 
@@ -344,6 +345,7 @@ async fn announces_its_frame_ceiling_and_honours_the_lower_one() {
         capabilities: Default::default(),
         limits: Some(Limits {
             max_frame_bytes: Some(4096),
+            max_in_flight: None,
         }),
     }))
     .await;

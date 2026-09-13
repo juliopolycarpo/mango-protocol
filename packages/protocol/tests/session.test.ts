@@ -5,6 +5,7 @@ import type { Port, PortClosure } from '../src/port';
 import type { Frame, HelloFrame } from '../src/schemas/frames';
 import { Session, type SessionOptions } from '../src/session';
 import { createInProcessPortPair } from '../src/transports/in-process';
+import { PROTOCOL_MINOR } from '../src/version';
 
 const HUB: SessionOptions['peer'] = { name: 'hub', version: '1.0.0', role: 'hub' };
 const RUNTIME: SessionOptions['peer'] = { name: 'runtime', version: '1.0.0', role: 'runtime' };
@@ -96,7 +97,7 @@ describe('Session handshake', () => {
     expect(fromHub.peer).toEqual(RUNTIME);
     expect(fromRuntime.peer).toEqual(HUB);
     expect(fromRuntime.capabilities).toEqual({ audit: true });
-    expect(hub.remote.effectiveMinor).toBe(0);
+    expect(hub.remote.effectiveMinor).toBe(PROTOCOL_MINOR);
     hub.close();
   });
 
