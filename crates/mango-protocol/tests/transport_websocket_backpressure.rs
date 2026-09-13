@@ -161,6 +161,85 @@ async fn a_peer_that_stops_reading_is_closed_with_4400_rather_than_waited_on() {
     let _ = acceptor.await;
 }
 
+/// A burst that outruns the sender's own check.
+///
+/// `send_frame` has no await on its happy path, so a caller that never yields
+/// between sends can queue arbitrarily far past the frame limit before the
+/// writer task is ever scheduled. The stalled-queue rule must therefore be
+/// judged by the writer task itself, the instant it finds the socket not
+/// draining — not fished for by whatever `send_frame` call happens to run
+/// next. This sends the whole burst back to back with no manual yield, then
+/// makes no further call at all: only the writer task can still give up on
+/// this peer.
+#[tokio::test]
+async fn a_burst_with_no_yields_still_gives_up_on_a_peer_that_is_not_reading() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+    let address = listener.local_addr().expect("a bound address");
+    let (start_reading, wait) = oneshot::channel::<()>();
+    let (report, closed) = oneshot::channel::<Option<u16>>();
+
+    let acceptor = tokio::spawn(async move {
+        let (socket, _address) = listener.accept().await.expect("a dialler");
+        let mut stream = upgrade(socket).await;
+        let _ = wait.await;
+        let mut code = None;
+        while let Some(Ok(message)) = stream.next().await {
+            if let Message::Close(frame) = message {
+                code = frame.map(|frame| u16::from(frame.code));
+                break;
+            }
+        }
+        let _ = report.send(code);
+    });
+
+    let port = connect_websocket(
+        &format!("ws://{address}/burst"),
+        &WebSocketConnectOptions::default().with_websocket(options()),
+        &ConnectDeadline::default().with_timeout(Duration::from_secs(5)),
+    )
+    .await
+    .expect("the acceptor selects mango.v1");
+
+    let (mut tx, _rx) = port.split();
+
+    // Far more than any kernel send buffer holds, sent with no yield between
+    // any two of them. Every one reports `Sent`: nothing has run the writer
+    // task yet to know otherwise.
+    for index in 0..4096 {
+        let frame = Frame::Req(Request {
+            id: format!("r-{index}"),
+            method: "test.bulk".into(),
+            params: Value::String("x".repeat(FRAME_LIMIT / 8)),
+        });
+        assert_eq!(
+            tx.send(frame).await,
+            SendOutcome::Sent,
+            "no writer-task turn has happened yet to notice the socket is not draining"
+        );
+    }
+
+    // Give the writer task the run of the executor, without ever calling
+    // `send_frame` again. The peer still is not reading, so if the writer
+    // task does not judge the rule itself here, nothing else in this test
+    // ever will.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let _ = start_reading.send(());
+    let code = tokio::time::timeout(Duration::from_secs(20), closed)
+        .await
+        .expect(
+            "the writer task must give up and send the farewell on its own, \
+             not wait for a sender that never asks again",
+        )
+        .expect("the acceptor reports what it read");
+    assert_eq!(
+        code,
+        Some(close_codes::PROTOCOL_ERROR),
+        "the peer is owed the code, not just a socket that stopped"
+    );
+    let _ = acceptor.await;
+}
+
 #[tokio::test]
 async fn a_frame_at_the_limit_is_not_mistaken_for_a_peer_that_stopped_reading() {
     // A frame of exactly the limit is legal, and at the smallest legal message
