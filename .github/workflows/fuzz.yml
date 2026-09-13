@@ -17,7 +17,10 @@ jobs:
   fuzz:
     name: Fuzz (${{ matrix.target }})
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # A cold cache builds tokio, jsonschema and regex under sanitizer
+    # instrumentation before the 300s run even starts; 10 was too tight for a
+    # first scheduled run.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -47,9 +50,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # fuzz/ deliberately targets nightly, unlike the rest of the repo (see
-      # its own rust-toolchain.toml note in docs/conformance.md); libFuzzer
-      # instrumentation needs `-Z` flags only nightly accepts.
+      # The root rust-toolchain.toml pins stable 1.97.0 for the rest of the
+      # repo, and that file applies here too (rustup resolves it by
+      # directory, not by cargo workspace); fuzz/ has no toolchain file of
+      # its own, so every invocation below selects nightly explicitly with
+      # `+nightly` instead. libFuzzer instrumentation needs `-Z` flags only
+      # nightly accepts.
       - run: rustup toolchain install nightly --profile minimal
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
