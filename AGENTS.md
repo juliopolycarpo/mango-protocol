@@ -56,7 +56,9 @@ The schema-equality test (`bun run check` runs it) emits the TS and Rust schemas
 normaliser below, and deep-compares them with the spec. A change that needs a new normaliser
 rule is a review flag, not a quick fix.
 
-Normaliser rules (`scripts/schema-equality.ts`): `$ref` to `#/$defs/<name>` is inlined;
+Normaliser rules (`packages/protocol/src/testing/schema.ts`, re-exported from
+`@mangostudio/protocol/testing` as `normalizeSchema` so a consumer applies the same ones):
+`$ref` to `#/$defs/<name>` is inlined;
 `$schema`, `$id`, `title`, `description`, `$comment`, `examples` and `format` are dropped;
 `additionalProperties: true` is dropped; a TypeBox `anyOf` whose branches carry distinct `type`
 consts becomes `oneOf`; the `null` alternative schemars adds to an `Option` member is stripped;
