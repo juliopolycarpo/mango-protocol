@@ -218,6 +218,9 @@ describe('LineDecoder', () => {
     const wholeOutcome = whole.push(blank);
     expect(wholeOutcome.frames).toEqual([]);
     expect(wholeOutcome.error?.kind).toBe('too-large');
+    // The line is complete here, terminator and all, so the refusal must not
+    // call it partial: `decodeLine` spells the same measurement this way.
+    expect(wholeOutcome.error?.message).toBe('line is 4097 bytes; expected at most 4096');
 
     const split = new LineDecoder({ maxFrameBytes: 4096 });
     const head = split.push(blank.slice(0, -1));
