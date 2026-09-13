@@ -6,7 +6,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use mango_protocol::codec::ndjson::{DEFAULT_MAX_FRAME_BYTES, LineDecoder, MIN_MAX_FRAME_BYTES};
+use mango_protocol::codec::ndjson::LineDecoder;
 use mango_protocol::error::CodecErrorKind;
 use mango_protocol::frame::Frame;
 
@@ -19,9 +19,13 @@ struct Input {
     bytes: Vec<u8>,
 }
 
+/// A ceiling well below libFuzzer's default `-max_len` (~4096), the same
+/// range `decode_line` uses. `MIN_MAX_FRAME_BYTES..=DEFAULT_MAX_FRAME_BYTES`
+/// (4096 to 16 MiB) would make the too-large refusal unreachable at any
+/// fuzzer-sized input, and it is exactly the path where the whole-push and
+/// split-push decoders once disagreed (a blank line over the limit).
 fn max_frame_bytes(offset: u16) -> usize {
-    let span = DEFAULT_MAX_FRAME_BYTES - MIN_MAX_FRAME_BYTES;
-    MIN_MAX_FRAME_BYTES + (usize::from(offset) % span)
+    16 + (usize::from(offset) % (8192 - 16))
 }
 
 /// Splits `bytes` at every cut point, each reduced into range so any `u16`

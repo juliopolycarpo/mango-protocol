@@ -14,9 +14,10 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use libfuzzer_sys::fuzz_target;
+use mango_protocol::error::{CodecError, CodecErrorKind};
 use mango_protocol::port::{Inbound, Port, PortClosure, PortRx, PortTx, SendOutcome};
 use mango_protocol::session::{Session, SessionOptions};
-use mango_protocol::{Frame, PeerInfo};
+use mango_protocol::{Frame, PeerInfo, close_codes, validate};
 use mango_protocol_fuzz::Script;
 
 /// A [`Port`] whose inbound side is a fixed queue and whose outbound side
@@ -73,21 +74,42 @@ fn peer() -> PeerInfo {
     }
 }
 
-fuzz_target!(|scripts: Vec<Script>| {
+/// Builds the fixed sequence [`ScriptedRx`] will replay: every scripted frame
+/// up to a schema-invalid one, exactly as a real port would deliver — a real
+/// `PortRx` only ever hands the driver a [`validate`]-passing [`Frame`], and
+/// refuses the rest of the stream (fatal, per [`LineDecoder`]'s own contract:
+/// "the stream cannot be resynchronised") the instant it meets one that does
+/// not. Ends in [`PortClosure::ProtocolError`] when a script was refused, or
+/// [`PortClosure::Closed`] with no code — a vanished link — otherwise.
+///
+/// [`LineDecoder`]: mango_protocol::codec::ndjson::LineDecoder
+fn script_inbound(scripts: Vec<Script>) -> VecDeque<Inbound> {
+    let mut inbound = VecDeque::new();
     // Capped so one input cannot balloon the number of frames a single
     // iteration drives; the property under test is termination, not
     // throughput.
-    let mut inbound: VecDeque<Inbound> = scripts
-        .into_iter()
-        .take(64)
-        .map(|script| Inbound::Frame(script.into_frame()))
-        .collect();
+    for script in scripts.into_iter().take(64) {
+        let frame = script.into_frame();
+        if let Err(error) = validate(&frame) {
+            inbound.push_back(Inbound::Closed(PortClosure::ProtocolError {
+                error: CodecError::new(CodecErrorKind::Schema, error.to_string()),
+                code: close_codes::PROTOCOL_ERROR,
+            }));
+            return inbound;
+        }
+        inbound.push_back(Inbound::Frame(frame));
+    }
     inbound.push_back(Inbound::Closed(PortClosure::Closed {
         code: None,
         reason: None,
     }));
+    inbound
+}
 
-    let port = ScriptedPort { inbound };
+fuzz_target!(|scripts: Vec<Script>| {
+    let port = ScriptedPort {
+        inbound: script_inbound(scripts),
+    };
     let mut options = SessionOptions::new(peer());
     // A fuzzed stream may never carry a valid `hello`; a short timeout keeps
     // that path bounded exactly like the "runs out of frames" path, rather
