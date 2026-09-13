@@ -84,6 +84,9 @@ pub enum Script {
         role_idx: u8,
         /// `hello.limits.maxFrameBytes`, when present.
         limit: Option<u16>,
+        /// `hello.limits.maxInFlight`, when present. `Some(0)` is below the
+        /// floor of §11.2 on purpose: that is the branch `validate` refuses.
+        in_flight: Option<u16>,
     },
     /// Builds a [`Frame::Req`].
     Req {
@@ -159,6 +162,7 @@ impl Script {
                 name_idx,
                 role_idx,
                 limit,
+                in_flight,
             } => Frame::Hello(Hello {
                 protocol: ProtocolVersion::new(1, u32::from(minor)),
                 peer: PeerInfo {
@@ -167,8 +171,11 @@ impl Script {
                     role: pick(&ROLES, role_idx).to_owned(),
                 },
                 capabilities: Map::new(),
-                limits: limit.map(|bytes| Limits {
-                    max_frame_bytes: Some(u64::from(bytes)),
+                // Present when either ceiling is, so `maxInFlight` can be
+                // announced on its own the way the wire allows it to be.
+                limits: (limit.is_some() || in_flight.is_some()).then(|| Limits {
+                    max_frame_bytes: limit.map(u64::from),
+                    max_in_flight: in_flight.map(u64::from),
                 }),
             }),
             Self::Req {
