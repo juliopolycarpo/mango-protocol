@@ -316,7 +316,8 @@ impl Contract {
     ///
     /// # Errors
     /// Returns [`ValidationError`] when `handlers` names a method this
-    /// contract does not declare.
+    /// contract does not declare, or when `options.discover` is set and the
+    /// catalog does not serialise to JSON. Either way nothing is registered.
     ///
     /// # Example
     ///

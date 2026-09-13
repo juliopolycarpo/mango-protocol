@@ -250,10 +250,20 @@ pub(super) fn serve(
 ) -> Result<ServeGuard, ValidationError> {
     let mut guards = Vec::with_capacity(handlers.handlers.len() + 1);
     if options.discover {
-        let catalog = contract.catalog();
+        // Serialised once here, not per request: `rpc.discover` answers the
+        // same document every time, and a catalog that cannot serialise must
+        // fail this registration rather than every call to it — the same
+        // "nothing left behind to unregister" rule the TypeScript SDK follows
+        // by building its catalog before it registers any handler.
+        let catalog = serde_json::to_value(&contract.catalog).map_err(|error| ValidationError {
+            field: "catalog".to_string(),
+            received: error.to_string(),
+            expected: "a catalog that serialises to JSON".to_string(),
+        })?;
+        let catalog = Arc::new(catalog);
         guards.push(
             session.handle(RPC_DISCOVER, move |params: Value, _context| {
-                let catalog = catalog.clone();
+                let catalog = Arc::clone(&catalog);
                 async move {
                     if !params.is_object() {
                         return Err(RemoteError::new(
@@ -262,12 +272,7 @@ pub(super) fn serve(
                         )
                         .with_detail("method", RPC_DISCOVER.to_string()));
                     }
-                    serde_json::to_value(catalog).map_err(|error| {
-                        RemoteError::new(
-                            codes::INTERNAL,
-                            format!("The catalog failed to serialise: {error}."),
-                        )
-                    })
+                    Ok((*catalog).clone())
                 }
             }),
         );
