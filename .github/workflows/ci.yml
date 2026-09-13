@@ -127,7 +127,11 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install 1.97.0 --profile minimal
+      # Keyed apart from the `rust` job's cache: that one builds with the 1.98.1 default
+      # toolchain, this one with +1.97.0, and sharing a key would mix artefacts from both.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: msrv
       - run: cargo +1.97.0 check --all-features --locked
 
   # Informational, not gating: the workspace is 0.1.0 and unreleased Rust API surface routinely
