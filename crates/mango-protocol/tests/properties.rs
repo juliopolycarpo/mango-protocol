@@ -134,9 +134,18 @@ fn hello_frame() -> impl Strategy<Value = Frame> {
         role(),
         json_object(),
         prop::option::of(4096u64..=1_000_000u64),
+        prop::option::of(1u64..=100_000u64),
     )
         .prop_map(
-            |(major, minor, name, version, role, capabilities, max_frame_bytes)| {
+            |(major, minor, name, version, role, capabilities, max_frame_bytes, max_in_flight)| {
+                // Absent when neither ceiling is announced: `limits: {}` is
+                // schema-valid but says nothing, and a generator that emitted
+                // it would stop covering the absent case.
+                let limits =
+                    (max_frame_bytes.is_some() || max_in_flight.is_some()).then_some(Limits {
+                        max_frame_bytes,
+                        max_in_flight,
+                    });
                 Frame::Hello(Hello {
                     protocol: ProtocolVersion::new(major, minor),
                     peer: PeerInfo {
@@ -145,9 +154,7 @@ fn hello_frame() -> impl Strategy<Value = Frame> {
                         role,
                     },
                     capabilities,
-                    limits: max_frame_bytes.map(|max_frame_bytes| Limits {
-                        max_frame_bytes: Some(max_frame_bytes),
-                    }),
+                    limits,
                 })
             },
         )
