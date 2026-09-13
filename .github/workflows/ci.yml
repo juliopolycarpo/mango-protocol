@@ -102,6 +102,19 @@ jobs:
         env:
           MANGO_INTEROP: "1"
 
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+        with:
+          tool: cargo-deny
+      - run: cargo deny check
+
   schema-equality:
     name: Schema equality and round trip
     runs-on: ubuntu-latest
@@ -122,7 +135,7 @@ jobs:
   gate:
     name: Gate
     if: always()
-    needs: [typescript, rust, transports, interop, schema-equality]
+    needs: [typescript, rust, transports, interop, deny, schema-equality]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
