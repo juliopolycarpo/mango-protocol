@@ -110,6 +110,12 @@ export interface SessionOptions {
   readonly livenessIntervalMs?: number | false;
   /** Initial handlers; `handle()` adds more at any time. */
   readonly handlers?: Readonly<Record<string, RequestHandler>>;
+  /**
+   * How long `close()` waits for in-flight handlers to settle before
+   * abandoning them; 5 seconds by default. Their abort signal fires first, so
+   * a handler that honours it settles long before this matters.
+   */
+  readonly handlerGraceMs?: number;
   /** Prefix of generated request ids; `r` by default. */
   readonly requestIdPrefix?: string;
   /** Injected for tests; the global timers by default. */
@@ -130,6 +136,9 @@ export const DEFAULT_MAX_IN_FLIGHT = 256;
 
 /** Stream keys one side emits on at once before `emit` refuses (§11.2). */
 export const DEFAULT_MAX_STREAM_KEYS = 1024;
+
+/** How long `close()` waits for in-flight handlers before abandoning them. */
+export const DEFAULT_HANDLER_GRACE_MS = 5_000;
 
 /** `error.details.kind` on the refusal that says the responder is full (§11.2). */
 export const IN_FLIGHT_LIMIT_KIND = 'in_flight_limit';
@@ -170,6 +179,9 @@ export class Session {
   readonly #localMaxFrameBytes: number;
   readonly #maxInFlight: number;
   readonly #maxStreamKeys: number;
+  readonly #handlerGraceMs: number;
+  /** Every inbound request this side is answering, so `close()` can wait. */
+  readonly #dispatches = new Set<Promise<void>>();
   readonly #handlers = new Map<string, RequestHandler>();
   readonly #pending = new Map<string, PendingRequest>();
   readonly #active = new Map<string, AbortController>();
@@ -199,6 +211,7 @@ export class Session {
       options.maxFrameBytes ?? port.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
     this.#maxInFlight = options.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT;
     this.#maxStreamKeys = options.maxStreamKeys ?? DEFAULT_MAX_STREAM_KEYS;
+    this.#handlerGraceMs = options.handlerGraceMs ?? DEFAULT_HANDLER_GRACE_MS;
     this.#requestIdPrefix = options.requestIdPrefix ?? 'r';
     for (const [method, handler] of Object.entries(options.handlers ?? {})) {
       this.#handlers.set(method, handler);
@@ -389,8 +402,33 @@ export class Session {
     return this.#closeListeners.add(listener);
   }
 
-  /** Closes the transport with a reason code and settles everything in flight. */
-  close(code: number = CLOSE_CODES.RELEASED, reason?: string): void {
+  /**
+   * Closes the transport with a reason code, settles everything in flight and
+   * resolves once every handler this side was running has settled — bounded by
+   * `handlerGraceMs`, so one that ignores its abort signal delays a shutdown
+   * without blocking it.
+   *
+   * @example
+   * const closure = await session.close(CLOSE_CODES.RELEASED, 'shutting down');
+   */
+  async close(code: number = CLOSE_CODES.RELEASED, reason?: string): Promise<SessionClosure> {
+    this.closeNow(code, reason);
+    await this.#settleHandlers();
+    return (
+      this.#closure ?? {
+        code,
+        ...(reason !== undefined ? { reason } : {}),
+        fatal: isFatalCloseCode(code),
+      }
+    );
+  }
+
+  /**
+   * [`close`] without the wait: tells the transport and tears down, leaving any
+   * handler that ignores its abort signal running. This is what a synchronous
+   * caller (a signal handler, a `finally` that cannot await) reaches for.
+   */
+  closeNow(code: number = CLOSE_CODES.RELEASED, reason?: string): void {
     if (this.#state === 'closed') return;
     try {
       this.#port.close(code, reason);
@@ -402,6 +440,19 @@ export class Session {
       ...(reason !== undefined ? { reason } : {}),
       fatal: isFatalCloseCode(code),
     });
+  }
+
+  /** Waits for every in-flight handler, or for the grace period to elapse. */
+  async #settleHandlers(): Promise<void> {
+    if (this.#dispatches.size === 0) return;
+    const running = Promise.allSettled([...this.#dispatches]);
+    await Promise.race([
+      running,
+      new Promise<void>((resolve) => {
+        const timer = this.#timers.setTimeout(resolve, this.#handlerGraceMs);
+        void running.then(() => this.#timers.clearTimeout(timer));
+      }),
+    ]);
   }
 
   #startHandshake(): void {
@@ -452,7 +503,7 @@ export class Session {
 
   #failHandshake(error: RemoteError, code: number, reason: string): void {
     this.#readyDeferred.reject(error);
-    this.close(code, reason);
+    this.closeNow(code, reason);
   }
 
   #receive(frame: Frame): void {
@@ -460,9 +511,12 @@ export class Session {
       case 'hello':
         this.#receiveHello(frame);
         return;
-      case 'req':
-        void this.#dispatch(frame);
+      case 'req': {
+        const settled = this.#dispatch(frame);
+        this.#dispatches.add(settled);
+        void settled.finally(() => this.#dispatches.delete(settled));
         return;
+      }
       case 'res':
         this.#settle(frame.id, (pending) => pending.resolve(frame.result));
         return;
@@ -504,7 +558,7 @@ export class Session {
 
   #receiveHello(frame: HelloFrame): void {
     if (this.#state !== 'handshaking') {
-      this.close(CLOSE_CODES.PROTOCOL_ERROR, 'duplicate hello');
+      this.closeNow(CLOSE_CODES.PROTOCOL_ERROR, 'duplicate hello');
       return;
     }
     const negotiation = negotiate(this.#localProtocol, frame.protocol);
@@ -542,7 +596,7 @@ export class Session {
       // One missed round trip is the signal: the interval is already several
       // times the round trip a healthy peer needs.
       if (this.#awaitingPong) {
-        this.close(CLOSE_CODES.RELEASED, 'liveness timeout');
+        this.closeNow(CLOSE_CODES.RELEASED, 'liveness timeout');
         return;
       }
       this.#awaitingPong = true;

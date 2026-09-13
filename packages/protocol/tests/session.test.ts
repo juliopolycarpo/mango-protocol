@@ -187,6 +187,82 @@ describe('Session handshake', () => {
   });
 });
 
+describe('Session close', () => {
+  it('resolves after every in-flight handler has settled', async () => {
+    const ports = createInProcessPortPair();
+    let released = (): void => undefined;
+    let started = (): void => undefined;
+    const firstCall = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let finished = false;
+    const responder = new Session(ports.b, {
+      peer: RUNTIME,
+      livenessIntervalMs: false,
+      handlers: {
+        'test.slow': async () => {
+          started();
+          await new Promise<void>((resolve) => {
+            released = resolve;
+          });
+          finished = true;
+          return null;
+        },
+      },
+    });
+    const hub = new Session(ports.a, { peer: HUB, livenessIntervalMs: false });
+    await Promise.all([hub.ready, responder.ready]);
+    void hub.request('test.slow', {}).catch(() => undefined);
+    await firstCall;
+
+    const closing = responder.close();
+    // Teardown is synchronous, so the state is already closed; the promise is
+    // about the handler, which is still running.
+    expect(responder.state).toBe('closed');
+    expect(finished).toBe(false);
+    released();
+    const closure = await closing;
+
+    expect(finished).toBe(true);
+    expect(closure.code).toBe(CLOSE_CODES.RELEASED);
+    hub.closeNow();
+  });
+
+  it('gives up on a handler that ignores its abort signal after the grace', async () => {
+    const ports = createInProcessPortPair();
+    const responder = new Session(ports.b, {
+      peer: RUNTIME,
+      livenessIntervalMs: false,
+      handlerGraceMs: 20,
+      // Never settles, and never looks at the signal: the shutdown is delayed
+      // by an unkillable handler but must not be blocked by one.
+      handlers: { 'test.stuck': () => new Promise(() => undefined) },
+    });
+    const hub = new Session(ports.a, { peer: HUB, livenessIntervalMs: false });
+    await Promise.all([hub.ready, responder.ready]);
+    void hub.request('test.stuck', {}).catch(() => undefined);
+    await tick();
+
+    const closure = await responder.close(CLOSE_CODES.RELEASED, 'grace');
+    expect(closure.reason).toBe('grace');
+    hub.closeNow();
+  });
+
+  it('closeNow tears down without waiting, and closing twice is a no-op', async () => {
+    const { hub, runtime } = pair();
+    await Promise.all([hub.ready, runtime.ready]);
+
+    hub.closeNow(CLOSE_CODES.SUPERSEDED, 'replaced');
+    expect(hub.state).toBe('closed');
+    expect(hub.closure).toMatchObject({ code: CLOSE_CODES.SUPERSEDED, reason: 'replaced' });
+
+    // A second close keeps the first reason; nothing is re-torn-down.
+    const again = await hub.close(CLOSE_CODES.RELEASED, 'later');
+    expect(again).toMatchObject({ code: CLOSE_CODES.SUPERSEDED, reason: 'replaced' });
+    runtime.closeNow();
+  });
+});
+
 describe('Session requests', () => {
   it('rejects an invalid or reserved method name locally', async () => {
     const { hub } = pair();

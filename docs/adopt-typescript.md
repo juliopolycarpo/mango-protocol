@@ -160,7 +160,9 @@ const off = session.onEvent((frame) => console.log(frame.topic, frame.seq));
 session.onClose(({ code, reason, fatal }) => {
   if (!fatal) scheduleReconnect();
 });
-session.close(4000, 'released');
+// Resolves once every handler this side was running has settled, bounded by
+// `handlerGraceMs`; `closeNow` is the synchronous form for a caller that cannot await.
+await session.close(4000, 'released');
 ```
 
 Use the contract helper for typed calls; the raw API is for tooling and for the reserved

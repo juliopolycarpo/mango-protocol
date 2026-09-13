@@ -77,8 +77,8 @@ pub struct SessionOptions {
     /// Prefix of generated request ids.
     pub request_id_prefix: String,
     /// How long `close()` waits for in-flight handlers to settle before
-    /// abandoning them. Rust-only; the TypeScript SDK has no equivalent since
-    /// it never awaits its own teardown.
+    /// abandoning them. The TypeScript SDK spells the same thing
+    /// `handlerGraceMs`.
     pub handler_grace: Duration,
     pub(super) handlers: Vec<(String, Arc<dyn Handler>)>,
 }

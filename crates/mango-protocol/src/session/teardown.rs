@@ -58,8 +58,9 @@ pub struct SessionClosure {
     pub fatal: bool,
     /// Present when a refused record ended the session.
     pub error: Option<CodecError>,
-    /// Handlers still running when the grace period expired. Rust-only; a
-    /// TypeScript session aborts and forgets instead of waiting.
+    /// Handlers still running when the grace period expired. Rust-only in the
+    /// count: the TypeScript session waits the same way, bounded by its own
+    /// `handlerGraceMs`, but its `close()` reports no number.
     pub unfinished_handlers: usize,
 }
 
