@@ -5,7 +5,7 @@ import { RESERVED_ERROR_CODES, RemoteError } from './errors';
 import { assertCatalog, type Catalog } from './schemas/catalog';
 import { isReservedMethodName, isValidMethodName, RPC_DISCOVER } from './schemas/common';
 import type { EventFrame } from './schemas/frames';
-import type { HandlerContext, RequestOptions, Session } from './session';
+import type { HandlerContext, RemotePeer, RequestOptions, Session } from './session';
 import type { ProtocolVersion } from './version';
 
 export interface MethodDefinition<P extends TSchema = TSchema, R extends TSchema = TSchema> {
@@ -66,14 +66,36 @@ export type ContractHandlers<M extends MethodMap> = {
   ) => MethodResult<M, K> | Promise<MethodResult<M, K>>;
 };
 
+/**
+ * Everything a policy decision needs beyond the method name and its declared
+ * capabilities: the parameters **after** they passed the method's schema, how
+ * many requests this side is already answering, and who the peer said it is.
+ *
+ * Extends the handler's own context, so a guard also has the request id, the
+ * abort signal and the session itself.
+ */
+export interface GuardContext extends HandlerContext {
+  /** The request's parameters, already validated against the method's schema. */
+  readonly params: unknown;
+  /** Requests this side is answering right now, this one included. */
+  readonly inFlight: number;
+  /** What the peer announced in its `hello`, plus the negotiated minor. */
+  readonly remote: RemotePeer;
+}
+
 export interface ServeOptions {
   /**
-   * Runs before every handler with the method's declared capability list.
-   * Throw a `RemoteError` (normally `DENIED`) to refuse; the SDK adds no policy
-   * of its own because consent, authorisation and their audit belong to the
-   * application.
+   * Runs after the parameters passed the method's schema and before the
+   * handler, with the method's declared capability list and everything else a
+   * policy needs. Throw a `RemoteError` (normally `DENIED`) to refuse; the SDK
+   * adds no policy of its own because consent, authorisation and their audit
+   * belong to the application.
    */
-  readonly guard?: (method: string, capabilities: readonly string[]) => void | Promise<void>;
+  readonly guard?: (
+    method: string,
+    capabilities: readonly string[],
+    context: GuardContext
+  ) => void | Promise<void>;
   /** Validate results against the schema before sending; off by default. */
   readonly validateResults?: boolean;
   /**
@@ -163,8 +185,18 @@ export function defineContract<M extends MethodMap, E extends EventMap = Record<
     serve: (session, handlers, options = {}) => {
       const removers: (() => void)[] = Object.entries(definition.methods).map(([method, entry]) =>
         session.handle(method, async (params, context) => {
-          if (options.guard) await options.guard(method, entry.capabilities ?? []);
+          // Validation first, guard second: a policy that logs or counts a
+          // refusal should never see parameters the contract already refuses,
+          // and this is the order the Rust SDK's `Guard` has always run in.
           assertParams(method, params);
+          if (options.guard) {
+            await options.guard(method, entry.capabilities ?? [], {
+              ...context,
+              params,
+              inFlight: context.session.inFlight,
+              remote: context.session.remote,
+            });
+          }
           const handler = handlers[method as keyof M];
           const result = await handler(params as never, context);
           if (options.validateResults && !Value.Check(entry.result, result)) {

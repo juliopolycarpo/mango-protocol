@@ -234,6 +234,11 @@ export class Session {
     return this.#closure;
   }
 
+  /** How many inbound requests this side is answering right now. */
+  get inFlight(): number {
+    return this.#active.size;
+  }
+
   /** The frame ceiling this side may send: the lower of both announced limits. */
   get sendLimitBytes(): number {
     const remote = this.#remote?.limits?.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;

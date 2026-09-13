@@ -55,8 +55,9 @@ const off = files.serve(session, {
   },
   'fs.watch': ({ path }, context) => startWatching(path, context.session),
 }, {
-  guard(method, capabilities) {
-    if (!grants.allow(capabilities)) {
+  guard(method, capabilities, { params, inFlight, remote }) {
+    if (!grants.allow(capabilities, remote.peer)) {
+      audit.denied({ method, params, inFlight, peer: remote.peer.name });
       throw new RemoteError(RESERVED_ERROR_CODES.DENIED, `${method} needs ${capabilities.join(', ')}`, {
         kind: 'consent_denied',
       });
@@ -65,8 +66,10 @@ const off = files.serve(session, {
 });
 ```
 
-Every handler receives parameters already validated against its schema; a bad request never
-reaches your code, the peer gets `INVALID_PARAMS` with the failing JSON pointer in
+The guard runs *after* the parameters passed the method's schema and before the handler, so a
+policy that logs, counts or audits a refusal is never handed a request the contract itself
+refuses. Every handler receives parameters already validated against its schema; a bad request
+never reaches your code, the peer gets `INVALID_PARAMS` with the failing JSON pointer in
 `details.path`. `context.signal` aborts when the peer cancels or the session closes. A thrown
 `RemoteError` reaches the peer with its code, message and details; any other exception becomes
 `INTERNAL` with a generic message, so nothing you did not choose to say leaks.

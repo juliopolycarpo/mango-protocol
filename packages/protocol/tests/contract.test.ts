@@ -178,6 +178,55 @@ describe('defineContract', () => {
     b.close();
   });
 
+  it('gives the guard the validated params, the in-flight count and the peer', async () => {
+    const { a, b } = sessions();
+    const seen: { params: unknown; inFlight: number; peer: string; method: string }[] = [];
+    contract.serve(
+      b,
+      { 'text.echo': ({ text }) => ({ text }), 'math.add': ({ a: x, b: y }) => x + y },
+      {
+        guard: (_method, _capabilities, context) => {
+          seen.push({
+            params: context.params,
+            inFlight: context.inFlight,
+            peer: context.remote.peer.name,
+            method: context.method,
+          });
+        },
+      }
+    );
+
+    expect(await a.request('text.echo', { text: 'hi' })).toEqual({ text: 'hi' });
+    expect(seen).toEqual([{ params: { text: 'hi' }, inFlight: 1, peer: 'a', method: 'text.echo' }]);
+    await a.close();
+    await b.close();
+  });
+
+  it('refuses parameters before the guard ever sees them', async () => {
+    const { a, b } = sessions();
+    let guarded = 0;
+    contract.serve(
+      b,
+      { 'text.echo': ({ text }) => ({ text }), 'math.add': ({ a: x, b: y }) => x + y },
+      {
+        guard: () => {
+          guarded += 1;
+        },
+      }
+    );
+
+    // A policy that logs, counts or audits a refusal must never be handed
+    // parameters the contract itself refuses.
+    await expect(a.request('text.echo', { text: 42 })).rejects.toMatchObject({
+      code: RESERVED_ERROR_CODES.INVALID_PARAMS,
+    });
+    expect(guarded).toBe(0);
+    expect(await a.request('text.echo', { text: 'hi' })).toEqual({ text: 'hi' });
+    expect(guarded).toBe(1);
+    await a.close();
+    await b.close();
+  });
+
   it('validates results when asked', async () => {
     const { a, b } = sessions();
     contract.serve(
