@@ -199,4 +199,20 @@ describe('LineDecoder', () => {
     expect(outcome.error?.kind).toBe('too-large');
     expect(outcome.error?.message).toContain('partial line is already 4097 bytes');
   });
+
+  it('refuses an oversized blank line the same whether it arrives whole or split', () => {
+    const blank = `${' '.repeat(4097)}\n`;
+
+    const whole = new LineDecoder({ maxFrameBytes: 4096 });
+    const wholeOutcome = whole.push(blank);
+    expect(wholeOutcome.frames).toEqual([]);
+    expect(wholeOutcome.error?.kind).toBe('too-large');
+
+    const split = new LineDecoder({ maxFrameBytes: 4096 });
+    const head = split.push(blank.slice(0, -1));
+    expect(head.frames).toEqual([]);
+    expect(head.error?.kind).toBe('too-large');
+    const tail = split.push(blank.slice(-1));
+    expect(tail.error?.kind).toBe('too-large');
+  });
 });

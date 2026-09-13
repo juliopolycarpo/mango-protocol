@@ -201,6 +201,16 @@ export class LineDecoder {
       const record = this.#pending.subarray(0, newline);
       this.#pending = this.#pending.subarray(newline + 1);
       this.#searched = 0;
+      // The size check runs before #consume's blank check, not after: a
+      // completed blank line must refuse exactly when the same bytes, still
+      // partial (no `\n` yet), already would have below. Checking blankness
+      // first let an oversized blank line buffer to completion and then be
+      // silently ignored, while the identical bytes arriving in two pushes
+      // were refused the moment they crossed the limit.
+      const content = stripCarriageReturn(record);
+      if (content.byteLength > this.#limit) {
+        return { frames, error: this.#refuse(content.byteLength) };
+      }
       const error = this.#consume(record, frames);
       if (error !== undefined) return { frames, error };
     }
