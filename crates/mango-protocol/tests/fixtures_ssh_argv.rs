@@ -49,7 +49,7 @@ fn options_of(case: &Value) -> Option<SshArgv> {
         options = options.with_identity_file(identity_file);
     }
     if let Some(port) = raw.get("port").and_then(Value::as_u64) {
-        options = options.with_port(u16::try_from(port).ok()?);
+        options = options.with_port(u32::try_from(port).ok()?);
     }
     if let Some(seconds) = raw.get("connectTimeoutSeconds").and_then(Value::as_u64) {
         options = options.with_connect_timeout_seconds(u32::try_from(seconds).ok()?);
@@ -87,12 +87,13 @@ fn every_reject_case_is_refused_for_the_reason_the_corpus_names() {
             .as_str()
             .expect("a reject case names a field");
 
-        let Some(options) = options_of(&case) else {
-            // The value does not fit this crate's types at all, which is a
-            // stronger refusal than the runtime one the corpus asks for.
-            ran += 1;
-            continue;
-        };
+        // A reject case that cannot be expressed is one this corpus never
+        // actually cross-checks. `n_port_above_the_range` sat in that hole for
+        // as long as the port was a `u16`: it counted as passing without
+        // `ssh_argv` ever being called on it.
+        let options = options_of(&case).unwrap_or_else(|| {
+            panic!("{name}: a reject case must be expressible, or it is never run")
+        });
         let error =
             ssh_argv(&options).expect_err(&format!("{name}: expected a refusal, got an argv"));
         assert_eq!(error.reason(), reason, "{name}: {error}");

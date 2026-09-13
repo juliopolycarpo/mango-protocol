@@ -13,7 +13,12 @@ use super::spawn::{ExitStatus, last_non_empty_line, signal_name};
 /// Reference connect timeout of the preset.
 pub const DEFAULT_CONNECT_TIMEOUT_SECONDS: u32 = 10;
 
-const PORT_MIN: u16 = 1;
+const PORT_MIN: u32 = 1;
+/// The largest port a TCP endpoint can name. Held as a `u32` because the
+/// refusal above it has to be expressible: a port that only fits in a `u16`
+/// can never be out of range, and `spec/fixtures/1/ssh-argv.json` asks for
+/// 65536 to be refused by name.
+const PORT_MAX: u32 = u16::MAX as u32;
 
 /// `ssh` reports every failure of its own with this status, whatever caused it.
 const SSH_OWN_FAILURE: i32 = 255;
@@ -37,8 +42,10 @@ pub struct SshArgv {
     pub host: String,
     /// The remote account, when it is not the local one.
     pub user: Option<String>,
-    /// The remote port, when it is not 22.
-    pub port: Option<u16>,
+    /// The remote port, when it is not 22. Wider than a port can be, so a
+    /// value out of range is refused by [`ssh_argv`] rather than by the type
+    /// — the same refusal `sshArgv` makes in the TypeScript SDK.
+    pub port: Option<u32>,
     /// A private key to use, and only that key.
     pub identity_file: Option<String>,
     /// The remote path first, its arguments after.
@@ -101,7 +108,7 @@ impl SshArgv {
     /// assert_eq!(options.port, Some(2222));
     /// ```
     #[must_use]
-    pub fn with_port(mut self, port: u16) -> Self {
+    pub fn with_port(mut self, port: u32) -> Self {
         self.port = Some(port);
         self
     }
@@ -205,8 +212,7 @@ impl fmt::Display for SshArgvError {
             ),
             Self::Port(port) => write!(
                 formatter,
-                "ssh port is {port}; expected an integer between {PORT_MIN} and {}",
-                u16::MAX
+                "ssh port is {port}; expected an integer between {PORT_MIN} and {PORT_MAX}"
             ),
             Self::ConnectTimeoutSeconds(seconds) => write!(
                 formatter,
@@ -356,9 +362,9 @@ fn checked_user(user: &str) -> Result<&str, SshArgvError> {
     Ok(user)
 }
 
-fn checked_port(port: u16) -> Result<u16, SshArgvError> {
-    if port < PORT_MIN {
-        return Err(SshArgvError::Port(u32::from(port)));
+fn checked_port(port: u32) -> Result<u32, SshArgvError> {
+    if !(PORT_MIN..=PORT_MAX).contains(&port) {
+        return Err(SshArgvError::Port(port));
     }
     Ok(port)
 }
@@ -433,6 +439,23 @@ mod tests {
             .position(|word| word == "-p")
             .expect("the port is set");
         assert!(identity < port, "{argv:?}");
+    }
+
+    #[test]
+    fn a_port_above_the_range_is_refused_by_the_preset_and_not_by_the_type() {
+        // `spec/fixtures/1/ssh-argv.json` carries this as a reject case named
+        // `port`, and the TypeScript `checkedPort` refuses it. While the field
+        // was a `u16` the value could not be expressed at all, so the corpus
+        // case was counted as passing without ever being run and this half of
+        // the range check was unreachable.
+        let error = ssh_argv(&SshArgv::new("build-box", ["mango-runtime"]).with_port(65_536))
+            .expect_err("a port above the range is refused");
+
+        assert_eq!(error.reason(), "port");
+        assert_eq!(
+            error.to_string(),
+            "ssh port is 65536; expected an integer between 1 and 65535"
+        );
     }
 
     #[test]
