@@ -1,5 +1,23 @@
 import { describe, expect, it } from 'bun:test';
-import { classifySshExit, sshArgv } from '../src/transports/ssh';
+import corpus from '../../../spec/fixtures/1/ssh-argv.json';
+import { classifySshExit, type SshArgvOptions, sshArgv } from '../src/transports/ssh';
+
+interface ArgvCase {
+  readonly name: string;
+  readonly verdict: 'accept' | 'reject';
+  readonly options: Record<string, unknown>;
+  readonly argv?: readonly string[];
+  readonly reason?: string;
+}
+
+/** The refusal message each `reason` must open with, as the Rust enum spells it. */
+const REASON_PREFIX: Record<string, string> = {
+  host: 'ssh host is',
+  user: 'ssh user is',
+  port: 'ssh port is',
+  connectTimeoutSeconds: 'ssh connectTimeoutSeconds is',
+  command: 'ssh command is',
+};
 
 /** The options every case in the preset carries, in the order spawn.md spells them. */
 const PRESET = [
@@ -21,6 +39,30 @@ const PRESET = [
   '-o',
   'RemoteCommand=none',
 ];
+
+describe('the shared argv corpus', () => {
+  // The Rust suite reads this same file, so these cases passing on both sides
+  // is what proves the two SDKs hand the operating system one command line.
+  const cases = corpus.cases as readonly ArgvCase[];
+
+  it('holds both accept and reject cases', () => {
+    expect(cases.filter((item) => item.verdict === 'accept').length).toBeGreaterThan(0);
+    expect(cases.filter((item) => item.verdict === 'reject').length).toBeGreaterThan(0);
+  });
+
+  for (const item of cases) {
+    it(`${item.name} is ${item.verdict}ed exactly as the corpus says`, () => {
+      const options = item.options as unknown as SshArgvOptions;
+      if (item.verdict === 'accept') {
+        expect(sshArgv(options)).toEqual([...(item.argv ?? [])]);
+        return;
+      }
+      const prefix = REASON_PREFIX[item.reason ?? ''];
+      expect(prefix).toBeDefined();
+      expect(() => sshArgv(options)).toThrow(prefix as string);
+    });
+  }
+});
 
 describe('sshArgv', () => {
   it('produces the preset, the destination and the quoted remote command', () => {

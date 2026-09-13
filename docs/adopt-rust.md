@@ -3,10 +3,9 @@
 `mango-protocol` is the wire in Rust: the frame types, their validation rules, the NDJSON line
 codec, the WebSocket chunk codec, the catalog document types and, behind the `schema` feature,
 a JSON Schema emission. Behind the `tokio` feature it also has a session (request/response
-multiplexing, cancel, event streams, liveness, graceful close) over any `Port`, and a `Contract`
-builder that validates, serves and calls it — see [Use a session](#use-a-session) below. A
-transport of its own (WebSocket, stdio) is still a later milestone; today a peer opens a session
-over its own `Port` implementation, or writes its own loop over the codec directly.
+multiplexing, cancel, event streams, liveness, graceful close) over any `Port`, a `Contract`
+builder that validates, serves and calls it — see [Use a session](#use-a-session) below — and
+the [transports](#transports) that session is opened over.
 
 ```toml
 [dependencies]
@@ -16,8 +15,17 @@ serde_json = "1"
 
 The codec-only path depends on `serde` and `serde_json` only. `schemars` is pulled in by the
 `schema` feature; `tokio`, `tokio-util` and `jsonschema` are pulled in by the `tokio` feature
-(the session and the contract builder), which the "Use a session" and "Serve a contract"
-sections below need.
+(the session, the contract builder and the stdio and local socket transports), which the "Use a
+session", "Serve a contract" and "Transports" sections below need. The `websocket` and `spawn`
+features add a transport each, so a consumer pays only for the ones it opens.
+
+| Feature     | Adds                                                                |
+| ----------- | ------------------------------------------------------------------- |
+| `tokio`     | `Session`, `Contract`, `transports::{ndjson, stdio, ipc, deadline}` |
+| `websocket` | `transports::websocket` — dialler, acceptor, `wss://` over rustls   |
+| `spawn`     | `transports::spawn` and the `transports::ssh` argv preset           |
+| `schema`    | JSON Schema emission                                                |
+| `testing`   | the reusable conformance suite                                      |
 
 ## Frames
 
@@ -144,10 +152,101 @@ See `Contract::client`'s own doc example for the full typed round trip through `
 `ContractHandlers`, and the `Guard` trait's doc example for the policy hook that runs between
 schema validation and the handler.
 
+## Transports
+
+Every transport produces a `Port`, and the session never learns which one it got. The
+byte-oriented ones share `transports::ndjson`, so the framing, the refusal handling and the
+close sequence exist once.
+
+```rust
+use mango_protocol::transports::stdio::stdio_port;
+use mango_protocol::transports::ipc::{connect_ipc, ipc_path, listen_ipc};
+use mango_protocol::transports::deadline::ConnectDeadline;
+
+// A spawned child speaks on its own standard streams. stdout carries frames
+// and nothing else, so route your logging to stderr while the session runs.
+let (session, driver) = Session::spawn(stdio_port(), SessionOptions::new(peer));
+
+// A local socket: a Unix domain socket, or a Windows named pipe. Both are
+// published so that only their owner can open them, and `accept` hands back
+// whatever identity the operating system offered for the peer.
+let mut listener = listen_ipc(ipc_path("mango-hub")?).await?;
+let (port, identity) = listener.accept().await?;
+
+// Dialling takes a deadline: an attempt nobody completes would otherwise stay
+// in flight for as long as the process lives.
+let deadline = ConnectDeadline::default().with_timeout(Duration::from_secs(5));
+let port = connect_ipc(ipc_path("mango-hub")?, &deadline).await?;
+```
+
+The WebSocket transport dials with the `mango.v1` subprotocol and the reference bearer
+credential, and accepts an upgrade either through its own helper or from whatever HTTP stack you
+already run:
+
+```rust
+use mango_protocol::transports::websocket::client::{WebSocketConnectOptions, connect_websocket};
+use mango_protocol::transports::websocket::server::accept_websocket;
+use mango_protocol::transports::websocket::{WebSocketOptions, websocket_port};
+
+let options = WebSocketConnectOptions::default().with_bearer(token);
+let port = connect_websocket("wss://hub.example/runtime", &options, &deadline).await?;
+
+// Accepting: the credential is checked before any hello, so a peer whose
+// token is no good never learns who you are. It reads the code off the close
+// because the upgrade completed first.
+let port = accept_websocket(socket, WebSocketOptions::default(), |token| match token {
+    Some(t) if known(t) => Ok(()),
+    _ => Err(close_codes::UNAUTHORIZED),
+})
+.await?;
+
+// Or, if you already upgraded the socket yourself:
+let port = websocket_port(already_upgraded, WebSocketOptions::default());
+```
+
+`wss://` uses rustls with the webpki root set and the `ring` provider, named explicitly rather
+than installed as the process default — a library that installed one would be deciding for the
+binary it is linked into. `ring` also builds without cmake or nasm, which keeps the Windows and
+aarch64 lanes free of a C toolchain. TLS is client-side only: the acceptor takes a stream
+somebody else already decrypted, because the protocol does not terminate TLS
+(`spec/transports/websocket.md`, TLS).
+
+The launcher starts a child and speaks stdio through its pipes. It observes and reports rather
+than guessing why a child failed:
+
+```rust
+use mango_protocol::transports::spawn::{SpawnOptions, spawn_port};
+use mango_protocol::transports::ssh::{SshArgv, classify_ssh_exit, ssh_argv};
+
+let (port, peer) = spawn_port(SpawnOptions::new(["mango-runtime", "--stdio"]))?;
+let (session, _driver) = Session::spawn(port, SessionOptions::new(identity));
+
+if session.ready().await.is_err() {
+    let why = peer.start_error(None).await;      // exit status, spawn error, last stderr line
+    eprintln!("{}", why.stderr_line);
+}
+// Closing the session ends the child's stdin, which is step 1 of the
+// sequence and all a conforming peer needs; `terminate` waits that out and
+// escalates to SIGTERM and SIGKILL for a child that does not leave.
+session.close(close_codes::RELEASED, Some("done")).await;
+peer.terminate().await;
+
+// SSH, WSL and container launches are the same transport with a different argv
+// in front; the preset is pure, so a caller can unit-test its launch command.
+let argv = ssh_argv(&SshArgv::new("build-box", ["mango-runtime", "--stdio"]))?;
+```
+
+`examples/conformance_peer` is a complete peer over every one of these, and what the interop
+lane drives:
+
+```console
+cargo run --example conformance_peer --features testing,websocket,spawn -- --ws 127.0.0.1:8080
+```
+
 ## What is missing, on purpose
 
-Transports of the session's own (WebSocket, stdio) are a later milestone; `Port` is the seam a
-transport crate implements against, proven today only by this crate's own in-process pair.
-`rpc.discover` is deferred too, out of scope until a consumer needs it. A `tracing` feature is
+Server-side TLS is not here: the runtime's own `serve` sits behind a TLS-terminating proxy, and
+it becomes a feature when a consumer asks for one. `rpc.discover` is deferred too, out of scope
+until a consumer needs it. A `tracing` feature is
 deferred as well, since no consumer reads a span yet and it would be public surface the docs
 lint and the feature powerset would have to carry for nothing.

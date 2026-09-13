@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { CLOSE_CODES } from '../src/close';
 import { CodecError } from '../src/errors';
 import type { PortClosure } from '../src/port';
+import { CLOSE_REASON_MAX_LENGTH } from '../src/schemas/common';
 import type { Frame } from '../src/schemas/frames';
 import { type ByteSink, createNdjsonPort } from '../src/transports/ndjson-port';
 
@@ -47,6 +48,20 @@ describe('NDJSON port', () => {
     handle.feed(encoder.encode('{"type":"ping"}\n{"type":'));
     handle.feed(encoder.encode('"pong"}\n'));
     expect(received).toEqual([{ type: 'ping' }, { type: 'pong' }]);
+  });
+
+  it('keeps the close code when the reason will not fit the frame limit', () => {
+    // The reason is capped by characters, but JSON escapes one NUL into six
+    // bytes, so a schema-valid reason can still outgrow a lowered limit. The
+    // code is what the peer needs: dropping the whole record for the sake of
+    // its reason would leave a refused peer reading a plain release.
+    const sink = new FakeByteSink();
+    const handle = createNdjsonPort({ sink, maxFrameBytes: 4096 });
+
+    handle.port.close(CLOSE_CODES.PROTOCOL_ERROR, '\0'.repeat(CLOSE_REASON_MAX_LENGTH));
+
+    expect(sink.lines).toEqual(['{"type":"close","code":4400}']);
+    expect(sink.ended).toBe(true);
   });
 
   it('exposes the frame limit it decodes under', () => {
