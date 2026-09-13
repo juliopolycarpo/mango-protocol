@@ -38,6 +38,11 @@ JSON Test Suite convention.
 the reference chunker, and by `scripts/fixtures/generate-ssh-argv.ts` from the reference argv
 builder; `bun run check` fails when either file is stale. Edit the generator, never the file.
 
+`negotiation.json` also carries a `handshake` object beside its `cases`: the 15-second budget of
+the wire spec's §5.2, the close code, and the exact reason a peer that never greeted is closed
+with. Both SDKs assert their own defaults against it, so the number lives in one place rather
+than three.
+
 `legacy-hello.json` is the one file nobody may regenerate. Its bytes were captured from the
 `runtime-protocol` 1.0.1 codec before that codec was deleted, and there is nothing left to
 capture them from: rewriting them by hand would turn "this build answers an old peer with
@@ -88,7 +93,9 @@ describe('my transport', () => {
 The suite runs the same scenarios against every transport: simultaneous handshake in both
 directions, minor negotiation, major mismatch answered with `4426`, requests in both directions
 and concurrently, unsupported methods, handler errors with codes and details, reserved method
-names, stream ordering and `end`, per-topic sequence numbers, ping in both directions, cancel,
+names, stream ordering and `end`, per-topic sequence numbers, ping in both directions — with the
+periodic ping switched off, which is how the suite proves §9's rule that a peer running no
+cadence of its own still answers one — cancel,
 local timeouts, dropped links failing in-flight requests with `UNAVAILABLE`, close reason
 propagation including fatal codes, `FRAME_TOO_LARGE` without ending the session, honouring a
 lower announced frame limit, and, with `connectRaw`, a schema-invalid `hello` answered with

@@ -106,6 +106,14 @@ Until a peer has received the other side's `hello`, it MUST NOT send any frame o
 `hello`, `ping`, `pong`, `close`, or an `err` answering a request the other side sent too
 early (§5.3): the peer's limits and the effective minor are not known yet.
 
+`hello` is sent as soon as the transport is open, with one exception in the other direction:
+where a transport authenticates (a WebSocket upgrade carrying a credential, a local socket
+checking peer credentials), the **acceptor** MUST NOT send `hello` until that check has
+succeeded. A peer whose credential is no good is closed with `4401` or `4403` and never learns
+who was listening. The **dialler** is under no such rule and MAY send `hello` immediately: on a
+refusal the acceptor discards it unread, which is why a refused dial costs one frame and not a
+round trip.
+
 ### 5.2 Negotiation
 
 On receiving the peer's `hello`:
@@ -120,7 +128,11 @@ On receiving the peer's `hello`:
    effective minor.
 
 The handshake is complete for a peer once it has both sent and received `hello`. A peer SHOULD
-bound the wait with a timeout; on expiry it closes with `4400` and the reason `handshake timeout`.
+bound the wait with a timeout; on expiry it closes with `4400` and the reason `handshake timeout`,
+spelled exactly that way so a log on the other side is searchable. The reference budget is
+15 seconds, which `spec/fixtures/1/negotiation.json` records under `handshake` for a conformance
+suite to check against its own default. A launcher that has to open a network connection or start
+a container before the child can greet budgets more (see [spawn](transports/spawn.md)).
 
 ### 5.3 Before the handshake completes
 
@@ -136,9 +148,12 @@ bound the wait with a timeout; on expiry it closes with `4400` and the reason `h
 { "type": "req", "id": "r-42", "method": "fs.read-file", "params": { "path": "/etc/hosts" } }
 ```
 
-- `id` is a string of 1 to 256 characters chosen by the requester. It MUST be unique among the
-  requester's in-flight requests on this session. Reusing an id after its response has arrived
-  is allowed but not recommended.
+- `id` is a string of 1 to 256 characters chosen by the requester. A requester MUST NOT reuse
+  an id within a session, including after its response has arrived: a per-session counter is the
+  reference generator, and both SDKs use one. The rule binds the sender because a responder
+  cannot check it — remembering every id a session has ever carried is exactly the unbounded
+  state [§11](#11-limits) refuses — so a responder enforces only the part it can see, an id that
+  duplicates one still in flight ([§6.2](#62-res-and-err)).
 - `method` matches `^[a-z](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z](?:[a-z0-9-]*[a-z0-9])?)+$` and is
   at most 128 characters: at least two dot-separated segments, each starting with a lowercase
   letter, made of lowercase letters, digits and dashes, and never ending with a dash. Names under
@@ -221,6 +236,10 @@ refused; a consumer narrows them to its own known set.
   peer: the sender closes with `4000` and the reason `liveness timeout`.
 - Transport-level keepalives (WebSocket control frames, TCP options) do not replace protocol
   liveness; a transport MAY use them in addition.
+- An implementation MAY run no periodic ping at all on a transport that cannot silently die —
+  an in-process pair, or one whose own liveness the application already trusts. Answering
+  `ping` is not optional either way: a peer that has switched its own cadence off MUST still
+  answer every `ping` it receives, because the other side may not have.
 
 ## 10. Close
 

@@ -1,5 +1,11 @@
 {
   "$comment": "Negotiation cases: effective minor is the lower minor when majors match; otherwise close 4426.",
+  "handshake": {
+    "$comment": "The handshake budget of the wire spec section 5.2: a peer that has not received hello within timeoutMs closes with closeCode and this exact reason.",
+    "timeoutMs": 15000,
+    "closeCode": 4400,
+    "reason": "handshake timeout"
+  },
   "cases": [
     {
       "name": "y_equal",

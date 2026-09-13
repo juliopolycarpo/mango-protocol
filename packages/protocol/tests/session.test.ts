@@ -121,6 +121,27 @@ describe('Session handshake', () => {
     });
   });
 
+  it('never reuses a request id within a session', async () => {
+    const ports = createInProcessPortPair();
+    const recorder = new FrameRecorder(ports.b);
+    const hub = new Session(ports.a, { peer: HUB, livenessIntervalMs: false });
+    const runtime = new Session(ports.b, {
+      peer: RUNTIME,
+      livenessIntervalMs: false,
+      handlers: { 'test.echo': (params) => params },
+    });
+    await Promise.all([hub.ready, runtime.ready]);
+
+    // §6.1 binds the requester, not the responder: each request settles before
+    // the next goes out, so nothing but a fresh id can keep them distinct.
+    for (let index = 0; index < 4; index += 1) await hub.request('test.echo', index);
+
+    const ids = recorder.frames.filter((frame) => frame.type === 'req').map((frame) => frame.id);
+    expect(ids).toHaveLength(4);
+    expect(new Set(ids).size).toBe(ids.length);
+    hub.close();
+  });
+
   it('answers a request that arrives before the handshake with UNAVAILABLE', async () => {
     const ports = createInProcessPortPair();
     const recorder = new FrameRecorder(ports.b);

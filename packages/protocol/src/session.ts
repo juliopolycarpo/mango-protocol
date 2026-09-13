@@ -98,8 +98,14 @@ export interface SessionOptions {
   readonly timers?: SessionTimers;
 }
 
-const DEFAULT_HANDSHAKE_TIMEOUT_MS = 15_000;
-const DEFAULT_LIVENESS_INTERVAL_MS = 20_000;
+/** How long a session waits for the peer's `hello` before closing `4400` (§5.2). */
+export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 15_000;
+
+/** The close reason §5.2 puts on a handshake that ran out of time, spelled exactly. */
+export const HANDSHAKE_TIMEOUT_REASON = 'handshake timeout';
+
+/** Default ping cadence once the handshake completes (§9). */
+export const DEFAULT_LIVENESS_INTERVAL_MS = 20_000;
 
 interface PendingRequest {
   readonly method: string;
@@ -367,7 +373,7 @@ export class Session {
           { timeoutMs }
         ),
         CLOSE_CODES.PROTOCOL_ERROR,
-        'handshake timeout'
+        HANDSHAKE_TIMEOUT_REASON
       );
     }, timeoutMs);
   }

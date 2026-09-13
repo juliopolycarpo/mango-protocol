@@ -30,7 +30,10 @@ pub use handle::{
     EventInput, EventStream, PongStream, RemotePeer, RequestOptions, Session, SessionState,
 };
 pub use handler::{CallContext, Handler, HandlerFuture, HandlerGuard};
-pub use options::SessionOptions;
+pub use options::{
+    DEFAULT_HANDLER_GRACE, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_LIVENESS_INTERVAL,
+    DEFAULT_REQUEST_ID_PREFIX, HANDSHAKE_TIMEOUT_REASON, SessionOptions,
+};
 pub use teardown::SessionClosure;
 
 use shared::{Inner, Shared};

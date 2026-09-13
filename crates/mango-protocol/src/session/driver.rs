@@ -457,6 +457,6 @@ fn on_handshake_timeout(shared: &Shared, handshake_timeout: Duration) -> Teardow
     .with_detail("timeout_ms", millis)));
     Teardown::Local {
         code: close_codes::PROTOCOL_ERROR,
-        reason: Some("handshake timeout".into()),
+        reason: Some(super::options::HANDSHAKE_TIMEOUT_REASON.into()),
     }
 }

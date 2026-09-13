@@ -18,6 +18,9 @@ pub const DEFAULT_LIVENESS_INTERVAL: Duration = Duration::from_secs(20);
 pub const DEFAULT_HANDLER_GRACE: Duration = Duration::from_secs(5);
 /// `"r"`: the default [`SessionOptions::request_id_prefix`].
 pub const DEFAULT_REQUEST_ID_PREFIX: &str = "r";
+/// The close reason the specification's §5.2 puts on a handshake that ran
+/// out of time, spelled exactly as the peer's log will show it.
+pub const HANDSHAKE_TIMEOUT_REASON: &str = "handshake timeout";
 
 /// How to open a [`crate::session::Session`]: who this side is, and every
 /// tunable the handshake and the driver need.
