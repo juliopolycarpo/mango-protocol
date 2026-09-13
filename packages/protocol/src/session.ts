@@ -411,6 +411,12 @@ export class Session {
    * `handlerGraceMs`, so one that ignores its abort signal delays a shutdown
    * without blocking it.
    *
+   * A handler that awaits its own `context.session.close()` is one of the
+   * handlers this waits on: the wait cannot distinguish "called from inside
+   * a running handler" from any other caller, so that call resolves only
+   * once `handlerGraceMs` elapses, not sooner. A handler that needs to close
+   * the session without waiting on itself should call `closeNow` instead.
+   *
    * @example
    * const closure = await session.close(CLOSE_CODES.RELEASED, 'shutting down');
    */

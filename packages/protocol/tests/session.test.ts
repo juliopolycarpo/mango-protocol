@@ -276,6 +276,37 @@ describe('Session close', () => {
     hub.closeNow();
   });
 
+  it('a handler awaiting its own close() stalls to the grace, not forever', async () => {
+    const ports = createInProcessPortPair();
+    const responder = new Session(ports.b, {
+      peer: RUNTIME,
+      livenessIntervalMs: false,
+      handlerGraceMs: 20,
+      handlers: {
+        // `close()` waits on every in-flight handler, this one included: it
+        // cannot tell "called from inside a running handler" apart from any
+        // other caller, so this resolves only once the grace elapses.
+        'test.closes-itself': async (_params, context) => {
+          // A prior await, matching the shape that actually stalls: it lets
+          // this handler's own dispatch promise land in `#dispatches` before
+          // `close()` is called, so `close()` ends up waiting on it.
+          await Promise.resolve();
+          await context.session.close();
+          return null;
+        },
+      },
+    });
+    const hub = new Session(ports.a, { peer: HUB, livenessIntervalMs: false });
+    await Promise.all([hub.ready, responder.ready]);
+    void hub.request('test.closes-itself', {}).catch(() => undefined);
+    await tick();
+
+    const before = Date.now();
+    await responder.close();
+    expect(Date.now() - before).toBeGreaterThanOrEqual(15);
+    hub.closeNow();
+  });
+
   it('closeNow tears down without waiting, and closing twice is a no-op', async () => {
     const { hub, runtime } = pair();
     await Promise.all([hub.ready, runtime.ready]);
