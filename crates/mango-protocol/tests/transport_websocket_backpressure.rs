@@ -15,7 +15,7 @@ use futures_util::StreamExt;
 use mango_protocol::close::close_codes;
 use mango_protocol::codec::ndjson::encode_frame_bytes;
 use mango_protocol::frame::{Frame, Request};
-use mango_protocol::port::{Port, PortTx, SendOutcome};
+use mango_protocol::port::{Inbound, Port, PortClosure, PortRx, PortTx, SendOutcome};
 use mango_protocol::transports::deadline::ConnectDeadline;
 use mango_protocol::transports::websocket::WebSocketOptions;
 use mango_protocol::transports::websocket::client::{WebSocketConnectOptions, connect_websocket};
@@ -237,6 +237,74 @@ async fn a_burst_with_no_yields_still_gives_up_on_a_peer_that_is_not_reading() {
         Some(close_codes::PROTOCOL_ERROR),
         "the peer is owed the code, not just a socket that stopped"
     );
+    let _ = acceptor.await;
+}
+
+/// The writer giving up is not only a `send_frame` outcome.
+///
+/// Nothing here ever reads a byte from the peer, and nothing is going to
+/// before this test says so — the acceptor only starts reading after `recv`
+/// has already returned. A session's read loop is exactly this shape: it
+/// waits on `recv` for whatever the peer sends next, and a peer that stopped
+/// reading may just as well never send anything back. If the writer task's
+/// own decision to give up never reaches the receive half, that `recv` has
+/// no way to learn the transport is gone and holds every pending response
+/// forever, which is the entire failure this transport's backpressure rule
+/// exists to prevent.
+#[tokio::test]
+async fn a_burst_with_no_yields_also_unblocks_a_concurrent_recv() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+    let address = listener.local_addr().expect("a bound address");
+    let (start_reading, wait) = oneshot::channel::<()>();
+
+    let acceptor = tokio::spawn(async move {
+        let (socket, _address) = listener.accept().await.expect("a dialler");
+        let _stream = upgrade(socket).await;
+        let _ = wait.await;
+    });
+
+    let port = connect_websocket(
+        &format!("ws://{address}/burst-recv"),
+        &WebSocketConnectOptions::default().with_websocket(options()),
+        &ConnectDeadline::default().with_timeout(Duration::from_secs(5)),
+    )
+    .await
+    .expect("the acceptor selects mango.v1");
+
+    let (mut tx, mut rx) = port.split();
+
+    for index in 0..4096 {
+        let frame = Frame::Req(Request {
+            id: format!("r-{index}"),
+            method: "test.bulk".into(),
+            params: Value::String("x".repeat(FRAME_LIMIT / 8)),
+        });
+        assert_eq!(tx.send(frame).await, SendOutcome::Sent);
+    }
+
+    // Give the writer task the run of the executor, exactly as the sibling
+    // test does — the acceptor still has not read a single byte.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let inbound = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .expect(
+            "recv blocked on a peer that stopped reading must not wait on that \
+             same peer to send something back before it agrees the transport \
+             is gone",
+        );
+    match inbound {
+        Some(Inbound::Closed(PortClosure::Closed { code, .. })) => {
+            assert_eq!(
+                code,
+                Some(close_codes::PROTOCOL_ERROR),
+                "recv is owed the same code send_frame already decided on"
+            );
+        }
+        other => panic!("expected Closed with PROTOCOL_ERROR, got {other:?}"),
+    }
+
+    let _ = start_reading.send(());
     let _ = acceptor.await;
 }
 

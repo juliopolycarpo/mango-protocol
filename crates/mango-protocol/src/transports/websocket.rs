@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -47,6 +47,11 @@ pub const WEBSOCKET_SUBPROTOCOL: &str = "mango.v1";
 /// RFC 6455 caps the close reason at 123 UTF-8 bytes; the `close` frame
 /// carries the full one.
 const MAX_CLOSE_REASON_BYTES: usize = 123;
+
+/// Recorded on both halves when the writer gives up on a queue that outgrew
+/// one frame limit while the socket was not draining.
+const STALLED_QUEUE_REASON: &str =
+    "the send queue outgrew one frame limit while the socket was not draining";
 
 /// How this transport frames, and how much it will hold for a socket that is
 /// not draining.
@@ -239,6 +244,7 @@ where
         let options = self.options;
         let (sink, stream) = self.stream.split();
         let writer = SocketWriter::spawn(sink, options);
+        let gave_up = writer.gave_up.subscribe();
         let tx = WebSocketTx {
             writer: writer.clone(),
             options,
@@ -248,6 +254,7 @@ where
             stream,
             reassembler: ChunkReassembler::new(options.max_message_bytes, options.max_frame_bytes),
             writer,
+            gave_up,
             closure: None,
             terminal: false,
         };
@@ -285,6 +292,12 @@ pub struct WebSocketRx<S> {
     stream: SplitStream<WebSocketStream<S>>,
     reassembler: ChunkReassembler,
     writer: SocketWriter,
+    /// True once the writer task gives up on a queue that outgrew one frame
+    /// limit while the socket was not draining, before the write behind it
+    /// ever resolves — see `drive`. A peer that stopped reading may also
+    /// never send anything back, so `recv` cannot wait on `stream.next()`
+    /// alone to learn the same thing the write half already decided.
+    gave_up: watch::Receiver<bool>,
     /// Why the socket ended; held until it is the next thing to hand out.
     closure: Option<PortClosure>,
     terminal: bool,
@@ -303,10 +316,30 @@ where
             if self.terminal {
                 return None;
             }
+            // Checked before anything here awaits, the same way a closure
+            // recorded from the socket itself is: a signal that landed while
+            // this was handing out an earlier frame must not be missed.
+            if *self.gave_up.borrow_and_update() {
+                self.writer.mark_closed();
+                self.closure = Some(PortClosure::Closed {
+                    code: Some(close_codes::PROTOCOL_ERROR),
+                    reason: Some(STALLED_QUEUE_REASON.to_owned()),
+                });
+                continue;
+            }
             // `StreamExt::next` on a `SplitStream` is cancel-safe: a call
             // dropped because another `select!` branch won the race leaves a
             // partially received message in the socket's own buffer.
-            match self.stream.next().await {
+            let message = tokio::select! {
+                message = self.stream.next() => message,
+                _ = self.gave_up.changed() => {
+                    // Nothing to do here: the next iteration's check at the
+                    // top of the loop is what records and hands out the
+                    // closure, exactly as it would if this arm had never won.
+                    continue;
+                }
+            };
+            match message {
                 Some(Ok(message)) => {
                     if let Some(item) = self.on_message(message).await {
                         return Some(item);
@@ -447,6 +480,12 @@ struct SocketWriter {
     /// not see that growth, since nothing re-polls a write already suspended
     /// on the socket to notice the queue behind it changing shape.
     paused: Arc<AtomicBool>,
+    /// Flips true the instant `drive` gives up on a queue that outgrew one
+    /// frame limit while the socket was not draining, before the write behind
+    /// it ever resolves. `WebSocketRx::recv` subscribes to this: a peer that
+    /// stopped reading may also never send anything back, so nothing else
+    /// would ever wake a `recv` blocked on that same peer.
+    gave_up: Arc<watch::Sender<bool>>,
     /// Held, never read: dropping the last handle aborts the writer task, so
     /// one still stuck on a socket that will not take the farewell cannot
     /// outlive the port.
@@ -490,12 +529,14 @@ impl SocketWriter {
         let queued_bytes = Arc::new(AtomicUsize::new(0));
         let open = Arc::new(AtomicBool::new(true));
         let paused = Arc::new(AtomicBool::new(false));
+        let gave_up = Arc::new(watch::Sender::new(false));
         let task = tokio::spawn(drive(
             sink,
             receiver,
             Arc::clone(&queued_bytes),
             Arc::clone(&open),
             Arc::clone(&paused),
+            Arc::clone(&gave_up),
             options,
         ));
         Self {
@@ -503,6 +544,7 @@ impl SocketWriter {
             queued_bytes,
             open,
             paused,
+            gave_up,
             _task: Arc::new(AbortOnDrop(task)),
             options,
         }
@@ -555,7 +597,7 @@ impl SocketWriter {
         if waiting > self.options.max_frame_bytes && self.paused.load(Ordering::Acquire) {
             self.close(
                 close_codes::PROTOCOL_ERROR,
-                Some("the send queue outgrew one frame limit while the socket was not draining"),
+                Some(STALLED_QUEUE_REASON),
                 true,
             )
             .await;
@@ -649,6 +691,7 @@ async fn drive<S>(
     queued_bytes: Arc<AtomicUsize>,
     open: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    gave_up: Arc<watch::Sender<bool>>,
     options: WebSocketOptions,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -690,8 +733,12 @@ async fn drive<S>(
                             // Set the instant the rule fires, not after this
                             // write finally drains: a sender already past
                             // this point must see `Closed` without waiting
-                            // for a peer that may never take another byte.
+                            // for a peer that may never take another byte,
+                            // and a concurrent `recv` — which this same peer
+                            // may also never send anything to unblock — must
+                            // not wait on it either.
                             open.store(false, Ordering::Release);
+                            gave_up.send_replace(true);
                         }
                         polled
                     })
@@ -737,16 +784,18 @@ async fn close_stalled_peer<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    const REASON: &str = "the send queue outgrew one frame limit while the socket was not draining";
     if options.send_close_frame
-        && let Some(messages) =
-            farewell_messages(close_codes::PROTOCOL_ERROR, Some(REASON), options)
+        && let Some(messages) = farewell_messages(
+            close_codes::PROTOCOL_ERROR,
+            Some(STALLED_QUEUE_REASON),
+            options,
+        )
     {
         let _ = write_chunks(sink, messages).await;
     }
     let frame = CloseFrame {
         code: CloseCode::from(close_codes::PROTOCOL_ERROR),
-        reason: clamp_close_reason(REASON).into(),
+        reason: clamp_close_reason(STALLED_QUEUE_REASON).into(),
     };
     let _ = sink.send(Message::Close(Some(frame))).await;
 }
