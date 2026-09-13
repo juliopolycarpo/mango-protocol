@@ -49,6 +49,34 @@ class FakePort implements Port {
   }
 }
 
+/** Wraps a real port and throws instead of sending when `shouldFail` matches. */
+class FailingSendPort implements Port {
+  readonly #inner: Port;
+  readonly #shouldFail: (frame: Frame) => boolean;
+
+  constructor(inner: Port, shouldFail: (frame: Frame) => boolean) {
+    this.#inner = inner;
+    this.#shouldFail = shouldFail;
+  }
+
+  send(frame: Frame): void {
+    if (this.#shouldFail(frame)) throw new Error('the transport refused this frame');
+    this.#inner.send(frame);
+  }
+
+  onFrame(listener: (frame: Frame) => void): () => void {
+    return this.#inner.onFrame(listener);
+  }
+
+  onClosed(listener: (closure: PortClosure) => void): () => void {
+    return this.#inner.onClosed(listener);
+  }
+
+  close(code: number, reason?: string): void {
+    this.#inner.close(code, reason);
+  }
+}
+
 /** Collects every frame a raw port receives so a test can inspect the wire. */
 class FrameRecorder {
   readonly frames: Frame[] = [];
@@ -397,6 +425,28 @@ describe('Session events and liveness', () => {
     expect(session.emit({ topic: 'test.ok', payload: 1 })).toBe(true);
     session.close();
     expect(session.emit({ topic: 'test.late', payload: 1 })).toBe(false);
+  });
+
+  it('does not count a stream key whose send failed toward the ceiling', async () => {
+    const ports = createInProcessPortPair();
+    let failNextEvent = false;
+    const port = new FailingSendPort(ports.a, (frame) => failNextEvent && frame.type === 'evt');
+    const session = new Session(port, {
+      peer: HUB,
+      livenessIntervalMs: false,
+      maxStreamKeys: 1,
+    });
+    ports.b.send(rawHello());
+    await session.ready;
+
+    failNextEvent = true;
+    expect(() => session.emit({ topic: 'test.a', payload: null })).toThrow(
+      'the transport refused this frame'
+    );
+    failNextEvent = false;
+    // The failed emit above must not have left "test.a" occupying the one
+    // stream key this session allows: a different key still fits.
+    expect(session.emit({ topic: 'test.b', payload: null })).toBe(true);
   });
 
   it('closes with a liveness timeout when pongs stop', async () => {

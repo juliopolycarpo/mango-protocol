@@ -368,9 +368,12 @@ export class Session {
       ...(event.end ? { end: true as const } : {}),
     };
     this.#assertFits(frame, `Event "${event.topic}"`);
+    // Sent before the sequence counter is committed: a port that throws must
+    // leave this stream key exactly as it found it, not occupying a slot
+    // toward `#maxStreamKeys` for a frame that never reached the wire.
+    this.#port.send(frame);
     if (event.end) this.#eventSequences.delete(key);
     else this.#eventSequences.set(key, seq + 1);
-    this.#port.send(frame);
     return true;
   }
 
