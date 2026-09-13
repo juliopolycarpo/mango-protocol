@@ -14,6 +14,17 @@ const CORPUS: &str = include_str!(concat!(
     "/../../spec/fixtures/1/ssh-argv.json"
 ));
 
+/// Reject cases this crate's types refuse outright, so `ssh_argv` is never
+/// reached for them.
+///
+/// Named rather than skipped. A case that quietly falls out of the run is one
+/// nothing cross-checks, which is exactly what `n_port_above_the_range` did
+/// while the exclusion was implicit: the reject test counted it as passing
+/// without ever calling `ssh_argv` on it. The test below fails both ways —
+/// when a case it cannot express is missing from this list, and when a case on
+/// this list turns out to be expressible after all and should simply be run.
+const REFUSED_BY_TYPE: &[&str] = &["n_port_above_the_range"];
+
 fn cases() -> Vec<Value> {
     let document: Value = serde_json::from_str(CORPUS).expect("ssh-argv.json is valid JSON");
     let cases = document["cases"].as_array().expect("a cases array").clone();
@@ -49,7 +60,7 @@ fn options_of(case: &Value) -> Option<SshArgv> {
         options = options.with_identity_file(identity_file);
     }
     if let Some(port) = raw.get("port").and_then(Value::as_u64) {
-        options = options.with_port(u32::try_from(port).ok()?);
+        options = options.with_port(u16::try_from(port).ok()?);
     }
     if let Some(seconds) = raw.get("connectTimeoutSeconds").and_then(Value::as_u64) {
         options = options.with_connect_timeout_seconds(u32::try_from(seconds).ok()?);
@@ -78,26 +89,41 @@ fn every_accept_case_builds_the_argv_the_corpus_holds() {
 #[test]
 fn every_reject_case_is_refused_for_the_reason_the_corpus_names() {
     let mut ran = 0;
+    let mut refused_by_type: Vec<String> = Vec::new();
     for case in cases() {
         if case["verdict"] != "reject" {
             continue;
         }
-        let name = case["name"].as_str().expect("a name");
+        let name = case["name"].as_str().expect("a name").to_owned();
         let reason = case["reason"]
             .as_str()
             .expect("a reject case names a field");
 
-        // A reject case that cannot be expressed is one this corpus never
-        // actually cross-checks. `n_port_above_the_range` sat in that hole for
-        // as long as the port was a `u16`: it counted as passing without
-        // `ssh_argv` ever being called on it.
-        let options = options_of(&case).unwrap_or_else(|| {
-            panic!("{name}: a reject case must be expressible, or it is never run")
-        });
+        let Some(options) = options_of(&case) else {
+            assert!(
+                REFUSED_BY_TYPE.contains(&name.as_str()),
+                "{name}: this crate's types cannot express the case, so `ssh_argv` never sees it. \
+                 Make it expressible, or name it in REFUSED_BY_TYPE saying which type refuses it."
+            );
+            refused_by_type.push(name);
+            ran += 1;
+            continue;
+        };
         let error =
             ssh_argv(&options).expect_err(&format!("{name}: expected a refusal, got an argv"));
         assert_eq!(error.reason(), reason, "{name}: {error}");
         ran += 1;
     }
     assert!(ran > 0, "the corpus holds no reject cases");
+
+    refused_by_type.sort();
+    let mut expected: Vec<String> = REFUSED_BY_TYPE
+        .iter()
+        .map(|&name| name.to_owned())
+        .collect();
+    expected.sort();
+    assert_eq!(
+        refused_by_type, expected,
+        "a case named in REFUSED_BY_TYPE is expressible now; run it rather than excluding it"
+    );
 }
