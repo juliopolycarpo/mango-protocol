@@ -115,6 +115,21 @@ jobs:
           tool: cargo-deny
       - run: cargo deny check
 
+  # MSRV policy lives on `rust-version` in the workspace Cargo.toml: current stable minus two
+  # minors is 1.96, but this crate holds at 1.97 because dropping further buys nothing today.
+  # rust-toolchain.toml pins 1.98.1 for everything else, so 1.97.0 is installed explicitly here.
+  msrv:
+    name: MSRV (1.97.0, policy on Cargo.toml's rust-version)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.97.0 --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo +1.97.0 check --all-features --locked
+
   schema-equality:
     name: Schema equality and round trip
     runs-on: ubuntu-latest
@@ -135,7 +150,7 @@ jobs:
   gate:
     name: Gate
     if: always()
-    needs: [typescript, rust, transports, interop, deny, schema-equality]
+    needs: [typescript, rust, transports, interop, deny, msrv, schema-equality]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
