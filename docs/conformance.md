@@ -99,8 +99,10 @@ describe('my transport', () => {
 
 The suite runs the same scenarios against every transport: simultaneous handshake in both
 directions, minor negotiation, major mismatch answered with `4426`, requests in both directions
-and concurrently, unsupported methods, handler errors with codes and details, reserved method
-names, stream ordering and `end`, per-topic sequence numbers, ping in both directions — with the
+and concurrently, unsupported methods, handler errors with codes and details, a request past the
+responder's in-flight ceiling refused as retryable, reserved method names, stream ordering and
+`end`, per-topic sequence numbers, one stream key past the local ceiling refused before anything
+is sent, ping in both directions — with the
 periodic ping switched off, which is how the suite proves §9's rule that a peer running no
 cadence of its own still answers one — cancel,
 local timeouts, dropped links failing in-flight requests with `UNAVAILABLE`, close reason

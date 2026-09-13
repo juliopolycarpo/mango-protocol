@@ -199,6 +199,31 @@ export function itBehavesLikeAMangoTransport(fixture: ConformanceFixture): void 
     });
   });
 
+  it('refuses a request past the in-flight ceiling and stays open', async () => {
+    await withPair(
+      async ({ a }) => {
+        const controller = new AbortController();
+        const held = a.request('test.forever', {}, { signal: controller.signal });
+        await settled();
+
+        const refused = await rejectionOf(a.request('test.echo', { queued: true }));
+        expect(refused).toMatchObject({
+          code: RESERVED_ERROR_CODES.UNAVAILABLE,
+          details: { kind: 'in_flight_limit', limit: 1 },
+        });
+
+        // Retryable, not fatal: the slot frees when the held request settles
+        // and the very same call goes through.
+        controller.abort();
+        await rejectionOf(held);
+        await settled();
+        expect(await a.request('test.echo', { queued: true })).toEqual({ queued: true });
+      },
+      {},
+      { maxInFlight: 1 }
+    );
+  });
+
   it('refuses a reserved rpc. method before it reaches the wire', async () => {
     await withPair(async ({ a }) => {
       expect(await rejectionOf(a.request('rpc.discover', {}))).toMatchObject({
@@ -253,6 +278,27 @@ export function itBehavesLikeAMangoTransport(fixture: ConformanceFixture): void 
       detach();
       expect(sequences).toEqual([0, 1]);
     });
+  });
+
+  it('refuses one stream key past the local ceiling', async () => {
+    await withPair(
+      async ({ a, b }) => {
+        // emit() is a no-op before the handshake completes, so a `true` here
+        // would otherwise be proving nothing about the ceiling.
+        await Promise.all([a.ready, b.ready]);
+        expect(a.emit({ topic: 'test.stream', streamId: 's-1', payload: null })).toBe(true);
+        expect(a.emit({ topic: 'test.stream', streamId: 's-2', payload: null })).toBe(true);
+        // Local, so nothing reaches the peer: a sender at this ceiling has
+        // leaked stream ids, which is a defect in the sender.
+        expect(() => a.emit({ topic: 'test.stream', streamId: 's-3', payload: null })).toThrow(
+          RemoteError
+        );
+
+        a.emit({ topic: 'test.stream', streamId: 's-1', payload: null, end: true });
+        expect(a.emit({ topic: 'test.stream', streamId: 's-3', payload: null })).toBe(true);
+      },
+      { maxStreamKeys: 2 }
+    );
   });
 
   it('answers a protocol ping with a pong in both directions', async () => {
