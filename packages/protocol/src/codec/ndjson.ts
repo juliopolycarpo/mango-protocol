@@ -153,6 +153,16 @@ export function measureFrameBytes(frame: Frame): number {
 export function decodeLine(line: string | Uint8Array, options?: FrameLimitOptions): Frame {
   const limit = resolveFrameLimit(options);
   const bytes = stripCarriageReturn(typeof line === 'string' ? encoder.encode(line) : line);
+  // Size before blankness, the order `LineDecoder` and the Rust codec both
+  // use: a line past the limit is refused for being past it whether or not
+  // anything but whitespace is in it, so one giant blank line cannot answer
+  // `empty` here and `too-large` everywhere else.
+  if (bytes.byteLength > limit) {
+    throw new CodecError(
+      'too-large',
+      `line is ${bytes.byteLength} bytes; expected at most ${limit}`
+    );
+  }
   const text = decoder.decode(bytes);
   if (BLANK_LINE.test(text)) {
     throw new CodecError('empty', 'line is blank; expected one JSON object');

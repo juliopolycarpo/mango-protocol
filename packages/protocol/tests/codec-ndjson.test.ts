@@ -110,6 +110,17 @@ describe('decodeLine', () => {
     expect(refusalOf(() => decodeLine('\r')).kind).toBe('empty');
   });
 
+  it('refuses an oversized blank record for its size, not its blankness', () => {
+    // The same order `LineDecoder` and the Rust codec use. Reporting `empty`
+    // here would have one giant blank line answer two different refusals
+    // depending on which decoder read it.
+    const blank = ' '.repeat(4097);
+    expect(refusalOf(() => decodeLine(blank, { maxFrameBytes: 4096 })).kind).toBe('too-large');
+    expect(refusalOf(() => decodeLine(' '.repeat(4096), { maxFrameBytes: 4096 })).kind).toBe(
+      'empty'
+    );
+  });
+
   it('refuses a byte-order mark on the byte path as well as the text path', () => {
     expect(refusalOf(() => decodeLine('﻿{"type":"ping"}')).kind).toBe('invalid-json');
     expect(refusalOf(() => decodeLine(encoder.encode('﻿{"type":"ping"}'))).kind).toBe(

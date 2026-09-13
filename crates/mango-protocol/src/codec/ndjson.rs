@@ -508,6 +508,21 @@ mod tests {
         assert!(outcome.frames.is_empty());
     }
 
+    /// The standalone decoder orders the two checks the same way the stream
+    /// decoder does: over the limit is over the limit, blank or not. The
+    /// TypeScript `decodeLine` reported `empty` for this input until the same
+    /// order landed there.
+    #[test]
+    fn an_oversized_blank_line_is_refused_for_its_size_not_its_blankness() {
+        let blank = vec![b' '; MIN_MAX_FRAME_BYTES + 1];
+        let error = decode_line(&blank, MIN_MAX_FRAME_BYTES).expect_err("over the limit");
+        assert_eq!(error.kind, CodecErrorKind::TooLarge);
+
+        let fits = vec![b' '; MIN_MAX_FRAME_BYTES];
+        let error = decode_line(&fits, MIN_MAX_FRAME_BYTES).expect_err("blank");
+        assert_eq!(error.kind, CodecErrorKind::Schema);
+    }
+
     #[test]
     fn an_oversized_blank_line_is_refused_whether_it_arrives_whole_or_split() {
         let mut blank = vec![b' '; MIN_MAX_FRAME_BYTES + 1];
