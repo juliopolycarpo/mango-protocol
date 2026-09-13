@@ -31,16 +31,16 @@ allow = [
 ]
 confidence-threshold = 0.8
 
-# ring declares `Apache-2.0 AND ISC` in its own Cargo.toml, which the allow list above already
-# covers directly. It still gets a clarify because that declared expression is not the whole
-# truth: ring vendors BoringSSL-derived C under a third, older OpenSSL-style license that the
-# Cargo.toml field doesn't mention, and pinning the clarify to a hash of LICENSE means a future
-# ring release that changes what it bundles fails loudly here instead of silently trusting a
-# field we haven't re-read.
-[[licenses.clarify]]
-crate = "ring"
-expression = "MIT AND ISC AND OpenSSL"
-license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+# No [[licenses.clarify]] for ring: the classic clarify pinning it to "MIT AND ISC AND OpenSSL"
+# (cargo-deny's own template still carries it) is left over from before ring 0.17 started
+# declaring a proper SPDX expression in Cargo.toml. ring 0.17.14 declares `Apache-2.0 AND ISC`
+# directly, which the allow list above already covers - verified by running this check with
+# ring's LICENSE untouched and no clarify present. Adding the stale clarify back would either be
+# a no-op (its license-files hash doesn't match this LICENSE, so cargo-deny silently ignores it
+# and falls through to the Cargo.toml field anyway) or, if the hash were fixed to match, break
+# the check outright ("OpenSSL" isn't on the allow list). Confirmed empirically: swapping the
+# clarify's `expression` for an unrelated, disallowed license and re-running still reports
+# `licenses ok` - proof the block isn't consulted.
 
 [licenses.private]
 ignore = false
