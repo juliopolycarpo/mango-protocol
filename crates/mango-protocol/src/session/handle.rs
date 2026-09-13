@@ -9,7 +9,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{RemoteError, codes};
 use crate::frame::{End, Event, Frame, Limits, PeerInfo, Request};
-use crate::validate::{is_reserved_method_name, is_valid_method_name};
+use crate::validate::{
+    RPC_DISCOVER_MINOR, is_defined_reserved_method, is_reserved_method_name, is_valid_method_name,
+};
 use crate::version::ProtocolVersion;
 
 use super::command::Command;
@@ -335,7 +337,13 @@ impl Session {
         params: Value,
         options: RequestOptions,
     ) -> Result<Value, RemoteError> {
-        if !is_valid_method_name(method) || is_reserved_method_name(method) {
+        // A reserved name this wire defines is legal to send; whether this
+        // *session* defines it depends on the effective minor, which is not
+        // known until the handshake completes, so that half waits for it.
+        let reserved = is_reserved_method_name(method);
+        if !is_valid_method_name(method)
+            || (reserved && !is_defined_reserved_method(method, u32::from(crate::PROTOCOL_MINOR)))
+        {
             return Err(RemoteError::new(
                 codes::INVALID_REQUEST,
                 format!(
@@ -344,7 +352,19 @@ impl Session {
                 ),
             ));
         }
-        self.ready().await?;
+        let remote = self.ready().await?;
+        if reserved && !is_defined_reserved_method(method, remote.effective_minor) {
+            let effective_minor = remote.effective_minor;
+            return Err(RemoteError::new(
+                codes::INVALID_REQUEST,
+                format!(
+                    "Method \"{method}\" is defined from wire minor {RPC_DISCOVER_MINOR}; this \
+                     session negotiated minor {effective_minor}."
+                ),
+            )
+            .with_detail("method", method.to_string())
+            .with_detail("effectiveMinor", u64::from(effective_minor)));
+        }
         if self.state() == SessionState::Closed {
             return Err(self.unavailable(method));
         }

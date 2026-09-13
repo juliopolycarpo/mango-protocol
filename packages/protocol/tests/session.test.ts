@@ -193,7 +193,10 @@ describe('Session requests', () => {
     await expect(hub.request('nodots', {})).rejects.toMatchObject({
       code: RESERVED_ERROR_CODES.INVALID_REQUEST,
     });
-    await expect(hub.request('rpc.discover', {})).rejects.toMatchObject({
+    // `rpc.nowhere`, not `rpc.discover`: a reserved name this wire *defines*
+    // is refused only once the effective minor is known, so it waits for the
+    // handshake. Every other rpc. name never reaches the wire at all.
+    await expect(hub.request('rpc.nowhere', {})).rejects.toMatchObject({
       code: RESERVED_ERROR_CODES.INVALID_REQUEST,
     });
     hub.close();

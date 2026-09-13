@@ -226,10 +226,29 @@ export function itBehavesLikeAMangoTransport(fixture: ConformanceFixture): void 
 
   it('refuses a reserved rpc. method before it reaches the wire', async () => {
     await withPair(async ({ a }) => {
-      expect(await rejectionOf(a.request('rpc.discover', {}))).toMatchObject({
+      // Undefined at every minor, so it never reaches the peer at all.
+      expect(await rejectionOf(a.request('rpc.nowhere', {}))).toMatchObject({
         code: RESERVED_ERROR_CODES.INVALID_REQUEST,
       });
     });
+  });
+
+  it('refuses rpc.discover below the minor that defines it', async () => {
+    await withPair(
+      async ({ a }) => {
+        const remote = await a.ready;
+        expect(remote.effectiveMinor).toBe(0);
+        // A 1.0 peer cannot have meant this method, so the requester never
+        // sends it: the refusal is local and names the minor it needed.
+        expect(await rejectionOf(a.request('rpc.discover', {}))).toMatchObject({
+          code: RESERVED_ERROR_CODES.INVALID_REQUEST,
+          details: { effectiveMinor: 0 },
+        });
+        expect(await a.request('test.echo', { alive: true })).toEqual({ alive: true });
+      },
+      {},
+      { protocol: { major: 1, minor: 0 } }
+    );
   });
 
   it('delivers an event stream and its end marker in order', async () => {

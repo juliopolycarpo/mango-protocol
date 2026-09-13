@@ -3,7 +3,12 @@ import { DEFAULT_MAX_FRAME_BYTES, measureFrameBytes } from './codec/ndjson';
 import { type CodecError, RESERVED_ERROR_CODES, RemoteError } from './errors';
 import { Listeners } from './listeners';
 import type { Port, PortClosure } from './port';
-import { isReservedMethodName, isValidMethodName } from './schemas/common';
+import {
+  isDefinedReservedMethod,
+  isReservedMethodName,
+  isValidMethodName,
+  RPC_DISCOVER_MINOR,
+} from './schemas/common';
 import type {
   ErrorPayload,
   EventFrame,
@@ -13,7 +18,7 @@ import type {
   PeerInfo,
   RequestFrame,
 } from './schemas/frames';
-import { negotiate, PROTOCOL_VERSION, type ProtocolVersion } from './version';
+import { negotiate, PROTOCOL_MINOR, PROTOCOL_VERSION, type ProtocolVersion } from './version';
 
 /** What the far peer announced in its `hello`, plus the negotiated minor. */
 export interface RemotePeer {
@@ -254,13 +259,27 @@ export class Session {
 
   /** Sends a request and resolves with its `result`, or rejects with a `RemoteError`. */
   async request(method: string, params: unknown, options: RequestOptions = {}): Promise<unknown> {
-    if (!isValidMethodName(method) || isReservedMethodName(method)) {
+    const reserved = isReservedMethodName(method);
+    // A reserved name this wire defines is legal to send; whether this
+    // *session* defines it depends on the effective minor, which is not known
+    // until the handshake completes, so that half of the check waits for it.
+    if (
+      !isValidMethodName(method) ||
+      (reserved && !isDefinedReservedMethod(method, PROTOCOL_MINOR))
+    ) {
       throw new RemoteError(
         RESERVED_ERROR_CODES.INVALID_REQUEST,
         `Method "${method}" is not a valid, unreserved method name; expected two or more dot-separated lowercase segments outside rpc.`
       );
     }
-    await this.ready;
+    const remote = await this.ready;
+    if (reserved && !isDefinedReservedMethod(method, remote.effectiveMinor)) {
+      throw new RemoteError(
+        RESERVED_ERROR_CODES.INVALID_REQUEST,
+        `Method "${method}" is defined from wire minor ${RPC_DISCOVER_MINOR}; this session negotiated minor ${remote.effectiveMinor}.`,
+        { method, effectiveMinor: remote.effectiveMinor }
+      );
+    }
     if (this.#state === 'closed') throw this.#unavailable(method);
 
     const id = `${this.#requestIdPrefix}-${++this.#requestSequence}`;
@@ -553,11 +572,15 @@ export class Session {
       });
       return;
     }
-    if (isReservedMethodName(frame.method)) {
+    const effectiveMinor = this.#remote?.effectiveMinor ?? 0;
+    if (
+      isReservedMethodName(frame.method) &&
+      !isDefinedReservedMethod(frame.method, effectiveMinor)
+    ) {
       this.#respondError(frame.id, {
         code: RESERVED_ERROR_CODES.INVALID_REQUEST,
-        message: `Method "${frame.method}" is reserved; the rpc. segment belongs to the protocol and defines no method in wire 1.0.`,
-        details: { method: frame.method },
+        message: `Method "${frame.method}" is reserved; the rpc. segment belongs to the protocol and defines no such method at wire minor ${effectiveMinor}.`,
+        details: { method: frame.method, effectiveMinor },
       });
       return;
     }

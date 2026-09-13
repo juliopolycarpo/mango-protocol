@@ -137,6 +137,17 @@ let result = a.request("fs.read-file", serde_json::json!({ "path": "README.md" }
 `cargo run --example session_pair --features tokio` runs a fuller version end to end: a request,
 an event stream and a cancelled call between two in-process sessions.
 
+Serving a contract answers `rpc.discover` with its catalog unless `ServeOptions { discover:
+false, .. }` says otherwise, and `ContractClient::discover` reads the other side's:
+
+```rust
+let catalog = contract.client(&session).discover().await?;
+let theirs = Contract::from_catalog(catalog)?; // the peer's document, checked like your own
+```
+
+`discover` fails with `METHOD_UNSUPPORTED` against a peer that serves no contract, and with
+`INVALID_REQUEST` against a wire 1.0 peer, which cannot have meant the method.
+
 A session bounds what the peer can make it hold, so a peer that opens requests and never cancels
 them cannot grow this side without limit:
 

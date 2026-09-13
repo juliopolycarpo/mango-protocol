@@ -21,10 +21,10 @@ two peers may exchange.
 `spec/mango-protocol-1.md` describes wire major 1 and carries the table of what each minor
 added. The minors so far:
 
-| Minor | Added                        | Shipped in |
-| ----- | ---------------------------- | ---------- |
-| `1.0` | The wire as first published. | `0.1.0`    |
-| `1.1` | `hello.limits.maxInFlight`.  | `0.2.0`    |
+| Minor | Added                                       | Shipped in |
+| ----- | ------------------------------------------- | ---------- |
+| `1.0` | The wire as first published.                | `0.1.0`    |
+| `1.1` | `hello.limits.maxInFlight`, `rpc.discover`. | `0.2.0`    |
 
 A minor is announced, never negotiated away: both peers send the highest they implement and the
 session runs at the lower. There is nothing to turn on.

@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::error::{RemoteError, codes};
 use crate::session::{CallContext, HandlerGuard, Session};
-use crate::validate::ValidationError;
+use crate::validate::{RPC_DISCOVER, ValidationError};
 
 use super::{Contract, check_params, check_result, decode};
 
@@ -181,8 +181,9 @@ pub trait Guard: Send + Sync + 'static {
 ///
 /// let options = ServeOptions { validate_results: true, ..Default::default() };
 /// assert!(options.guard.is_none());
+/// // Serving a catalog means answering rpc.discover; opt out, never in.
+/// assert!(options.discover);
 /// ```
-#[derive(Default)]
 pub struct ServeOptions {
     /// Runs after schema validation, before the handler.
     pub guard: Option<Arc<dyn Guard>>,
@@ -191,6 +192,24 @@ pub struct ServeOptions {
     /// SDK; this is real drift protection in Rust (the schema is
     /// hand-authored `Value`, not derived from the handler's `R`).
     pub validate_results: bool,
+    /// Answer `rpc.discover` with this contract's catalog. On by default: a
+    /// peer that serves a contract SHOULD say so (§6.4). Set `false` where
+    /// the catalog itself is privileged, and the method goes back to
+    /// answering `METHOD_UNSUPPORTED`.
+    pub discover: bool,
+}
+
+/// Written by hand rather than derived: `bool::default()` is `false`, and a
+/// derived `Default` would silently make opting *in* to `rpc.discover` the
+/// thing a caller has to remember.
+impl Default for ServeOptions {
+    fn default() -> Self {
+        Self {
+            guard: None,
+            validate_results: false,
+            discover: true,
+        }
+    }
 }
 
 /// Unregisters every handler [`Contract::serve`] registered when dropped,
@@ -229,7 +248,23 @@ pub(super) fn serve(
     handlers: ContractHandlers,
     options: ServeOptions,
 ) -> Result<ServeGuard, ValidationError> {
-    let mut guards = Vec::with_capacity(handlers.handlers.len());
+    let mut guards = Vec::with_capacity(handlers.handlers.len() + 1);
+    if options.discover {
+        let catalog = contract.catalog();
+        guards.push(
+            session.handle(RPC_DISCOVER, move |_params: Value, _context| {
+                let catalog = catalog.clone();
+                async move {
+                    serde_json::to_value(catalog).map_err(|error| {
+                        RemoteError::new(
+                            codes::INTERNAL,
+                            format!("The catalog failed to serialise: {error}."),
+                        )
+                    })
+                }
+            }),
+        );
+    }
     for (method, erased) in handlers.handlers {
         let compiled = contract.method(&method).ok_or_else(|| ValidationError {
             field: "handlers".to_string(),

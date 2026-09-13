@@ -164,7 +164,18 @@ session.close(4000, 'released');
 ```
 
 Use the contract helper for typed calls; the raw API is for tooling and for the reserved
-`rpc.*` space the protocol may add.
+`rpc.*` space, of which the protocol defines one method:
+
+```ts
+// Serving a contract answers rpc.discover with its catalog, unless you say not to.
+contract.serve(session, handlers); // { discover: false } opts out
+
+// Reading the other side's: validated against catalog.json before it comes back.
+const catalog = await contract.client(session).discover();
+```
+
+`discover()` rejects with `METHOD_UNSUPPORTED` against a peer that serves no contract, and with
+`INVALID_REQUEST` against a wire 1.0 peer, which cannot have meant the method.
 
 ## Resource caps
 

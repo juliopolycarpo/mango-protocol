@@ -150,8 +150,9 @@ pub fn is_valid_method_name(name: &str) -> bool {
 
 /// True when `name` sits under the reserved `rpc.` segment.
 ///
-/// Such a name is schema-valid but a session refuses it: a method answers
-/// with `INVALID_REQUEST`, since wire 1.0 defines none there.
+/// Such a name belongs to the specification, never to an application. One the
+/// effective minor defines is served (see [`is_defined_reserved_method`]);
+/// every other is answered with `INVALID_REQUEST`.
 ///
 /// # Example
 ///
@@ -164,6 +165,32 @@ pub fn is_valid_method_name(name: &str) -> bool {
 #[must_use]
 pub fn is_reserved_method_name(name: &str) -> bool {
     name.starts_with(RPC_RESERVED_PREFIX)
+}
+
+/// The reserved method that answers with the responder's catalog (§6.4).
+pub const RPC_DISCOVER: &str = "rpc.discover";
+
+/// Effective minor from which [`RPC_DISCOVER`] is part of the wire.
+pub const RPC_DISCOVER_MINOR: u32 = 1;
+
+/// True when `name` is a reserved method this wire defines at
+/// `effective_minor`.
+///
+/// Every other `rpc.` name is refused with `INVALID_REQUEST`, `rpc.discover`
+/// against a 1.0 peer included: that peer cannot have meant this method.
+///
+/// # Example
+///
+/// ```
+/// use mango_protocol::validate::is_defined_reserved_method;
+///
+/// assert!(is_defined_reserved_method("rpc.discover", 1));
+/// assert!(!is_defined_reserved_method("rpc.discover", 0));
+/// assert!(!is_defined_reserved_method("rpc.unknown", 1));
+/// ```
+#[must_use]
+pub fn is_defined_reserved_method(name: &str, effective_minor: u32) -> bool {
+    name == RPC_DISCOVER && effective_minor >= RPC_DISCOVER_MINOR
 }
 
 /// True when the role matches `^[a-z][a-z0-9-]*$` and fits [`MAX_CODE_CHARS`].

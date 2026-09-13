@@ -73,7 +73,10 @@ pub use frame::{
     Cancel, Close, End, ErrorPayload, ErrorResponse, Event, Frame, Hello, Limits, PeerInfo,
     Request, Response,
 };
-pub use validate::{ValidationError, is_reserved_method_name, is_valid_method_name, validate};
+pub use validate::{
+    RPC_DISCOVER, ValidationError, is_defined_reserved_method, is_reserved_method_name,
+    is_valid_method_name, validate,
+};
 pub use version::{Negotiation, PROTOCOL_VERSION, ProtocolVersion, negotiate};
 
 /// Wire major version this crate speaks. Mirrors [`PROTOCOL_VERSION`].

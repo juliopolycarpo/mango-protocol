@@ -277,6 +277,63 @@ async fn serves_typed_handlers_and_requests_through_a_typed_client() {
 }
 
 #[tokio::test]
+async fn answers_rpc_discover_with_the_served_catalog() {
+    let (session_a, session_b) = sessions().await;
+    let contract = example();
+    let guard = contract
+        .serve(&session_b, plain_handlers(), ServeOptions::default())
+        .expect("both methods are declared");
+
+    let discovered = within("rpc.discover", contract.client(&session_a).discover())
+        .await
+        .expect("the peer serves a contract");
+    assert_eq!(discovered, contract.catalog());
+    // The peer's document, compiled with the same checks a contract built
+    // here passes, before a caller acts on it.
+    Contract::from_catalog(discovered).expect("the peer's catalog compiles");
+
+    // Unregistered with the rest: a peer that stopped serving stops answering.
+    drop(guard);
+    let error = within(
+        "rpc.discover after the guard dropped",
+        contract.client(&session_a).discover(),
+    )
+    .await
+    .expect_err("the handler was unregistered");
+    assert_eq!(error.code, codes::METHOD_UNSUPPORTED);
+}
+
+#[tokio::test]
+async fn leaves_rpc_discover_unanswered_when_the_catalog_is_not_offered() {
+    let (session_a, session_b) = sessions().await;
+    let contract = example();
+    let options = ServeOptions {
+        discover: false,
+        ..Default::default()
+    };
+    contract
+        .serve(&session_b, plain_handlers(), options)
+        .expect("both methods are declared")
+        .persist();
+
+    let error = within("rpc.discover", contract.client(&session_a).discover())
+        .await
+        .expect_err("this peer does not publish its catalog");
+    assert_eq!(error.code, codes::METHOD_UNSUPPORTED);
+
+    // Opting out of the catalog does not opt out of the contract.
+    let sum: f64 = within(
+        "math.add",
+        contract
+            .client(&session_a)
+            .request("math.add", AddParams { a: 2.0, b: 3.0 }),
+    )
+    .await
+    .expect("the contract is still served");
+    assert_eq!(sum, 5.0);
+}
+
+#[tokio::test]
 async fn serve_guard_persist_keeps_the_handlers_after_the_guard_is_dropped() {
     let (session_a, session_b) = sessions().await;
     let contract = example();

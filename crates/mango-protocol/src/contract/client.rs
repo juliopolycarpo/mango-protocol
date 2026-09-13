@@ -3,8 +3,12 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use serde_json::json;
+
+use crate::catalog::Catalog;
 use crate::error::{RemoteError, codes};
 use crate::session::{RequestOptions, Session};
+use crate::validate::RPC_DISCOVER;
 
 /// A typed request surface over one [`Session`], from [`super::Contract::client`].
 ///
@@ -34,6 +38,29 @@ impl<'a> ContractClient<'a> {
     ) -> Result<R, RemoteError> {
         self.request_with(method, params, RequestOptions::default())
             .await
+    }
+
+    /// Asks the peer for the contract it serves (`rpc.discover`, §6.4) and
+    /// decodes the answer as a [`Catalog`].
+    ///
+    /// The catalog is the peer's, not this side's, so a caller that intends
+    /// to act on it compiles it with [`super::Contract::from_catalog`], which
+    /// runs the same checks a contract built here passes.
+    ///
+    /// # Errors
+    /// `INVALID_REQUEST` against a peer below wire minor 1,
+    /// `METHOD_UNSUPPORTED` when the peer serves no contract, and `INTERNAL`
+    /// when what came back is not a catalog document.
+    pub async fn discover(&self) -> Result<Catalog, RemoteError> {
+        self.discover_with(RequestOptions::default()).await
+    }
+
+    /// [`ContractClient::discover`], tuned by `options`.
+    ///
+    /// # Errors
+    /// The same as [`ContractClient::discover`].
+    pub async fn discover_with(&self, options: RequestOptions) -> Result<Catalog, RemoteError> {
+        self.request_with(RPC_DISCOVER, json!({}), options).await
     }
 
     /// [`ContractClient::request`], tuned by `options`.

@@ -4,10 +4,10 @@ Status: draft. This document is normative for wire major 1, up to and including 
 `spec/schema/1/protocol.json` is the normative JSON Schema for every shape named here; where
 prose and schema disagree, the schema wins and the prose is a bug.
 
-| Minor | Added                                                      |
-| ----- | ---------------------------------------------------------- |
-| `1.0` | Everything else in this document.                          |
-| `1.1` | `hello.limits.maxInFlight` ([§11.2](#112-session-limits)). |
+| Minor | Added                                                                                                                   |
+| ----- | ----------------------------------------------------------------------------------------------------------------------- |
+| `1.0` | Everything else in this document.                                                                                       |
+| `1.1` | `hello.limits.maxInFlight` ([§11.2](#112-session-limits)) and the `rpc.discover` method ([§6.4](#64-reserved-methods)). |
 
 The key words MUST, MUST NOT, SHOULD and MAY are to be read as in RFC 2119.
 
@@ -163,7 +163,8 @@ a container before the child can greet budgets more (see [spawn](transports/spaw
 - `method` matches `^[a-z](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z](?:[a-z0-9-]*[a-z0-9])?)+$` and is
   at most 128 characters: at least two dot-separated segments, each starting with a lowercase
   letter, made of lowercase letters, digits and dashes, and never ending with a dash. Names under
-  the `rpc.` segment are reserved for this specification; none is defined in 1.0.
+  the `rpc.` segment are reserved for this specification and listed in
+  [§6.4](#64-reserved-methods); an application MUST NOT define one.
 - `params` is any JSON value. Contracts SHOULD require an object.
 
 ### 6.2 res and err
@@ -202,6 +203,30 @@ session, including requests it refused, cancelled, or could not route:
 
 Applications define any other code. Unknown codes MUST be preserved as received and never
 refused; a consumer narrows them to its own known set.
+
+### 6.4 Reserved methods
+
+Method names under the `rpc.` segment belong to this specification. Each is introduced by a
+minor and is part of the wire, not of any contract:
+
+| Method         | Since | Params                           | Result                                                                            |
+| -------------- | ----- | -------------------------------- | --------------------------------------------------------------------------------- |
+| `rpc.discover` | `1.1` | An object; no member is defined. | The responder's catalog document ([§12](#12-contracts-and-the-catalog-document)). |
+
+- A requester MUST NOT send a reserved method the [effective minor](#52-negotiation) does not
+  define. A responder that receives one answers `INVALID_REQUEST`, which is also what a 1.1
+  peer answers for `rpc.discover` when the effective minor is `0` — the other side is a 1.0
+  peer that cannot have meant this method.
+- `rpc.discover` asks the responder for the contract it serves, so a peer can read the methods,
+  events and capabilities of the other side without an application method of its own, and a
+  diagnostic can report the skew between what a peer offers and what its caller expects. A
+  responder that serves no contract answers `METHOD_UNSUPPORTED`, exactly as it would for any
+  method it has no handler for: serving a catalog is a MAY, and answering `rpc.discover` when
+  you serve one is a SHOULD.
+- The result is the catalog document itself, not a wrapper around one. A requester validates it
+  against `catalog.json` before trusting it.
+- `rpc.` names are otherwise ordinary requests: they count against `maxInFlight`, they are
+  cancellable, and they are refused before the handshake completes like any other.
 
 ## 7. Cancellation
 
@@ -355,8 +380,9 @@ Applications describe their methods, events and capabilities in a **catalog** co
   normally `DENIED`.
 - `protocol` is the lowest wire version the catalog needs.
 
-The catalog is a description, not a wire message. SDKs use it to type clients and validate
-handlers; a peer MAY publish it through an application method.
+The catalog is a description, not a wire message; the one place it crosses the wire is as the
+result of `rpc.discover` ([§6.4](#64-reserved-methods)). SDKs use it to type clients and
+validate handlers.
 
 ## 13. Conformance
 

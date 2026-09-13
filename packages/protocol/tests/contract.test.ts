@@ -98,6 +98,45 @@ describe('defineContract', () => {
     b.close();
   });
 
+  it('answers rpc.discover with the served catalog', async () => {
+    const { a, b } = sessions();
+    const off = contract.serve(b, {
+      'text.echo': ({ text }) => ({ text }),
+      'math.add': ({ a: x, b: y }) => x + y,
+    });
+
+    const discovered = await contract.client(a).discover();
+    expect(discovered).toEqual(contract.catalog());
+    // The peer's document, checked against catalog.json before a caller reads
+    // a member off it.
+    assertCatalog(discovered);
+
+    // Unregistered with the rest: a peer that stopped serving stops answering.
+    off();
+    await expect(contract.client(a).discover()).rejects.toMatchObject({
+      code: RESERVED_ERROR_CODES.METHOD_UNSUPPORTED,
+    });
+    a.close();
+    b.close();
+  });
+
+  it('leaves rpc.discover unanswered when the catalog is not offered', async () => {
+    const { a, b } = sessions();
+    contract.serve(
+      b,
+      { 'text.echo': ({ text }) => ({ text }), 'math.add': ({ a: x, b: y }) => x + y },
+      { discover: false }
+    );
+
+    await expect(contract.client(a).discover()).rejects.toMatchObject({
+      code: RESERVED_ERROR_CODES.METHOD_UNSUPPORTED,
+    });
+    // Opting out of the catalog does not opt out of the contract.
+    expect(await contract.client(a).request('text.echo', { text: 'hi' })).toEqual({ text: 'hi' });
+    a.close();
+    b.close();
+  });
+
   it('refuses parameters that fail the schema with INVALID_PARAMS and a path', async () => {
     const { a, b } = sessions();
     contract.serve(b, {

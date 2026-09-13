@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{RemoteError, codes};
 use crate::frame::{ErrorPayload, ErrorResponse, Frame, Request, Response};
 use crate::port::PortTx;
-use crate::validate::is_reserved_method_name;
+use crate::validate::{is_defined_reserved_method, is_reserved_method_name};
 
 use super::driver::Writer;
 use super::handle::{Session, SessionState};
@@ -114,15 +114,18 @@ pub(super) fn on_request<Tx: PortTx>(
         );
         return;
     }
-    if is_reserved_method_name(&method) {
+    let effective_minor = remote.effective_minor;
+    if is_reserved_method_name(&method) && !is_defined_reserved_method(&method, effective_minor) {
         let message = format!(
             "Method \"{method}\" is reserved; the rpc. segment belongs to the protocol and \
-             defines no method in wire 1.0."
+             defines no such method at wire minor {effective_minor}."
         );
         respond_error(
             writer,
             id,
-            RemoteError::new(codes::INVALID_REQUEST, message).with_detail("method", method),
+            RemoteError::new(codes::INVALID_REQUEST, message)
+                .with_detail("method", method)
+                .with_detail("effectiveMinor", u64::from(effective_minor)),
         );
         return;
     }

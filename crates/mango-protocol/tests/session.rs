@@ -461,9 +461,12 @@ async fn rejects_an_invalid_or_reserved_method_name_locally() {
     .expect_err("refused locally");
     assert_eq!(invalid.code, "INVALID_REQUEST");
 
+    // `rpc.nowhere`, not `rpc.discover`: a reserved name this wire *defines*
+    // is refused only once the effective minor is known, so it waits for the
+    // handshake and would hang here. Every other rpc. name never can be.
     let reserved = within(
         "a reserved method name",
-        session.request("rpc.discover", Value::Null),
+        session.request("rpc.nowhere", Value::Null),
     )
     .await
     .expect_err("refused locally");

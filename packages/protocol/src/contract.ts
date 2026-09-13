@@ -3,7 +3,7 @@ import type { TLocalizedValidationError } from 'typebox/error';
 import Value from 'typebox/value';
 import { RESERVED_ERROR_CODES, RemoteError } from './errors';
 import { assertCatalog, type Catalog } from './schemas/catalog';
-import { isReservedMethodName, isValidMethodName } from './schemas/common';
+import { isReservedMethodName, isValidMethodName, RPC_DISCOVER } from './schemas/common';
 import type { EventFrame } from './schemas/frames';
 import type { HandlerContext, RequestOptions, Session } from './session';
 import type { ProtocolVersion } from './version';
@@ -50,6 +50,13 @@ export interface ContractClient<M extends MethodMap> {
     params: MethodParams<M, K>,
     options?: RequestOptions
   ): Promise<MethodResult<M, K>>;
+  /**
+   * Asks the peer for the contract it serves (`rpc.discover`, §6.4) and
+   * validates the answer against `catalog.json` before returning it. Rejects
+   * with `INVALID_REQUEST` against a peer below wire minor 1, and with
+   * `METHOD_UNSUPPORTED` when the peer serves no contract.
+   */
+  discover(options?: RequestOptions): Promise<Catalog>;
 }
 
 export type ContractHandlers<M extends MethodMap> = {
@@ -69,6 +76,13 @@ export interface ServeOptions {
   readonly guard?: (method: string, capabilities: readonly string[]) => void | Promise<void>;
   /** Validate results against the schema before sending; off by default. */
   readonly validateResults?: boolean;
+  /**
+   * Answer `rpc.discover` with this contract's catalog. On by default: a peer
+   * that serves a contract SHOULD say so (§6.4). Set `false` where the
+   * catalog itself is privileged, and the method goes back to answering
+   * `METHOD_UNSUPPORTED`.
+   */
+  readonly discover?: boolean;
 }
 
 export interface ContractEvents<E extends EventMap> {
@@ -138,9 +152,16 @@ export function defineContract<M extends MethodMap, E extends EventMap = Record<
     client: (session) => ({
       request: (method, params, options) =>
         session.request(method, params, options) as Promise<MethodResult<M, typeof method>>,
+      discover: async (options) => {
+        const answer = await session.request(RPC_DISCOVER, {}, options);
+        // A peer's catalog is the peer's, not ours: check it before a caller
+        // reads a member off it.
+        assertCatalog(answer);
+        return answer;
+      },
     }),
     serve: (session, handlers, options = {}) => {
-      const removers = Object.entries(definition.methods).map(([method, entry]) =>
+      const removers: (() => void)[] = Object.entries(definition.methods).map(([method, entry]) =>
         session.handle(method, async (params, context) => {
           if (options.guard) await options.guard(method, entry.capabilities ?? []);
           assertParams(method, params);
@@ -157,6 +178,10 @@ export function defineContract<M extends MethodMap, E extends EventMap = Record<
           return result;
         })
       );
+      if (options.discover !== false) {
+        const catalog = buildCatalog(definition);
+        removers.push(session.handle(RPC_DISCOVER, () => catalog));
+      }
       return () => {
         for (const remove of removers) remove();
       };

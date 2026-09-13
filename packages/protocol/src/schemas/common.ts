@@ -99,6 +99,25 @@ export const OpenObjectSchema = Type.Unsafe<Record<string, unknown>>({ type: 'ob
 /** Method names and event topics under this segment belong to the spec (§6.1). */
 export const RPC_RESERVED_PREFIX = 'rpc.';
 
+/** The reserved method that answers with the responder's catalog (§6.4). */
+export const RPC_DISCOVER = 'rpc.discover';
+
+/** Effective minor from which `rpc.discover` is part of the wire. */
+export const RPC_DISCOVER_MINOR = 1;
+
+/**
+ * True when `value` is a reserved method this wire defines at `effectiveMinor`.
+ * Every other `rpc.` name is refused with `INVALID_REQUEST`, including this one
+ * against a 1.0 peer, which cannot have meant it.
+ *
+ * @example
+ * isDefinedReservedMethod('rpc.discover', 1); // true
+ * isDefinedReservedMethod('rpc.discover', 0); // false
+ */
+export function isDefinedReservedMethod(value: string, effectiveMinor: number): boolean {
+  return value === RPC_DISCOVER && effectiveMinor >= RPC_DISCOVER_MINOR;
+}
+
 /**
  * True when `value` is a well-formed method name or event topic: at least two
  * dot-separated lowercase segments, at most 128 characters.
