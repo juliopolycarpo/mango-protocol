@@ -11,7 +11,10 @@ repository = "https://github.com/juliopolycarpo/mango-protocol"
 rust-version = "1.97.0"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# `deny`, not `forbid`: one module - the Windows named pipe's security
+# descriptor - has no safe binding to reach for, and `forbid` cannot be lifted
+# even for a single documented call. Every `unsafe` block carries a SAFETY note.
+unsafe_code = "deny"
 missing_docs = "warn"
 
 [workspace.lints.clippy]

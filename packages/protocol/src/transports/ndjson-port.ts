@@ -186,14 +186,38 @@ class NdjsonPort implements Port {
       code,
       ...(reason !== undefined ? { reason: reason.slice(0, CLOSE_REASON_MAX_LENGTH) } : {}),
     };
+    const line = this.#encodeClose(frame);
+    if (line === undefined) {
+      // The code itself is not one a `close` frame may carry. That does not
+      // change what the port does next, and the sink still has to be ended.
+      this.#sinkWritable = false;
+      return;
+    }
     try {
-      this.#sink.write(encoder.encode(encodeLine(frame, { maxFrameBytes: this.maxFrameBytes })));
+      this.#sink.write(line);
     } catch {
-      // The peer is already gone, or the code is not one a `close` frame may
-      // carry. Neither changes what the port does next, and the sink still has
-      // to be ended: that is where the transport releases its handles.
+      // The peer is already gone. The sink still has to be ended: that is
+      // where the transport releases its handles.
       this.#sinkWritable = false;
     }
+  }
+
+  /**
+   * The farewell as bytes, dropping its reason if that is what it takes to
+   * fit. The reason is capped by characters and JSON escapes one NUL into six
+   * bytes, so a schema-valid reason can still outgrow a lowered frame limit —
+   * and the code is the part the peer needs. `undefined` means no `close`
+   * frame can be encoded at all.
+   */
+  #encodeClose(frame: CloseFrame): Uint8Array | undefined {
+    for (const candidate of [frame, { type: 'close', code: frame.code } as CloseFrame]) {
+      try {
+        return encoder.encode(encodeLine(candidate, { maxFrameBytes: this.maxFrameBytes }));
+      } catch {
+        // Try the shorter one; if that fails too, the code is the problem.
+      }
+    }
+    return undefined;
   }
 
   /** Runs the transport's teardown exactly once, whatever ended the port. */

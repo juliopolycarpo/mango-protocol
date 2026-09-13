@@ -44,6 +44,9 @@ if (!rsOnly) {
   );
   tasks.push(task('fixtures:chunks', ['bun', './scripts/fixtures/generate-chunks.ts', '--check']));
   tasks.push(
+    task('fixtures:ssh-argv', ['bun', './scripts/fixtures/generate-ssh-argv.ts', '--check'])
+  );
+  tasks.push(
     task('fixtures:catalog-example', [
       'bun',
       './scripts/fixtures/generate-catalog-example.ts',

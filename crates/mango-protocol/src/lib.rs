@@ -6,8 +6,8 @@
 //! rules a decoder enforces, the two framings a transport needs, and the
 //! catalog document. Behind the `tokio` feature it also carries a session
 //! (request/response multiplexing, cancel, event streams, liveness, close)
-//! over any `port::Port`, and a `contract` builder that validates, serves
-//! and calls it. Transports of their own remain a later milestone.
+//! over any `port::Port`, a `contract` builder that validates, serves and
+//! calls it, and the `transports` the session is opened over.
 //!
 //! # Example
 //!
@@ -38,6 +38,7 @@
 //! - `schema` — JSON Schema emission, behind the `schema` feature.
 //! - `port` — the transport seam and an in-process pair, behind the `tokio` feature.
 //! - `session` — request/response multiplexing, cancel, events, liveness, close; behind `tokio`.
+//! - `transports` — the ports a session is opened over; behind `tokio` and its own features.
 //! - `contract` — catalog-driven validation, `serve`, typed handlers, a guard; behind `tokio`.
 //! - `testing` — the reusable conformance suite, behind the `testing` feature.
 
@@ -60,6 +61,8 @@ pub mod port;
 pub mod session;
 #[cfg(feature = "testing")]
 pub mod testing;
+#[cfg(feature = "tokio")]
+pub mod transports;
 
 pub use catalog::{Catalog, CatalogEvent, CatalogMethod};
 pub use close::{close_code_name, close_codes, is_fatal_close_code};
