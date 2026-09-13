@@ -130,6 +130,27 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo +1.97.0 check --all-features --locked
 
+  # Informational, not gating: the workspace is 0.1.0 and unreleased Rust API surface routinely
+  # lands on the same PR that would trip this (this one included - CodecError gains a field).
+  # spec/versioning.md is explicit that "0.x: the wire may still change in a minor package
+  # release", and this repo's own package-version table treats a pre-1.0 SDK signature change as
+  # `minor`, not `major` - gating here would fail PRs on changes our own versioning policy calls
+  # non-breaking. Move this into `gate.needs` once the crate reaches 1.0.
+  semver-checks:
+    name: cargo-semver-checks (informational)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+        with:
+          tool: cargo-semver-checks
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Compares against the last version published to crates.io automatically; no baseline flag.
+      - run: cargo semver-checks check-release --all-features
+
   schema-equality:
     name: Schema equality and round trip
     runs-on: ubuntu-latest
