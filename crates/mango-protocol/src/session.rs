@@ -63,10 +63,17 @@ impl Session {
     ) -> (Session, SessionDriver<P::Tx, P::Rx>) {
         let port_max_frame_bytes = port.max_frame_bytes();
         let (tx, rx) = port.split();
-        let local_max_frame_bytes = options
-            .max_frame_bytes
-            .or(port_max_frame_bytes)
-            .unwrap_or(DEFAULT_MAX_FRAME_BYTES);
+        // A session option *narrows* the port's ceiling, it never replaces
+        // it: the port is what actually decodes and encodes, so announcing
+        // more than it accepts would make the peer send frames this side
+        // then refuses. Unset defers to the port, then to the default —
+        // unchanged, and never clamped down to the default on its own.
+        let local_max_frame_bytes = match (options.max_frame_bytes, port_max_frame_bytes) {
+            (Some(session_ceiling), Some(port_ceiling)) => session_ceiling.min(port_ceiling),
+            (Some(session_ceiling), None) => session_ceiling,
+            (None, Some(port_ceiling)) => port_ceiling,
+            (None, None) => DEFAULT_MAX_FRAME_BYTES,
+        };
         let (ready, _) = watch::channel(None);
         let (closure, _) = watch::channel(None);
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();

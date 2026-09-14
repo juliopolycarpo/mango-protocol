@@ -58,6 +58,10 @@ pub struct SessionOptions {
     pub protocol: ProtocolVersion,
     /// Largest frame this side accepts. `None` defers to the port's own
     /// ceiling, then to [`crate::codec::ndjson::DEFAULT_MAX_FRAME_BYTES`].
+    /// Set, the session announces the *lower* of this and the port's own
+    /// ceiling: a session option narrows what the port decodes, it never
+    /// widens it, so the peer is never told to send more than the port
+    /// actually accepts.
     pub max_frame_bytes: Option<usize>,
     /// How many requests this side will answer at once. Past it a `req` is
     /// refused with `UNAVAILABLE` and `details.kind` of `in_flight_limit`,

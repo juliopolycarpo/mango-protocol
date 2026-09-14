@@ -12,7 +12,7 @@ use mango_protocol::error::{CodecErrorKind, RemoteError, codes};
 use mango_protocol::frame::{
     Cancel, Close, ErrorPayload, ErrorResponse, Hello, Limits, PeerInfo, Request, Response,
 };
-use mango_protocol::port::{Inbound, PortClosure, port_pair};
+use mango_protocol::port::{Inbound, MemoryPortOptions, PortClosure, port_pair, port_pair_with};
 use mango_protocol::session::{
     CallContext, DEFAULT_HANDSHAKE_TIMEOUT, EventInput, HANDSHAKE_TIMEOUT_REASON, RequestOptions,
     Session, SessionOptions, SessionState,
@@ -354,6 +354,69 @@ async fn announces_its_frame_ceiling_and_honours_the_lower_one() {
         .await
         .expect("handshake succeeds");
     assert_eq!(session.send_limit_bytes(), 4096);
+}
+
+#[tokio::test]
+async fn a_session_ceiling_above_the_ports_own_is_clamped_to_it() {
+    // A session option narrows the port's ceiling; it must never replace it.
+    // The port here only decodes 4096, so a session configured at 8192 must
+    // still announce 4096 — otherwise the peer sends frames this port then
+    // refuses.
+    let (a, b) = port_pair_with(MemoryPortOptions {
+        max_frame_bytes: Some(4096),
+        validate_frames: true,
+    });
+    let options = SessionOptions::new(peer("a")).with_max_frame_bytes(8192);
+    let (_session, _driver) = Session::spawn(a, options);
+    let mut raw = RawPeer::new(b);
+
+    let sent_hello = within(
+        "the session's own hello",
+        raw.until(|frame| matches!(frame, Frame::Hello(_))),
+    )
+    .await;
+    let Frame::Hello(sent_hello) = sent_hello else {
+        unreachable!("until() only returns a frame matching the predicate")
+    };
+    assert_eq!(
+        sent_hello.limits,
+        Some(Limits {
+            max_frame_bytes: Some(4096),
+            max_in_flight: None,
+        }),
+        "expected 4096, received {:?}",
+        sent_hello.limits
+    );
+}
+
+#[tokio::test]
+async fn an_unset_session_ceiling_still_defers_to_a_port_ceiling_above_the_default() {
+    // No `with_max_frame_bytes` call: the session must defer to the port's
+    // own ceiling even when that ceiling sits above the 16 MiB default,
+    // rather than silently clamping it down to the default.
+    let port_ceiling = mango_protocol::codec::ndjson::DEFAULT_MAX_FRAME_BYTES + 4096;
+    let (a, b) = port_pair_with(MemoryPortOptions {
+        max_frame_bytes: Some(port_ceiling),
+        validate_frames: false,
+    });
+    let (session, _driver) = Session::spawn(a, SessionOptions::new(peer("a")));
+    let mut raw = RawPeer::new(b);
+
+    raw.send(Frame::Hello(Hello {
+        protocol: mango_protocol::PROTOCOL_VERSION,
+        peer: peer("b"),
+        capabilities: Default::default(),
+        limits: Some(Limits {
+            max_frame_bytes: Some(port_ceiling as u64),
+            max_in_flight: None,
+        }),
+    }))
+    .await;
+
+    within("ready()", session.ready())
+        .await
+        .expect("handshake succeeds");
+    assert_eq!(session.send_limit_bytes(), port_ceiling);
 }
 
 #[tokio::test]

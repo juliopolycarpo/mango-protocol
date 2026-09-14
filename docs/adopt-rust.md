@@ -167,6 +167,11 @@ once one of yours has settled, and never latch on it the way you would on `METHO
 `max_stream_keys` is local and never announced: `emit` returns `Err` when a new key would pass
 it, because reaching it means this side leaked stream ids rather than that the peer did anything.
 
+`with_max_frame_bytes` sets what this session *asks for*; the port it opens over may decode less.
+The session announces the lower of the two — never the session's own ceiling outright — so a
+session configured above a port's ceiling never tells the peer to send frames the port then
+refuses.
+
 ## Serve a contract
 
 A `Contract` (see [Build a contract](build-a-contract.md)) wraps a session with schema
