@@ -13,7 +13,7 @@
 
 import { CodecError } from '../errors';
 import type { Frame } from '../schemas/frames';
-import { resolveByteCeiling } from './limits';
+import { resolveIntegerAtLeast } from './limits';
 import { decodeLine, encodeFrameBytes, resolveFrameLimit } from './ndjson';
 
 /** Version, index and count: the header every chunk carries. */
@@ -49,7 +49,7 @@ export function maxChunksFor(maxFrameBytes: number): number {
 }
 
 function resolveMessageCeiling(options?: ChunkOptions): number {
-  return resolveByteCeiling(
+  return resolveIntegerAtLeast(
     'maxMessageBytes',
     options?.maxMessageBytes,
     DEFAULT_MAX_MESSAGE_BYTES,

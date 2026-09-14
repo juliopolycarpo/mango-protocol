@@ -14,7 +14,7 @@ import {
   spawn,
 } from 'node:child_process';
 import { CLOSE_CODES } from '../close';
-import { resolveByteCeiling } from '../codec/limits';
+import { resolveIntegerAtLeast } from '../codec/limits';
 import type { Port, PortClosure } from '../port';
 import type { Frame } from '../schemas/frames';
 import { type ByteSink, createNdjsonPort, type NdjsonPortHandle } from './ndjson-port';
@@ -213,7 +213,7 @@ export function spawnPort(options: SpawnOptions, spawnChild: SpawnChild = spawn)
     );
   }
   const tail = new BoundedTail(
-    resolveByteCeiling('stderrTailBytes', options.stderrTailBytes, DEFAULT_STDERR_TAIL_BYTES, 1)
+    resolveIntegerAtLeast('stderrTailBytes', options.stderrTailBytes, DEFAULT_STDERR_TAIL_BYTES, 1)
   );
   const exit = deferredExit();
   const launch = new LaunchRecord();
