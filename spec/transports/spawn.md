@@ -41,8 +41,10 @@ either way.
    exits on its own.
 2. After a grace period (2 seconds reference), send `SIGTERM`.
 3. After a second grace period, send `SIGKILL`.
-4. Resolve once the child has exited, or after a bounded deadline, so a shutdown is delayed by
-   an unkillable child but never blocked by one.
+4. Resolve once the child has exited, or after a bounded deadline (2 seconds reference, timed
+   from the last kill request), so a shutdown is delayed by an unkillable child but never
+   blocked by one. A launcher that gives up reports that the child had not exited; it does not
+   invent an exit status.
 
 Windows has no POSIX signals: step 2 and 3 collapse into terminating the process. Descendants
 the child spawned are not reached; the child's own cancellation path is what reaps them.
