@@ -432,6 +432,32 @@ fn opening_a_session_refuses_a_sub_floor_ceiling_set_directly_on_the_pub_field()
     let _ = Session::open(a, options);
 }
 
+#[test]
+#[should_panic(expected = "max_in_flight is 0; expected at least 1")]
+fn opening_a_session_refuses_a_zero_max_in_flight_set_directly_on_the_pub_field() {
+    // A zero here would build a `hello.limits.maxInFlight` the schema
+    // refuses, so the peer's handshake would die on a decode error rather
+    // than a clear local one. `max_in_flight` is `pub`, so `with_max_in_flight`
+    // alone is not enough.
+    let (a, _b) = port_pair();
+    let mut options = SessionOptions::new(peer("a"));
+    options.max_in_flight = 0;
+    let _ = Session::open(a, options);
+}
+
+#[test]
+#[should_panic(expected = "max_stream_keys is 0; expected at least 1")]
+fn opening_a_session_refuses_a_zero_max_stream_keys_set_directly_on_the_pub_field() {
+    // A zero here makes the very first `emit` answer UNAVAILABLE, because
+    // `sequences.len() >= limit` is true for any new key when the limit is
+    // zero. `max_stream_keys` is `pub`, so `with_max_stream_keys` alone is
+    // not enough.
+    let (a, _b) = port_pair();
+    let mut options = SessionOptions::new(peer("a"));
+    options.max_stream_keys = 0;
+    let _ = Session::open(a, options);
+}
+
 #[tokio::test]
 async fn tears_down_on_a_received_close_frame_with_its_code() {
     let (a, b) = port_pair();

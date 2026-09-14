@@ -61,10 +61,11 @@ impl Session {
     /// # Panics
     ///
     /// Panics when `options.max_frame_bytes` is `Some` value below
-    /// [`crate::codec::ndjson::MIN_MAX_FRAME_BYTES`], naming both.
-    /// `SessionOptions::with_max_frame_bytes` already refuses one on the
-    /// builder path, but `max_frame_bytes` is `pub`, so this is the check for
-    /// a caller that assigned the field directly.
+    /// [`crate::codec::ndjson::MIN_MAX_FRAME_BYTES`], naming both. Likewise
+    /// for `options.max_in_flight` or `options.max_stream_keys` at `0`.
+    /// `SessionOptions`'s builders already refuse these on the builder path,
+    /// but every field involved is `pub`, so this is the check for a caller
+    /// that assigned one directly.
     #[must_use]
     pub fn open<P: Port>(
         port: P,
@@ -88,6 +89,8 @@ impl Session {
             (None, Some(port_ceiling)) => port_ceiling,
             (None, None) => DEFAULT_MAX_FRAME_BYTES,
         };
+        let max_in_flight = check_at_least("max_in_flight", options.max_in_flight, 1);
+        let max_stream_keys = check_at_least("max_stream_keys", options.max_stream_keys, 1);
         let (ready, _) = watch::channel(None);
         let (closure, _) = watch::channel(None);
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
@@ -96,8 +99,8 @@ impl Session {
             local_protocol: options.protocol,
             local_capabilities: options.capabilities,
             local_max_frame_bytes,
-            max_in_flight: options.max_in_flight,
-            max_stream_keys: options.max_stream_keys,
+            max_in_flight,
+            max_stream_keys,
             inner: Mutex::new(Inner {
                 state: SessionState::Handshaking,
                 remote: None,

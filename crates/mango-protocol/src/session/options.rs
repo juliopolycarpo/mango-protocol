@@ -171,6 +171,10 @@ impl SessionOptions {
 
     /// Sets how many requests this side will answer at once (§11.2).
     ///
+    /// # Panics
+    ///
+    /// Panics when `max_in_flight` is `0`, naming both.
+    ///
     /// # Example
     ///
     /// ```
@@ -182,12 +186,17 @@ impl SessionOptions {
     /// assert_eq!(options.max_in_flight, 8);
     /// ```
     #[must_use]
-    pub const fn with_max_in_flight(mut self, max_in_flight: usize) -> Self {
-        self.max_in_flight = max_in_flight;
+    pub fn with_max_in_flight(mut self, max_in_flight: usize) -> Self {
+        self.max_in_flight =
+            crate::codec::limits::check_at_least("max_in_flight", max_in_flight, 1);
         self
     }
 
     /// Sets how many stream keys this side will emit on at once (§11.2).
+    ///
+    /// # Panics
+    ///
+    /// Panics when `max_stream_keys` is `0`, naming both.
     ///
     /// # Example
     ///
@@ -200,8 +209,9 @@ impl SessionOptions {
     /// assert_eq!(options.max_stream_keys, 4);
     /// ```
     #[must_use]
-    pub const fn with_max_stream_keys(mut self, max_stream_keys: usize) -> Self {
-        self.max_stream_keys = max_stream_keys;
+    pub fn with_max_stream_keys(mut self, max_stream_keys: usize) -> Self {
+        self.max_stream_keys =
+            crate::codec::limits::check_at_least("max_stream_keys", max_stream_keys, 1);
         self
     }
 
@@ -289,12 +299,26 @@ mod tests {
     /// rather than building an option a peer's schema would refuse anyway.
     #[test]
     fn a_ceiling_below_its_floor_panics_naming_both() {
-        let cases: [PanicCase; 1] = [(
-            "max_frame_bytes is 512; expected at least 4096",
-            Box::new(|| {
-                let _ = SessionOptions::new(peer()).with_max_frame_bytes(512);
-            }),
-        )];
+        let cases: [PanicCase; 3] = [
+            (
+                "max_frame_bytes is 512; expected at least 4096",
+                Box::new(|| {
+                    let _ = SessionOptions::new(peer()).with_max_frame_bytes(512);
+                }),
+            ),
+            (
+                "max_in_flight is 0; expected at least 1",
+                Box::new(|| {
+                    let _ = SessionOptions::new(peer()).with_max_in_flight(0);
+                }),
+            ),
+            (
+                "max_stream_keys is 0; expected at least 1",
+                Box::new(|| {
+                    let _ = SessionOptions::new(peer()).with_max_stream_keys(0);
+                }),
+            ),
+        ];
         for (expected, body) in cases {
             assert_eq!(panic_message(body), expected);
         }
@@ -304,5 +328,11 @@ mod tests {
     fn a_ceiling_at_its_floor_is_accepted() {
         let options = SessionOptions::new(peer()).with_max_frame_bytes(MIN_MAX_FRAME_BYTES);
         assert_eq!(options.max_frame_bytes, Some(MIN_MAX_FRAME_BYTES));
+
+        let options = SessionOptions::new(peer())
+            .with_max_in_flight(1)
+            .with_max_stream_keys(1);
+        assert_eq!(options.max_in_flight, 1);
+        assert_eq!(options.max_stream_keys, 1);
     }
 }

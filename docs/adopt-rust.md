@@ -174,6 +174,9 @@ refuses.
 
 A frame or message ceiling set below what the spec allows panics at configuration, naming the
 value and the floor it broke, the way the TypeScript SDK raises a `RangeError` for the same call.
+`with_max_in_flight` and `with_max_stream_keys` carry the same rule at a floor of `1`: `0` would
+build a `hello.limits.maxInFlight` the schema refuses, or make the very first `emit` answer
+`UNAVAILABLE`.
 
 ## Serve a contract
 
