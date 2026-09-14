@@ -213,6 +213,36 @@ describe('Session handshake', () => {
     expect(session.sendLimitBytes).toBe(4096);
     session.close();
   });
+
+  it('announces the lower of its own ceiling and the one the port decodes', async () => {
+    // A port that only decodes 4096 cannot be talked into accepting 8192 by a
+    // session option: announcing the higher number invites the peer to send a
+    // frame the port will refuse, and the refusal ends the session.
+    const ports = createInProcessPortPair({ maxFrameBytes: 4096 });
+    const recorder = new FrameRecorder(ports.b);
+    const session = new Session(ports.a, {
+      peer: HUB,
+      maxFrameBytes: 8192,
+      livenessIntervalMs: false,
+    });
+    const hello = await recorder.until((frame) => frame.type === 'hello');
+    expect(hello).toMatchObject({ type: 'hello', limits: { maxFrameBytes: 4096 } });
+    ports.b.send(rawHello());
+    await session.ready;
+    expect(session.sendLimitBytes).toBe(4096);
+    session.close();
+  });
+
+  it('keeps a port ceiling above the default when no option asks for less', async () => {
+    // The option is absent, so the port's own ceiling is the answer whole; a
+    // transport that can carry more than 16 MiB is not clamped back to it.
+    const ports = createInProcessPortPair({ maxFrameBytes: 32 * 1024 * 1024 });
+    const session = new Session(ports.a, { peer: HUB, livenessIntervalMs: false });
+    ports.b.send({ ...rawHello(), limits: { maxFrameBytes: 32 * 1024 * 1024 } });
+    await session.ready;
+    expect(session.sendLimitBytes).toBe(32 * 1024 * 1024);
+    session.close();
+  });
 });
 
 describe('Session close', () => {

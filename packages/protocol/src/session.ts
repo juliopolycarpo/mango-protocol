@@ -86,9 +86,12 @@ export interface SessionOptions {
   /** Highest wire version this side speaks; the SDK's own by default. */
   readonly protocol?: ProtocolVersion;
   /**
-   * Largest frame this side accepts. Defaults to the port's own decoder limit.
-   * Announced in `hello.limits` when it is below the protocol default, and the
-   * lower of both sides' ceilings bounds every frame this side sends.
+   * Largest frame this side accepts. Defaults to the port's own decoder limit;
+   * when set, the session announces the lower of it and the port's, because a
+   * frame the port cannot decode is one this side cannot accept however high
+   * the option is. Announced in `hello.limits` when it is below the protocol
+   * default, and the lower of both sides' ceilings bounds every frame this
+   * side sends.
    */
   readonly maxFrameBytes?: number;
   /**
@@ -150,6 +153,20 @@ interface PendingRequest {
   readonly cleanup: () => void;
 }
 
+/**
+ * The frame ceiling this side announces: the lower of what the session asked
+ * for and what the port can actually decode. An absent option defers to the
+ * port outright, so a transport that carries more than the protocol default
+ * keeps its own ceiling.
+ *
+ * @example
+ * localFrameCeiling(8192, 4096); // 4096
+ */
+function localFrameCeiling(requested: number | undefined, portCeiling: number | undefined): number {
+  if (requested === undefined) return portCeiling ?? DEFAULT_MAX_FRAME_BYTES;
+  return Math.min(requested, portCeiling ?? requested);
+}
+
 interface Deferred<T> {
   readonly promise: Promise<T>;
   readonly resolve: (value: T) => void;
@@ -207,8 +224,7 @@ export class Session {
     this.#options = options;
     this.#timers = options.timers ?? globalTimers();
     this.#localProtocol = options.protocol ?? PROTOCOL_VERSION;
-    this.#localMaxFrameBytes =
-      options.maxFrameBytes ?? port.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
+    this.#localMaxFrameBytes = localFrameCeiling(options.maxFrameBytes, port.maxFrameBytes);
     this.#maxInFlight = options.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT;
     this.#maxStreamKeys = options.maxStreamKeys ?? DEFAULT_MAX_STREAM_KEYS;
     this.#handlerGraceMs = options.handlerGraceMs ?? DEFAULT_HANDLER_GRACE_MS;
