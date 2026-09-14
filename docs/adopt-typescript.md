@@ -103,11 +103,21 @@ stopped answering — stays in flight for as long as the process lives. A deadli
 destroys what the dial opened and rejects with a `TimeoutError`; an abort rejects with the
 reason the caller gave.
 
-On POSIX the socket is owner-only from the moment it exists, and a stale socket
-file left by a crashed listener is replaced. On Windows the named pipe is **not**
-restricted — Node cannot set a pipe's security descriptor, so any local user may
-connect. Check the peer's credentials and close with `4401` before `hello` if the
-address alone is not enough trust there.
+On POSIX the socket is owner-only from the moment it exists. A socket file at the address is
+*stale* when a connection to it is refused — the listener that made it is gone — and `listenIpc`
+removes a stale file before binding; a file a connection succeeds against, or one the dial
+cannot judge either way, is a live listener's address, and `listenIpc` refuses to bind over it
+with `EADDRINUSE` instead of silently taking it over. On Windows the named pipe is **not**
+restricted — Node cannot set a pipe's security descriptor, so any local user may connect. Check
+the peer's credentials and close with `4401` before `hello` if the address alone is not enough
+trust there.
+
+One residual race is outside what a probe can close: libuv's `uv__pipe_close` unlinks a Unix
+socket path unconditionally on `close()`, with no way from JavaScript to make it check first. A
+listener that crashes, gets replaced at the same address, and *then* runs its delayed `close()`
+will unlink the replacement's socket file out from under it — the replacement keeps running on
+an inode nothing can reach. The probe above closes the far more common case, a stale file with
+no process behind it at all; this one needs a crash landing inside that exact window.
 
 **WebSocket.** Binary chunked messages under subprotocol `mango.v1`; the SDK never sends text
 frames. Authentication is a bearer token on the upgrade request, checked by the HTTP layer

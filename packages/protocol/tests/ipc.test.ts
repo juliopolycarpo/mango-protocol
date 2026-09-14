@@ -332,6 +332,47 @@ describe('local socket transport', () => {
     }
   });
 
+  // POSIX only: a named pipe has no address a second `listen` could steal —
+  // Windows serialises pipe instances at the kernel level instead.
+  it.skipIf(WINDOWS)('refuses to bind where a live listener answers', async () => {
+    const path = nextPath();
+    // Filters on a completed handshake rather than the first accepted
+    // connection: the second `listenIpc` call below probes this address to
+    // judge it live, and that probe connects and disconnects at once,
+    // reaching this same `onConnection` before any real client does.
+    let resolveHost: (session: Session) => void = () => undefined;
+    const hostReady = new Promise<Session>((resolve) => {
+      resolveHost = resolve;
+    });
+    const server = await listenIpc(path, (port) => {
+      const session = new Session(port, {
+        peer: CONFORMANCE_A,
+        handlers: CONFORMANCE_HANDLERS,
+        livenessIntervalMs: false,
+      });
+      session.ready.then(() => resolveHost(session)).catch(() => undefined);
+    });
+
+    try {
+      const rejection = await rejectionOf(listenIpc(path, () => undefined));
+      expect(rejection).toMatchObject({ code: 'EADDRINUSE' });
+
+      const client = new Session(await connectIpc(path), {
+        peer: CONFORMANCE_B,
+        livenessIntervalMs: false,
+      });
+      const host = await hostReady;
+      await Promise.all([client.ready, host.ready]);
+
+      expect(await client.request('test.echo', { text: 'still here' })).toEqual({
+        text: 'still here',
+      });
+      client.close(CLOSE_CODES.RELEASED);
+    } finally {
+      await server.close();
+    }
+  });
+
   // POSIX only: Windows guards a named pipe with an ACL, not a file mode.
   it.skipIf(WINDOWS)('creates the socket with owner-only permissions', async () => {
     const path = nextPath();
