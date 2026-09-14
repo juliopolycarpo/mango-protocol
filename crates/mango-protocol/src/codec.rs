@@ -5,4 +5,5 @@
 //! transport, which reuses an NDJSON line as its reassembled payload.
 
 pub mod chunk;
+pub mod limits;
 pub mod ndjson;

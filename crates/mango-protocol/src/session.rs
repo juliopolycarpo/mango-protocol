@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-use crate::codec::ndjson::DEFAULT_MAX_FRAME_BYTES;
+use crate::codec::limits::check_at_least;
+use crate::codec::ndjson::{DEFAULT_MAX_FRAME_BYTES, MIN_MAX_FRAME_BYTES};
 use crate::port::Port;
 
 mod command;
@@ -56,6 +57,14 @@ impl Session {
     /// let (session, _driver) = Session::open(a, SessionOptions::new(peer));
     /// assert_eq!(session.state(), SessionState::Handshaking);
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics when `options.max_frame_bytes` is `Some` value below
+    /// [`crate::codec::ndjson::MIN_MAX_FRAME_BYTES`], naming both.
+    /// `SessionOptions::with_max_frame_bytes` already refuses one on the
+    /// builder path, but `max_frame_bytes` is `pub`, so this is the check for
+    /// a caller that assigned the field directly.
     #[must_use]
     pub fn open<P: Port>(
         port: P,
@@ -69,8 +78,13 @@ impl Session {
         // then refuses. Unset defers to the port, then to the default —
         // unchanged, and never clamped down to the default on its own.
         let local_max_frame_bytes = match (options.max_frame_bytes, port_max_frame_bytes) {
-            (Some(session_ceiling), Some(port_ceiling)) => session_ceiling.min(port_ceiling),
-            (Some(session_ceiling), None) => session_ceiling,
+            (Some(session_ceiling), Some(port_ceiling)) => {
+                check_at_least("max_frame_bytes", session_ceiling, MIN_MAX_FRAME_BYTES)
+                    .min(port_ceiling)
+            }
+            (Some(session_ceiling), None) => {
+                check_at_least("max_frame_bytes", session_ceiling, MIN_MAX_FRAME_BYTES)
+            }
             (None, Some(port_ceiling)) => port_ceiling,
             (None, None) => DEFAULT_MAX_FRAME_BYTES,
         };

@@ -172,6 +172,9 @@ The session announces the lower of the two — never the session's own ceiling o
 session configured above a port's ceiling never tells the peer to send frames the port then
 refuses.
 
+A frame or message ceiling set below what the spec allows panics at configuration, naming the
+value and the floor it broke, the way the TypeScript SDK raises a `RangeError` for the same call.
+
 ## Serve a contract
 
 A `Contract` (see [Build a contract](build-a-contract.md)) wraps a session with schema

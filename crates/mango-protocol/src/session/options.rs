@@ -154,9 +154,18 @@ impl SessionOptions {
     }
 
     /// Sets the largest frame this side accepts.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `max_frame_bytes` is below
+    /// [`crate::codec::ndjson::MIN_MAX_FRAME_BYTES`], naming both.
     #[must_use]
     pub fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Self {
-        self.max_frame_bytes = Some(max_frame_bytes);
+        self.max_frame_bytes = Some(crate::codec::limits::check_at_least(
+            "max_frame_bytes",
+            max_frame_bytes,
+            crate::codec::ndjson::MIN_MAX_FRAME_BYTES,
+        ));
         self
     }
 
@@ -255,5 +264,45 @@ impl SessionOptions {
     pub fn handle(mut self, method: impl Into<String>, handler: impl Handler) -> Self {
         self.handlers.push((method.into(), Arc::new(handler)));
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionOptions;
+    use crate::codec::limits::panic_message;
+    use crate::codec::ndjson::MIN_MAX_FRAME_BYTES;
+    use crate::frame::PeerInfo;
+
+    fn peer() -> PeerInfo {
+        PeerInfo {
+            name: "hub".into(),
+            version: "1.0.0".into(),
+            role: "hub".into(),
+        }
+    }
+
+    /// One expected panic message and the builder call that must produce it.
+    type PanicCase = (&'static str, Box<dyn FnOnce()>);
+
+    /// Every builder here panics naming the value and the floor it broke,
+    /// rather than building an option a peer's schema would refuse anyway.
+    #[test]
+    fn a_ceiling_below_its_floor_panics_naming_both() {
+        let cases: [PanicCase; 1] = [(
+            "max_frame_bytes is 512; expected at least 4096",
+            Box::new(|| {
+                let _ = SessionOptions::new(peer()).with_max_frame_bytes(512);
+            }),
+        )];
+        for (expected, body) in cases {
+            assert_eq!(panic_message(body), expected);
+        }
+    }
+
+    #[test]
+    fn a_ceiling_at_its_floor_is_accepted() {
+        let options = SessionOptions::new(peer()).with_max_frame_bytes(MIN_MAX_FRAME_BYTES);
+        assert_eq!(options.max_frame_bytes, Some(MIN_MAX_FRAME_BYTES));
     }
 }

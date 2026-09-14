@@ -91,6 +91,11 @@ impl Default for WebSocketOptions {
 impl WebSocketOptions {
     /// Sets the frame ceiling this port reassembles and sends within.
     ///
+    /// # Panics
+    ///
+    /// Panics when `max_frame_bytes` is below
+    /// [`crate::codec::ndjson::MIN_MAX_FRAME_BYTES`], naming both.
+    ///
     /// # Example
     ///
     /// ```
@@ -100,12 +105,21 @@ impl WebSocketOptions {
     /// assert_eq!(options.max_frame_bytes, 1 << 20);
     /// ```
     #[must_use]
-    pub const fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Self {
-        self.max_frame_bytes = max_frame_bytes;
+    pub fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Self {
+        self.max_frame_bytes = crate::codec::limits::check_at_least(
+            "max_frame_bytes",
+            max_frame_bytes,
+            crate::codec::ndjson::MIN_MAX_FRAME_BYTES,
+        );
         self
     }
 
     /// Sets the message ceiling the chunker splits a frame to fit.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `max_message_bytes` is below
+    /// [`crate::codec::chunk::MIN_MAX_MESSAGE_BYTES`], naming both.
     ///
     /// # Example
     ///
@@ -116,8 +130,12 @@ impl WebSocketOptions {
     /// assert_eq!(options.max_message_bytes, 4096);
     /// ```
     #[must_use]
-    pub const fn with_max_message_bytes(mut self, max_message_bytes: usize) -> Self {
-        self.max_message_bytes = max_message_bytes;
+    pub fn with_max_message_bytes(mut self, max_message_bytes: usize) -> Self {
+        self.max_message_bytes = crate::codec::limits::check_at_least(
+            "max_message_bytes",
+            max_message_bytes,
+            crate::codec::chunk::MIN_MAX_MESSAGE_BYTES,
+        );
         self
     }
 
@@ -976,5 +994,29 @@ mod tests {
         let whole_frame = Some(options.max_frame_bytes + CHUNK_HEADER_BYTES);
         assert_eq!(config.max_message_size, whole_frame);
         assert_eq!(config.max_frame_size, whole_frame);
+    }
+
+    /// One expected panic message and the builder call that must produce it.
+    type PanicCase = (&'static str, Box<dyn FnOnce()>);
+
+    #[test]
+    fn a_ceiling_below_its_floor_panics_naming_both() {
+        let cases: [PanicCase; 2] = [
+            (
+                "max_frame_bytes is 512; expected at least 4096",
+                Box::new(|| {
+                    let _ = WebSocketOptions::default().with_max_frame_bytes(512);
+                }),
+            ),
+            (
+                "max_message_bytes is 1024; expected at least 2048",
+                Box::new(|| {
+                    let _ = WebSocketOptions::default().with_max_message_bytes(1024);
+                }),
+            ),
+        ];
+        for (expected, body) in cases {
+            assert_eq!(crate::codec::limits::panic_message(body), expected);
+        }
     }
 }

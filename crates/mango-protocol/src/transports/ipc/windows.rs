@@ -86,6 +86,11 @@ impl IpcListener {
 
     /// Sets the frame limit every port this listener produces enforces.
     ///
+    /// # Panics
+    ///
+    /// Panics when `max_frame_bytes` is below
+    /// [`crate::codec::ndjson::MIN_MAX_FRAME_BYTES`], naming both.
+    ///
     /// # Example
     ///
     /// ```no_run
@@ -102,7 +107,11 @@ impl IpcListener {
     /// ```
     #[must_use]
     pub fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Self {
-        self.max_frame_bytes = Some(max_frame_bytes);
+        self.max_frame_bytes = Some(crate::codec::limits::check_at_least(
+            "max_frame_bytes",
+            max_frame_bytes,
+            crate::codec::ndjson::MIN_MAX_FRAME_BYTES,
+        ));
         self
     }
 
@@ -296,5 +305,12 @@ mod tests {
             matches!(error, ConnectError::Io(_)),
             "expected an operating system error, got {error:?}"
         );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "max_frame_bytes is 512; expected at least 4096")]
+    async fn with_max_frame_bytes_below_the_floor_panics_naming_both() {
+        let listener = listen_ipc(&address()).await.expect("the address is free");
+        let _ = listener.with_max_frame_bytes(512);
     }
 }

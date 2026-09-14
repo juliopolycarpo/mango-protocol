@@ -2,7 +2,10 @@
 
 use tokio::sync::mpsc;
 
-use crate::codec::ndjson::{DEFAULT_MAX_FRAME_BYTES, decode_line, encode_frame_bytes};
+use crate::codec::limits::check_at_least;
+use crate::codec::ndjson::{
+    DEFAULT_MAX_FRAME_BYTES, MIN_MAX_FRAME_BYTES, decode_line, encode_frame_bytes,
+};
 use crate::frame::Frame;
 
 use super::{Inbound, Port, PortClosure, PortRx, PortTx, SendOutcome};
@@ -113,8 +116,16 @@ pub fn port_pair() -> (MemoryPort, MemoryPort) {
 /// assert_eq!(b_rx.recv().await, Some(Inbound::Frame(Frame::Pong)));
 /// # }
 /// ```
+///
+/// # Panics
+///
+/// Panics when `options.max_frame_bytes` is `Some` value below
+/// [`MIN_MAX_FRAME_BYTES`], naming both.
 #[must_use]
 pub fn port_pair_with(options: MemoryPortOptions) -> (MemoryPort, MemoryPort) {
+    if let Some(max_frame_bytes) = options.max_frame_bytes {
+        let _ = check_at_least("max_frame_bytes", max_frame_bytes, MIN_MAX_FRAME_BYTES);
+    }
     let (a_to_b, b_from_a) = mpsc::unbounded_channel();
     let (b_to_a, a_from_b) = mpsc::unbounded_channel();
     let a = MemoryPort {
@@ -212,6 +223,7 @@ impl PortRx for MemoryPortRx {
 #[cfg(test)]
 mod tests {
     use super::{MemoryPortOptions, port_pair, port_pair_with};
+    use crate::codec::ndjson::MIN_MAX_FRAME_BYTES;
     use crate::error::CodecErrorKind;
     use crate::frame::{Close, Frame, Request};
     use crate::port::{Inbound, Port, PortClosure, PortRx, PortTx, SendOutcome};
@@ -252,8 +264,11 @@ mod tests {
 
     #[tokio::test]
     async fn validate_mode_refuses_a_frame_over_the_configured_ceiling() {
+        // Below MIN_MAX_FRAME_BYTES is now its own refusal (see
+        // `port_pair_with_refuses_a_ceiling_below_the_floor` below), so this
+        // ceiling sits at the floor and the body is sized past it instead.
         let options = MemoryPortOptions {
-            max_frame_bytes: Some(16),
+            max_frame_bytes: Some(MIN_MAX_FRAME_BYTES),
             validate_frames: true,
         };
         let (a, _b) = port_pair_with(options);
@@ -262,7 +277,7 @@ mod tests {
         let frame = Frame::Req(Request {
             id: "r".into(),
             method: "a.b".into(),
-            params: Value::String("x".repeat(200)),
+            params: Value::String("x".repeat(5000)),
         });
         match a_tx.send(frame).await {
             SendOutcome::Refused(error) => assert_eq!(error.kind, CodecErrorKind::TooLarge),
@@ -273,7 +288,7 @@ mod tests {
     #[tokio::test]
     async fn clone_mode_never_refuses_an_oversized_frame() {
         let options = MemoryPortOptions {
-            max_frame_bytes: Some(16),
+            max_frame_bytes: Some(MIN_MAX_FRAME_BYTES),
             validate_frames: false,
         };
         let (a, b) = port_pair_with(options);
@@ -332,5 +347,14 @@ mod tests {
         drop(b_tx);
 
         assert_eq!(a_tx.send(Frame::Ping).await, SendOutcome::Closed);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_frame_bytes is 4095; expected at least 4096")]
+    fn port_pair_with_refuses_a_ceiling_below_the_floor() {
+        let _ = port_pair_with(MemoryPortOptions {
+            max_frame_bytes: Some(MIN_MAX_FRAME_BYTES - 1),
+            validate_frames: false,
+        });
     }
 }

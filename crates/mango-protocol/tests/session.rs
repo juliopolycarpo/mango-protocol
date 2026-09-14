@@ -419,6 +419,19 @@ async fn an_unset_session_ceiling_still_defers_to_a_port_ceiling_above_the_defau
     assert_eq!(session.send_limit_bytes(), port_ceiling);
 }
 
+#[test]
+#[should_panic(expected = "max_frame_bytes is 512; expected at least 4096")]
+fn opening_a_session_refuses_a_sub_floor_ceiling_set_directly_on_the_pub_field() {
+    // `max_frame_bytes` is `pub`, so a caller can set it without
+    // `with_max_frame_bytes` ever running its floor check. `Session::open`
+    // re-checks it, even though `with_max_frame_bytes` already panics on the
+    // builder path — the field is a second door into the same value.
+    let (a, _b) = port_pair();
+    let mut options = SessionOptions::new(peer("a"));
+    options.max_frame_bytes = Some(512);
+    let _ = Session::open(a, options);
+}
+
 #[tokio::test]
 async fn tears_down_on_a_received_close_frame_with_its_code() {
     let (a, b) = port_pair();

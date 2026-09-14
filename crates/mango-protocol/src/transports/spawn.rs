@@ -277,6 +277,11 @@ impl SpawnOptions {
 
     /// Sets the frame limit the child's port enforces.
     ///
+    /// # Panics
+    ///
+    /// Panics when `max_frame_bytes` is below
+    /// [`crate::codec::ndjson::MIN_MAX_FRAME_BYTES`], naming both.
+    ///
     /// # Example
     ///
     /// ```
@@ -287,7 +292,11 @@ impl SpawnOptions {
     /// ```
     #[must_use]
     pub fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Self {
-        self.max_frame_bytes = Some(max_frame_bytes);
+        self.max_frame_bytes = Some(crate::codec::limits::check_at_least(
+            "max_frame_bytes",
+            max_frame_bytes,
+            crate::codec::ndjson::MIN_MAX_FRAME_BYTES,
+        ));
         self
     }
 
@@ -1204,6 +1213,12 @@ mod tests {
             env.get("MANGO_TOKEN").map(String::as_str),
             Some("deliberate")
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "max_frame_bytes is 512; expected at least 4096")]
+    fn with_max_frame_bytes_below_the_floor_panics_naming_both() {
+        let _ = SpawnOptions::new(["mango-runtime"]).with_max_frame_bytes(512);
     }
 
     #[test]

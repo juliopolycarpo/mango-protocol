@@ -6,6 +6,7 @@
 
 use serde_json::error::Category;
 
+use crate::codec::limits::{check_at_least, checked_at_least};
 use crate::error::{CodecError, CodecErrorKind};
 use crate::frame::Frame;
 use crate::validate::validate;
@@ -63,7 +64,9 @@ fn is_blank(line: &[u8]) -> bool {
 /// Encodes one frame as compact UTF-8 JSON, without a terminator.
 ///
 /// The frame is validated first: a peer must never send a frame that violates
-/// the schema.
+/// the schema. `max_frame_bytes` below [`MIN_MAX_FRAME_BYTES`] is refused the
+/// same way, naming both — this function already returns a `Result`, so it
+/// refuses rather than panics, unlike the builders that carry this same rule.
 ///
 /// # Example
 ///
@@ -74,6 +77,8 @@ fn is_blank(line: &[u8]) -> bool {
 /// assert_eq!(bytes, br#"{"type":"ping"}"#);
 /// ```
 pub fn encode_frame_bytes(frame: &Frame, max_frame_bytes: usize) -> Result<Vec<u8>, CodecError> {
+    let max_frame_bytes = checked_at_least("max_frame_bytes", max_frame_bytes, MIN_MAX_FRAME_BYTES)
+        .map_err(|message| CodecError::new(CodecErrorKind::Schema, message))?;
     validate(frame).map_err(|error| CodecError::new(CodecErrorKind::Schema, error.to_string()))?;
     let bytes = serde_json::to_vec(frame).map_err(|error| {
         CodecError::new(
@@ -115,7 +120,8 @@ pub fn encode_line(frame: &Frame, max_frame_bytes: usize) -> Result<Vec<u8>, Cod
 /// no frame to hand back here. Bytes that are not JSON are
 /// [`CodecErrorKind::InvalidJson`]; JSON that is not a valid frame, or a frame
 /// whose members break a length, grammar or range rule, is
-/// [`CodecErrorKind::Schema`].
+/// [`CodecErrorKind::Schema`]. `max_frame_bytes` below [`MIN_MAX_FRAME_BYTES`]
+/// is refused the same way, naming both.
 ///
 /// # Example
 ///
@@ -126,6 +132,8 @@ pub fn encode_line(frame: &Frame, max_frame_bytes: usize) -> Result<Vec<u8>, Cod
 /// assert_eq!(frame, Frame::Ping);
 /// ```
 pub fn decode_line(bytes: &[u8], max_frame_bytes: usize) -> Result<Frame, CodecError> {
+    let max_frame_bytes = checked_at_least("max_frame_bytes", max_frame_bytes, MIN_MAX_FRAME_BYTES)
+        .map_err(|message| CodecError::new(CodecErrorKind::Schema, message))?;
     let line = strip_carriage_return(bytes);
     if line.len() > max_frame_bytes {
         return Err(too_large(line.len(), max_frame_bytes));
@@ -235,6 +243,11 @@ pub struct LineDecoder {
 impl LineDecoder {
     /// Builds a decoder bounded by `max_frame_bytes`.
     ///
+    /// # Panics
+    ///
+    /// Panics when `max_frame_bytes` is below [`MIN_MAX_FRAME_BYTES`], naming
+    /// both.
+    ///
     /// # Example
     ///
     /// ```
@@ -244,7 +257,9 @@ impl LineDecoder {
     /// assert_eq!(decoder.max_frame_bytes(), 4096);
     /// ```
     #[must_use]
-    pub const fn new(max_frame_bytes: usize) -> Self {
+    pub fn new(max_frame_bytes: usize) -> Self {
+        let max_frame_bytes =
+            check_at_least("max_frame_bytes", max_frame_bytes, MIN_MAX_FRAME_BYTES);
         Self {
             max_frame_bytes,
             buffer: Vec::new(),
@@ -438,10 +453,61 @@ mod tests {
 
     #[test]
     fn a_line_at_the_limit_is_accepted_and_one_byte_over_is_not() {
-        let line = br#"{"type":"ping"}"#;
-        assert!(decode_line(line, line.len()).is_ok());
-        let error = decode_line(line, line.len() - 1).expect_err("too large");
+        // The ceiling itself must stay at or above MIN_MAX_FRAME_BYTES now
+        // that decode_line refuses a sub-floor one, so the boundary under
+        // test is sized up rather than using the 16-byte ping line.
+        let frame = Frame::Req(Request {
+            id: "r".into(),
+            method: "a.b".into(),
+            params: Value::String("x".repeat(MIN_MAX_FRAME_BYTES)),
+        });
+        let line = encode_frame_bytes(&frame, DEFAULT_MAX_FRAME_BYTES).expect("encodes");
+        assert!(line.len() > MIN_MAX_FRAME_BYTES);
+        assert!(decode_line(&line, line.len()).is_ok());
+        let error = decode_line(&line, line.len() - 1).expect_err("too large");
         assert_eq!(error.kind, CodecErrorKind::TooLarge);
+    }
+
+    #[test]
+    fn encoding_refuses_a_frame_ceiling_below_the_floor() {
+        let error =
+            encode_frame_bytes(&Frame::Ping, MIN_MAX_FRAME_BYTES - 1).expect_err("below floor");
+        assert_eq!(error.kind, CodecErrorKind::Schema);
+        assert_eq!(
+            error.message,
+            format!(
+                "max_frame_bytes is {}; expected at least {MIN_MAX_FRAME_BYTES}",
+                MIN_MAX_FRAME_BYTES - 1
+            )
+        );
+    }
+
+    #[test]
+    fn decoding_refuses_a_frame_ceiling_below_the_floor() {
+        let error =
+            decode_line(b"{\"type\":\"ping\"}", MIN_MAX_FRAME_BYTES - 1).expect_err("below floor");
+        assert_eq!(error.kind, CodecErrorKind::Schema);
+        assert_eq!(
+            error.message,
+            format!(
+                "max_frame_bytes is {}; expected at least {MIN_MAX_FRAME_BYTES}",
+                MIN_MAX_FRAME_BYTES - 1
+            )
+        );
+    }
+
+    #[test]
+    fn building_a_decoder_below_the_floor_panics_naming_both() {
+        let message = crate::codec::limits::panic_message(|| {
+            let _ = LineDecoder::new(MIN_MAX_FRAME_BYTES - 1);
+        });
+        assert_eq!(
+            message,
+            format!(
+                "max_frame_bytes is {}; expected at least {MIN_MAX_FRAME_BYTES}",
+                MIN_MAX_FRAME_BYTES - 1
+            )
+        );
     }
 
     #[test]
