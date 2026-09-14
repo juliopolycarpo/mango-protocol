@@ -1,8 +1,12 @@
 import { describe, expect, it } from 'bun:test';
 import { fileURLToPath } from 'node:url';
 import { CHUNK_HEADER_BYTES } from '../src/codec/chunk';
+import { RESERVED_ERROR_CODES } from '../src/errors';
 import type { PortClosure } from '../src/port';
 import type { Frame } from '../src/schemas/frames';
+import { Session } from '../src/session';
+import { CONFORMANCE_A } from '../src/testing/conformance';
+import { rejectionOf } from '../src/testing/rejection';
 import {
   createWebSocketPort,
   outcomeOfBunSend,
@@ -377,6 +381,117 @@ describe('createWebSocketPort', () => {
   it('exposes the frame limit it decodes under', () => {
     expect(harness().handle.port.maxFrameBytes).toBe(16 * 1024 * 1024);
     expect(harness({ maxFrameBytes: 8192 }).handle.port.maxFrameBytes).toBe(8192);
+  });
+});
+
+describe('createWebSocketPort accept', () => {
+  const ALLOWED_ORIGINS = ['https://app.example'];
+
+  it('refuses a disallowed origin with 4403 before hello, and sends nothing', async () => {
+    const sink = new FakeWebSocketSink();
+    const handle = createWebSocketPort(sink, {
+      accept: { origin: 'https://evil.example', allowedOrigins: ALLOWED_ORIGINS },
+    });
+    const closures: PortClosure[] = [];
+    handle.port.onClosed((closure) => closures.push(closure));
+
+    // No farewell close frame: spec/transports/websocket.md says "before it
+    // sends hello", so nothing goes out ahead of the refusal.
+    expect(sink.sent).toEqual([]);
+    expect(sink.calls).toEqual(['close:4403']);
+    expect(sink.closes).toEqual([{ code: 4403, reason: 'origin not allowed' }]);
+
+    // The report waits for a subscriber, so a listener attached in the same
+    // tick as `createWebSocketPort` (the ordinary case) still sees it.
+    expect(closures).toEqual([]);
+    await Promise.resolve();
+    expect(closures).toEqual([{ kind: 'closed', code: 4403, reason: 'origin not allowed' }]);
+  });
+
+  it('still reports the refusal to a listener that subscribes turns later', async () => {
+    // An acceptor that awaits anything at all between building the port and
+    // wiring it up — a session lookup, an audit write — drains the microtask
+    // queue first. A closure held for exactly one microtask is gone by then,
+    // and the subscriber would never learn why the port is closed.
+    const sink = new FakeWebSocketSink();
+    const handle = createWebSocketPort(sink, {
+      accept: { origin: 'https://evil.example', allowedOrigins: ALLOWED_ORIGINS },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const closures: PortClosure[] = [];
+    handle.port.onClosed((closure) => closures.push(closure));
+    await Promise.resolve();
+
+    expect(closures).toEqual([{ kind: 'closed', code: 4403, reason: 'origin not allowed' }]);
+  });
+
+  it('fails a Session built on the refused port, naming the code the socket was closed with', async () => {
+    const sink = new FakeWebSocketSink();
+    const handle = createWebSocketPort(sink, {
+      accept: { origin: 'https://evil.example', allowedOrigins: ALLOWED_ORIGINS },
+    });
+
+    // The port is already closed, so the session's own `hello` is refused
+    // where it is sent rather than after a handshake timeout; the 4403 rides
+    // in the refusal. The closure itself is what `port.onClosed` reports.
+    const rejection = await rejectionOf(new Session(handle.port, { peer: CONFORMANCE_A }).ready);
+
+    expect(rejection).toMatchObject({ code: RESERVED_ERROR_CODES.UNAVAILABLE });
+    expect((rejection as Error).message).toContain('4403');
+  });
+
+  it('drops a later onClose(4403) from the framework as a no-op', async () => {
+    const sink = new FakeWebSocketSink();
+    const handle = createWebSocketPort(sink, {
+      accept: { origin: 'https://evil.example', allowedOrigins: ALLOWED_ORIGINS },
+    });
+    const closures: PortClosure[] = [];
+    handle.port.onClosed((closure) => closures.push(closure));
+    await Promise.resolve();
+
+    handle.onClose(4403, 'origin not allowed');
+
+    expect(closures).toHaveLength(1);
+  });
+
+  it('lets hello flow for an allowed origin', () => {
+    const sink = new FakeWebSocketSink();
+    const handle = createWebSocketPort(sink, {
+      accept: { origin: 'https://app.example', allowedOrigins: ALLOWED_ORIGINS },
+    });
+
+    handle.port.send({ type: 'ping' });
+
+    expect(sink.calls).toEqual(['send:sent']);
+  });
+
+  it('lets hello flow for an absent origin, which is not a browser', () => {
+    const sink = new FakeWebSocketSink();
+    const handle = createWebSocketPort(sink, {
+      accept: { origin: undefined, allowedOrigins: ALLOWED_ORIGINS },
+    });
+
+    handle.port.send({ type: 'ping' });
+
+    expect(sink.calls).toEqual(['send:sent']);
+  });
+
+  it('never refuses without an accept option, whatever the upgrade carried', async () => {
+    const sink = new FakeWebSocketSink();
+    const handle = createWebSocketPort(sink);
+    const closures: PortClosure[] = [];
+    handle.port.onClosed((closure) => closures.push(closure));
+
+    handle.port.send({ type: 'ping' });
+    await Promise.resolve();
+
+    // The refusal is opt-in: without `accept` the port neither closes nor
+    // reports a closure, whoever the origin would have been.
+    expect(sink.calls).toEqual(['send:sent']);
+    expect(sink.closes).toEqual([]);
+    expect(closures).toEqual([]);
   });
 });
 

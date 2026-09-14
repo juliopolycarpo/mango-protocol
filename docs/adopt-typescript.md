@@ -152,7 +152,24 @@ const port = webSocketPort(socket);
 if (!isOriginAllowed(request.headers.get('origin') ?? undefined, ALLOWED_ORIGINS)) {
   return new Response(null, { status: 403 });
 }
+
+// or, if the framework hands the SDK an already-open socket instead of a
+// chance to refuse the upgrade, hand the origin to the port and let it close
+// with 4403 before `hello` rather than check at the HTTP layer:
+const { port } = createWebSocketPort(sink, {
+  accept: { origin: request.headers.get('origin') ?? undefined, allowedOrigins: ALLOWED_ORIGINS },
+});
 ```
+
+Both paths are conformant (spec/transports/websocket.md, Origin); pick whichever one this SDK
+actually owns. Refusing at the upgrade is cheaper — the socket never opens — but only works when
+the framework lets the acceptor answer the upgrade itself. `accept` is for the framework that
+hands over an already-open socket: TypeScript owns no HTTP upgrade of its own, so
+`createWebSocketPort` closes it with `4403` and `origin not allowed` before it would otherwise
+send anything, and a `Session` built on the returned port fails its handshake instead of hanging
+to the timeout. `origin` is required but nullable on purpose — write
+`request.headers.get('origin') ?? undefined` rather than omit the field, so a caller who forgot
+to read the header cannot read as an origin to let through.
 
 The sink reports each send as sent, buffered or dropped, so the port can pause its queue under
 backpressure and close with `4400` when the socket drops a chunk; `outcomeOfBunSend` maps the

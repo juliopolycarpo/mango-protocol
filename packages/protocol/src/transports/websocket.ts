@@ -53,6 +53,20 @@ export interface WebSocketPortOptions {
    * sent the frame goes first.
    */
   readonly sendCloseFrame?: boolean;
+  /**
+   * Opts this port into enforcing the Origin policy of
+   * spec/transports/websocket.md itself, for an acceptor that would rather
+   * hand the header down than check it at the HTTP upgrade. `origin` is
+   * required but nullable on purpose: a caller must write out
+   * `request.headers.get('origin') ?? undefined` rather than omit the field,
+   * so forgetting to read the header cannot read as an origin to pass
+   * through. A disallowed origin gets nothing at all, not even `hello`: the
+   * port closes itself with `4403` before `createWebSocketPort` returns.
+   */
+  readonly accept?: {
+    readonly origin: string | undefined;
+    readonly allowedOrigins: readonly string[];
+  };
 }
 
 /**
@@ -123,12 +137,30 @@ export function outcomeOfBunSend(result: number): SendOutcome {
  * // then, from the framework's own callbacks:
  * handle.onMessage(message);
  * handle.onClose(code, reason);
+ *
+ * With `accept`, a disallowed origin closes the returned port with `4403`
+ * before this returns and sends nothing to the socket first:
+ *
+ * @example
+ * const handle = createWebSocketPort(sink, {
+ *   accept: { origin: request.headers.get('origin') ?? undefined, allowedOrigins },
+ * });
+ * // The port is closed before the session can send `hello`, so `ready`
+ * // rejects with UNAVAILABLE naming the 4403 the socket was closed with;
+ * // `handle.port.onClosed` reports that closure in full.
+ * new Session(handle.port, { peer });
  */
 export function createWebSocketPort(
   sink: WebSocketSink,
   options: WebSocketPortOptions = {}
 ): WebSocketPortHandle {
   const port = new WebSocketPort(sink, options);
+  if (
+    options.accept !== undefined &&
+    !isOriginAllowed(options.accept.origin, options.accept.allowedOrigins)
+  ) {
+    port.refuseOrigin();
+  }
   return {
     port,
     onMessage: (message) => port.receiveMessage(message),
@@ -161,6 +193,9 @@ class WebSocketPort implements Port {
   #open = true;
   #ownerClosed = false;
   #reported = false;
+  /** A closure raised before anyone subscribed; held rather than dropped. */
+  #pendingClosure: PortClosure | undefined;
+  #closureScheduled = false;
   #closeCode: number | undefined;
 
   constructor(sink: WebSocketSink, options: WebSocketPortOptions) {
@@ -192,7 +227,9 @@ class WebSocketPort implements Port {
   }
 
   onClosed(listener: (closure: PortClosure) => void): () => void {
-    return this.#closed.add(listener);
+    const detach = this.#closed.add(listener);
+    this.#scheduleClosure();
+    return detach;
   }
 
   close(code: number, reason?: string): void {
@@ -204,6 +241,29 @@ class WebSocketPort implements Port {
     if (!this.#open) return;
     this.#shutdown(code);
     this.#sink.close(code, clampCloseReason(reason));
+  }
+
+  /**
+   * Refuses the port before it ever sends anything: no farewell `close`
+   * frame (spec/transports/websocket.md, Origin says "before it sends
+   * `hello`", so nothing may go out ahead of the refusal), just the socket
+   * close and the closure.
+   *
+   * Unlike `close()`, the closure here is not one the caller already knows
+   * about — this runs inside `createWebSocketPort`, before the caller has
+   * the handle back — so `#ownerClosed` stays false and the closure is held
+   * until somebody subscribes, the way `#arrivals` holds a frame that
+   * arrived before anyone was listening for frames.
+   */
+  refuseOrigin(): void {
+    this.#shutdown(CLOSE_CODES.FORBIDDEN);
+    this.#sink.close(CLOSE_CODES.FORBIDDEN, 'origin not allowed');
+    this.#pendingClosure = {
+      kind: 'closed',
+      code: CLOSE_CODES.FORBIDDEN,
+      reason: 'origin not allowed',
+    };
+    this.#scheduleClosure();
   }
 
   /** One incoming message: text is fatal, bytes feed the reassembler. */
@@ -362,6 +422,24 @@ class WebSocketPort implements Port {
     this.#closeCode = code;
     this.#reassembler.reset();
     this.#frames.clear();
+  }
+
+  /**
+   * Delivers a held closure once there is somebody to deliver it to, on a
+   * microtask rather than inside `onClosed`, because a subscriber adding
+   * itself from a constructor is not finished being built yet.
+   */
+  #scheduleClosure(): void {
+    if (this.#closureScheduled || this.#pendingClosure === undefined) return;
+    if (this.#closed.size === 0) return;
+    this.#closureScheduled = true;
+    queueMicrotask(() => {
+      this.#closureScheduled = false;
+      const closure = this.#pendingClosure;
+      if (closure === undefined) return;
+      this.#pendingClosure = undefined;
+      this.#report(closure);
+    });
   }
 
   /** At most one closure, and never for a close this side asked for. */
