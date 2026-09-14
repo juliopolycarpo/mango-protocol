@@ -1049,6 +1049,45 @@ async fn sequences_events_per_stream_key_and_releases_the_counter_on_end() {
 }
 
 #[tokio::test]
+async fn emit_burns_no_stream_key_when_the_driver_is_gone() {
+    // `state()` only changes when the driver runs, so it stays `Ready` after
+    // the driver task is aborted — `emit`'s top-of-function short circuit
+    // never fires, and the send to the (now gone) driver is what must fail.
+    let (a, b) = port_pair();
+    let options_a = SessionOptions::new(peer("a")).with_max_stream_keys(1);
+    let (session_a, driver_a) = Session::spawn(a, options_a);
+    let (session_b, _driver_b) = Session::spawn(b, SessionOptions::new(peer("b")));
+
+    within("a's ready()", session_a.ready())
+        .await
+        .expect("handshake succeeds");
+    within("b's ready()", session_b.ready())
+        .await
+        .expect("handshake succeeds");
+
+    driver_a.abort();
+    let _ = driver_a.await;
+
+    let first = session_a.emit(EventInput {
+        topic: "stream.a".into(),
+        payload: Value::Null,
+        stream_id: None,
+        end: false,
+    });
+    assert_eq!(first, Ok(false), "expected Ok(false), received {first:?}");
+
+    // A ceiling of 1: if the first emit had burned its key, this one would
+    // come back UNAVAILABLE instead of Ok — proof the key was never spent.
+    let second = session_a.emit(EventInput {
+        topic: "stream.b".into(),
+        payload: Value::Null,
+        stream_id: None,
+        end: false,
+    });
+    assert_eq!(second, Ok(false), "expected Ok(false), received {second:?}");
+}
+
+#[tokio::test]
 async fn answers_a_ping_with_a_pong_the_pinger_can_observe() {
     let (a, b) = port_pair();
     let (session_a, _driver_a) = Session::spawn(a, SessionOptions::new(peer("a")));

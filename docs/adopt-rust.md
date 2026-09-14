@@ -166,6 +166,9 @@ and `details.kind` of `in_flight_limit`; that refusal is **retryable** — send 
 once one of yours has settled, and never latch on it the way you would on `METHOD_UNSUPPORTED`.
 `max_stream_keys` is local and never announced: `emit` returns `Err` when a new key would pass
 it, because reaching it means this side leaked stream ids rather than that the peer did anything.
+`emit`'s `Ok(false)` means more than "not ready yet", too: it also covers a driver that has
+stopped, and either way the stream key `emit` was called with is never spent — a session whose
+driver died does not burn its `max_stream_keys` budget on frames nobody saw.
 
 `with_max_frame_bytes` sets what this session *asks for*; the port it opens over may decode less.
 The session announces the lower of the two — never the session's own ceiling outright — so a
