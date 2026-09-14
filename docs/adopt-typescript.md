@@ -82,6 +82,12 @@ inventing a status when the grace runs out.
 and on close sends SIGTERM then SIGKILL after a grace period. The launcher decides what to run;
 WSL and container wrappers are argv arrays the application builds.
 
+`child.terminate()` may resolve `undefined`: once `SIGKILL` has had `exitGraceMs` (2 seconds by
+default) and the child still has not exited — stuck in `D` state, or a Windows process whose
+`kill()` returned `false` — it gives up rather than waiting forever, and does not invent a
+status. `child.exited` is the promise with no deadline; it always waits for the real exit, so a
+caller that needs to know for certain awaits that one instead.
+
 **Local socket.** A Unix domain socket or a Windows named pipe, NDJSON framed:
 
 ```ts

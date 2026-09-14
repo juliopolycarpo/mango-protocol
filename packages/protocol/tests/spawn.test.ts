@@ -43,6 +43,25 @@ class FakeChildProcess extends EventEmitter {
 }
 
 /**
+ * A child that ignores every signal: `kill()` reports the request as
+ * refused and nothing ever settles `exit`. This is a process stopped in `D`
+ * state, or a Windows process whose `kill()` returned `false` — the shapes
+ * `terminate()`'s exit grace exists to survive.
+ */
+class UnkillableChild extends EventEmitter {
+  readonly stdin = new PassThrough();
+  readonly stdout = new PassThrough();
+  readonly stderr = new PassThrough();
+  readonly pid = 4343;
+  readonly exitCode: number | null = null;
+  readonly signalCode: string | null = null;
+
+  kill(): boolean {
+    return false;
+  }
+}
+
+/**
  * A peer a caller implements themselves, carrying only what `SpawnedPeer` has
  * always asked for. It exists to make `bun run check` fail if a member is ever
  * added to that interface: everything this SDK learns about a launch belongs
@@ -315,6 +334,13 @@ describe('spawn launcher', () => {
 
     const status = await peer.terminate();
 
+    // A `SIGKILL` this test's own default exit grace has time to observe:
+    // narrow at the call rather than weaken the assertion below.
+    if (status === undefined) {
+      throw new Error(
+        'expected terminate() to observe the exit within its grace, received undefined'
+      );
+    }
     // The signal name is platform-specific; that the child is gone is not.
     expect(status.code === null || status.code !== 0).toBe(true);
   });
@@ -350,8 +376,58 @@ describe('spawn launcher', () => {
     const first = peer.terminate();
     const second = peer.terminate();
 
-    expect(await first).toBe(await second);
-    expect(await peer.exited).toBe(await first);
+    const firstStatus = await first;
+    // The echo child exits on its own once it sees the close frame, well
+    // inside every grace, so this narrows rather than weakens: an `undefined`
+    // here would mean the default exit grace ran out on a healthy child.
+    if (firstStatus === undefined) {
+      throw new Error('expected terminate() to observe the echo child exit, received undefined');
+    }
+
+    expect(await second).toBe(firstStatus);
+    expect(await peer.exited).toBe(firstStatus);
+  });
+
+  it('bounds terminate to the exit grace and reports an unreaped child as undefined', async () => {
+    const child = new UnkillableChild();
+    const peer = spawnPort(
+      { argv: ['runtime'], terminateGraceMs: 50, killGraceMs: 50, exitGraceMs: 100 },
+      () => child as unknown as ChildProcess
+    );
+
+    const terminated = peer.terminate();
+    const outcome = await Promise.race([
+      terminated.then(() => 'resolved' as const),
+      Bun.sleep(1_000).then(() => 'waiting' as const),
+    ]);
+
+    expect(outcome).toBe('resolved');
+    expect(await terminated).toBeUndefined();
+
+    // `exited` has no deadline: it is still the promise that tells the truth
+    // about whether the child actually exited, however long that takes.
+    const exitedOutcome = await Promise.race([
+      peer.exited.then(() => 'settled' as const),
+      Bun.sleep(50).then(() => 'pending' as const),
+    ]);
+    expect(exitedOutcome).toBe('pending');
+  });
+
+  it('answers a second terminate with the status of a child that exited late', async () => {
+    // `undefined` is what the first call observed, not a verdict on the
+    // child. A supervisor that gives up, logs, and asks again once the
+    // process table is clear must not be told "never exited" for ever.
+    const child = new UnkillableChild();
+    const peer = spawnPort(
+      { argv: ['runtime'], terminateGraceMs: 10, killGraceMs: 10, exitGraceMs: 20 },
+      () => child as unknown as ChildProcess
+    );
+
+    expect(await peer.terminate()).toBeUndefined();
+    child.emit('exit', 137, null);
+    await peer.exited;
+
+    expect(await peer.terminate()).toEqual({ code: 137, signal: null });
   });
 
   it('hides the child console window by default', () => {

@@ -65,6 +65,15 @@ export interface SpawnOptions {
   readonly terminateGraceMs?: number;
   /** How long `SIGTERM` has to work before `SIGKILL`; 2 seconds. */
   readonly killGraceMs?: number;
+  /**
+   * How long `terminate()` waits for the exit once `SIGKILL` has been sent,
+   * before giving up and resolving `undefined`; 2 seconds. A child stuck in
+   * `D` state, or a Windows process whose `kill()` returns `false`, may never
+   * exit at all — this bounds the wait so a shutdown awaiting `terminate()`
+   * is delayed but never blocked forever. `exited` is unaffected: it keeps
+   * waiting for the real exit.
+   */
+  readonly exitGraceMs?: number;
   /** Called with every stderr chunk, for a launcher that streams diagnostics. */
   readonly onStderr?: (chunk: Uint8Array) => void;
   /**
@@ -95,6 +104,8 @@ export interface SpawnedPeer {
   /**
    * Resolves exactly once with how the child ended. A child that never started
    * resolves `{ code: null, signal: null }`; `stderrTail()` carries the reason.
+   * Unlike `terminate()`, this is unbounded on purpose: it is the one promise
+   * that always tells the truth about whether the child actually exited.
    */
   readonly exited: Promise<ExitStatus>;
   /**
@@ -103,8 +114,19 @@ export interface SpawnedPeer {
    * best effort, as any tail of a pipe is.
    */
   stderrTail(): string;
-  /** Closes stdin, then escalates to `SIGTERM` and `SIGKILL`. Idempotent. */
-  terminate(): Promise<ExitStatus>;
+  /**
+   * Closes stdin, then escalates to `SIGTERM` and `SIGKILL`. Idempotent: the
+   * escalation runs once however many times this is called.
+   *
+   * Resolves with the exit status once the child is gone, or `undefined` once
+   * `exitGraceMs` has passed since the last kill request without one landing —
+   * a child stuck in `D` state, or a Windows process whose `kill()` returned
+   * `false`, must not leave a caller awaiting `terminate()` stuck forever.
+   * `undefined` is what this call observed, not a verdict: asking again once
+   * the child has finally exited answers with its status. `exited` is the
+   * promise to await for the real exit; it has no deadline.
+   */
+  terminate(): Promise<ExitStatus | undefined>;
 }
 
 /**
@@ -132,6 +154,7 @@ const DEFAULT_STDERR_TAIL_BYTES = 16 * 1024;
 /** Reference grace periods of the termination sequence (spawn.md, Termination). */
 const DEFAULT_TERMINATE_GRACE_MS = 2000;
 const DEFAULT_KILL_GRACE_MS = 2000;
+const DEFAULT_EXIT_GRACE_MS = 2000;
 
 /** How long `startError` waits for an exit status that has not landed yet. */
 const DEFAULT_START_ERROR_GRACE_MS = 250;
@@ -226,10 +249,14 @@ export function spawnPort(options: SpawnOptions, spawnChild: SpawnChild = spawn)
       : createNdjsonPort({ sink: unspawnedSink(), ...limit });
   wire(child, handle, options, tail, exit, launch);
 
-  let termination: Promise<ExitStatus> | undefined;
-  const terminate = (): Promise<ExitStatus> => {
+  let termination: Promise<ExitStatus | undefined> | undefined;
+  const terminate = async (): Promise<ExitStatus | undefined> => {
+    // The escalation runs once, but its answer is not cached: a child that
+    // outlived the graces and exited afterwards has an exit status now, and
+    // a caller who asks again deserves it rather than the `undefined` the
+    // first call was right about at the time.
     termination ??= escalate(child, handle, exit.promise, options);
-    return termination;
+    return (await termination) ?? (await settledStatus(exit.promise));
   };
   // The launcher owns the child's lifetime whichever side ended the port: a
   // refused line or a stdout the child closed ends the session, and a child
@@ -344,7 +371,10 @@ function wire(
  * The port the launcher hands out: the NDJSON port, plus a `close` that starts
  * the termination sequence the child's lifetime depends on.
  */
-function launcherPort(handle: NdjsonPortHandle, terminate: () => Promise<ExitStatus>): Port {
+function launcherPort(
+  handle: NdjsonPortHandle,
+  terminate: () => Promise<ExitStatus | undefined>
+): Port {
   const inner = handle.port;
   return {
     ...(inner.maxFrameBytes !== undefined ? { maxFrameBytes: inner.maxFrameBytes } : {}),
@@ -368,11 +398,13 @@ async function escalate(
   handle: NdjsonPortHandle,
   exited: Promise<ExitStatus>,
   options: SpawnOptions
-): Promise<ExitStatus> {
+): Promise<ExitStatus | undefined> {
   // A `close` frame first, so a conforming child knows why it is leaving; the
   // port ends stdin behind it, which is step 1 of the sequence.
   handle.port.close(CLOSE_CODES.RELEASED, 'launcher terminating');
   if (child?.stdin?.writable) child.stdin.end();
+  // The spawn-error path already settles `exited` synchronously-ish, so a
+  // child that never started never reaches the bounded wait below.
   if (child === undefined) return await exited;
 
   const terminateGrace = options.terminateGraceMs ?? DEFAULT_TERMINATE_GRACE_MS;
@@ -382,7 +414,12 @@ async function escalate(
   const killGrace = options.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
   if (await settledWithin(exited, killGrace)) return await exited;
   kill(child, 'SIGKILL');
-  return await exited;
+
+  // Bounded from here: a child that ignores SIGKILL (a process stuck in `D`
+  // state, a Windows `kill()` that returned `false`) must not keep a shutdown
+  // awaiting `terminate()` stuck forever. `exited` itself stays unbounded.
+  const exitGrace = options.exitGraceMs ?? DEFAULT_EXIT_GRACE_MS;
+  return (await settledWithin(exited, exitGrace)) ? await exited : undefined;
 }
 
 function kill(child: ChildProcess, signal: 'SIGTERM' | 'SIGKILL'): void {
@@ -391,6 +428,11 @@ function kill(child: ChildProcess, signal: 'SIGTERM' | 'SIGKILL'): void {
   // the same call with a name the platform cannot deliver.
   if (WINDOWS) child.kill();
   else child.kill(signal);
+}
+
+/** The exit status if it has already landed, `undefined` while it has not. */
+async function settledStatus(exited: Promise<ExitStatus>): Promise<ExitStatus | undefined> {
+  return (await settledWithin(exited, 0)) ? await exited : undefined;
 }
 
 /** True when the promise settled inside the grace, false when the grace ran out. */
