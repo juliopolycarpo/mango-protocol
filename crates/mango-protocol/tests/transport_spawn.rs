@@ -77,7 +77,8 @@ async fn a_launched_child_completes_the_handshake_and_answers_over_its_pipes() {
 
     let status = tokio::time::timeout(Duration::from_secs(10), launched.terminate())
         .await
-        .expect("the child leaves on the end of its stdin");
+        .expect("the child leaves on the end of its stdin")
+        .expect("the exit grace did not run out on a child that already left");
     assert_eq!(status.signal, None, "no signal was needed: {status}");
     assert_eq!(status.code, Some(0), "{status}");
 }
@@ -106,7 +107,8 @@ async fn a_child_that_ignores_the_end_of_its_stdin_is_escalated_past_it() {
 
     let status = tokio::time::timeout(Duration::from_secs(10), launched.terminate())
         .await
-        .expect("the launcher escalates rather than waiting for ever");
+        .expect("the launcher escalates rather than waiting for ever")
+        .expect("SIGKILL reaches this child inside the default exit grace");
 
     if cfg!(unix) {
         // SIGTERM: the step the end of file did not achieve.

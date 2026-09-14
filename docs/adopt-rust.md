@@ -280,7 +280,10 @@ if session.ready().await.is_err() {
 }
 // Closing the session ends the child's stdin, which is step 1 of the
 // sequence and all a conforming peer needs; `terminate` waits that out and
-// escalates to SIGTERM and SIGKILL for a child that does not leave.
+// escalates to SIGTERM and SIGKILL for a child that does not leave. It gives
+// up and resolves `None` once the exit grace runs out after SIGKILL, so a
+// shutdown awaiting it is delayed but never blocked forever; `exited` is the
+// call to await for the real exit — it has no deadline.
 session.close(close_codes::RELEASED, Some("done")).await;
 peer.terminate().await;
 
