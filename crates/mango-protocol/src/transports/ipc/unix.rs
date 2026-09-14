@@ -3,9 +3,10 @@
 //! carries.
 
 use std::io;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
@@ -22,6 +23,10 @@ const SOCKET_MODE: u32 = 0o600;
 /// Owner-only and not searchable by anyone else, which is what keeps a socket
 /// staged inside it out of reach before its own mode is set.
 const STAGING_DIRECTORY_MODE: u32 = 0o700;
+
+/// How long [`probe`] waits for a verdict before erring toward "live" — the
+/// same 1 second the TypeScript SDK's `clearStaleSocket` uses.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The port a dialled connection produces.
 pub type IpcPort = NdjsonPort<OwnedReadHalf, OwnedWriteHalf>;
@@ -57,6 +62,10 @@ pub(super) fn address_for(name: &str) -> PathBuf {
 pub struct IpcListener {
     listener: UnixListener,
     path: PathBuf,
+    /// The address's inode at the moment this listener published it. `close`
+    /// unlinks only while this is still what sits at `path`, so a listener
+    /// that crashed and was replaced does not delete its replacement's file.
+    inode: u64,
     max_frame_bytes: Option<usize>,
     /// Weak handles to the ports handed out, so shutting down can tell the
     /// sessions still using them. Holding one never keeps a connection alive.
@@ -134,7 +143,11 @@ impl IpcListener {
     }
 
     /// Tells every session still open on this listener why, stops accepting,
-    /// and removes the socket file.
+    /// and removes the socket file — but only while it is still this
+    /// listener's own. A listener that crashed and was replaced, then closed
+    /// late on a handle nobody dropped, must not delete the replacement's
+    /// address; the inode recorded when this listener published is what
+    /// tells the two apart, since both sit at the same `path`.
     ///
     /// local-socket.md: "A listener shutting down sends `close` `4000` to every
     /// session first." The ports moved to whoever called
@@ -144,10 +157,16 @@ impl IpcListener {
     pub async fn close(self) {
         super::tell_accepted(self.accepted, close_codes::RELEASED, "listener closing").await;
         drop(self.listener);
-        // Best effort: an address already gone, or replaced by a newer
-        // listener that bound after this one stopped, is not this one's to
-        // report on.
-        let _ = tokio::fs::remove_file(&self.path).await;
+        // Best effort, and only this listener's to report on: an address
+        // already gone is nothing to remove, and one a newer listener
+        // replaced after this one stopped is that listener's file now, not
+        // this one's.
+        let Ok(metadata) = tokio::fs::symlink_metadata(&self.path).await else {
+            return;
+        };
+        if metadata.ino() == self.inode {
+            let _ = tokio::fs::remove_file(&self.path).await;
+        }
     }
 
     fn port(&self, stream: UnixStream) -> IpcServerPort {
@@ -165,16 +184,20 @@ impl IpcListener {
 /// cannot do without reaching into every other thread. Staging inside a
 /// directory nobody else may enter closes it without leaving this call.
 ///
-/// A stale socket file left by a previous process is removed first. Anything
-/// else at the address is refused rather than replaced: a regular file there
-/// is a mistake the caller has to see.
+/// A socket file at the address is *stale* — and removed first — when a
+/// connection to it is refused; binding refuses instead when a connection
+/// succeeds or cannot be judged, because the address counts as in use
+/// (local-socket.md, Addresses). Anything at the address that is not a socket
+/// is refused rather than replaced or judged: a regular file there is a
+/// mistake the caller has to see.
 ///
 /// # Errors
 ///
-/// Whatever binding, restricting or publishing the address failed with, and
+/// Whatever binding, restricting or publishing the address failed with;
 /// [`io::ErrorKind::AlreadyExists`] when something that is not a socket
 /// already holds the address, or when another listener took it while this one
-/// was binding.
+/// was binding; and [`io::ErrorKind::AddrInUse`] when a live listener answers
+/// at the address already.
 pub async fn listen_ipc(path: impl AsRef<Path>) -> io::Result<IpcListener> {
     let path = path.as_ref().to_path_buf();
     remove_stale_socket(&path).await?;
@@ -183,10 +206,15 @@ pub async fn listen_ipc(path: impl AsRef<Path>) -> io::Result<IpcListener> {
     let staged = stage_and_publish(&staging, &path).await;
     discard(&staging).await;
     let listener = staged?;
+    // Recorded now, right after publishing succeeded, so a later `close` can
+    // tell this listener's own address from one a replacement has since
+    // bound at the same path.
+    let inode = tokio::fs::symlink_metadata(&path).await?.ino();
 
     Ok(IpcListener {
         listener,
         path,
+        inode,
         max_frame_bytes: None,
         accepted: Vec::new(),
     })
@@ -372,14 +400,61 @@ async fn remove_stale_socket(path: &Path) -> io::Result<()> {
             ),
         ));
     }
-    tokio::fs::remove_file(path).await
+    match probe(path).await {
+        Staleness::Stale => tokio::fs::remove_file(path).await,
+        Staleness::Live => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "{} is served by a live listener; expected the address to be free or a socket \
+                 file nothing answers on",
+                path.display()
+            ),
+        )),
+    }
+}
+
+/// Whether a socket file at an address is stale, or a live listener still
+/// answers behind it — local-socket.md's definition: "a socket file at the
+/// address is stale when a connection to it is refused".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Staleness {
+    Stale,
+    Live,
+}
+
+/// Dials `path` to tell a stale socket file from one a live listener answers
+/// on. [`io::ErrorKind::ConnectionRefused`] and [`io::ErrorKind::NotFound`]
+/// are stale: the listener that made the file is gone, whether the socket
+/// still refuses connections or the file was removed under the dial.
+/// Everything else — a successful connect, the timeout, a permission error —
+/// is live. Erring toward live is deliberate: taking over an address this
+/// could not judge is exactly the failure [`remove_stale_socket`] exists to
+/// refuse, so an inconclusive dial must never read as stale.
+async fn probe(path: &Path) -> Staleness {
+    match tokio::time::timeout(PROBE_TIMEOUT, UnixStream::connect(path)).await {
+        Ok(Ok(stream)) => {
+            // A live listener answered; nothing more to do with the
+            // connection than let the dial itself have proven the point.
+            drop(stream);
+            Staleness::Live
+        }
+        Ok(Err(error))
+            if matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            ) =>
+        {
+            Staleness::Stale
+        }
+        Ok(Err(_)) | Err(_) => Staleness::Live,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnectDeadline, IpcListener, SOCKET_MODE, STAGING_DIRECTORY_MODE, connect_ipc, discard,
-        listen_ipc, publish, stage, staging_path,
+        ConnectDeadline, IpcListener, SOCKET_MODE, STAGING_DIRECTORY_MODE, UnixListener,
+        connect_ipc, discard, listen_ipc, publish, stage, staging_path,
     };
     use crate::close::close_codes;
     use crate::frame::Frame;
@@ -422,6 +497,31 @@ mod tests {
         listen_ipc(address.path())
             .await
             .expect("the address is free")
+    }
+
+    /// `listen_ipc`, retried briefly on `AddrInUse`, for a test that stages a
+    /// dead listener and expects the next one to see it as stale.
+    ///
+    /// This test binary runs every test in one process, and an unrelated
+    /// test's `Command::spawn` can fork a child at the exact instant this
+    /// test's own listener socket is still open on this thread — `fork`
+    /// duplicates every file descriptor regardless of `CLOEXEC`, which only
+    /// takes effect at the child's own `execve`. In that microseconds-wide
+    /// gap the forked child holds its own copy of the fd, which is enough to
+    /// make a probe launched in that instant see the address as live. A
+    /// handful of short retries outlasts the gap without changing what the
+    /// assertion means: the address is stale once the fork elsewhere has
+    /// moved on, which every one of these retries still requires.
+    async fn listen_ipc_past_a_concurrent_forking_test(path: &Path) -> io::Result<IpcListener> {
+        for attempt in 0..10 {
+            match listen_ipc(path).await {
+                Err(error) if error.kind() == io::ErrorKind::AddrInUse && attempt < 9 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                outcome => return outcome,
+            }
+        }
+        unreachable!("the loop always returns on its last attempt")
     }
 
     #[tokio::test]
@@ -647,10 +747,101 @@ mod tests {
         // A listener that vanished without closing leaves its address behind.
         drop(listening(&address).await);
 
-        let second = listen_ipc(address.path())
+        let second = listen_ipc_past_a_concurrent_forking_test(&address.path())
             .await
             .expect("a stale socket is not an occupied address");
         second.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_live_listener_is_not_stale() {
+        let address = Address::new();
+        let mut first = listening(&address).await;
+
+        let error = listen_ipc(address.path())
+            .await
+            .expect_err("a live listener answers; the address is not stale");
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::AddrInUse,
+            "expected AddrInUse, received a listener"
+        );
+
+        let dial = tokio::spawn({
+            let path = address.path();
+            async move {
+                let dialled = connect_ipc(path, &ConnectDeadline::default())
+                    .await
+                    .expect("the first listener still answers");
+                let (mut tx, _rx) = dialled.split();
+                tx.send(Frame::Ping).await;
+            }
+        });
+
+        // The refused `listen_ipc` call above already dialled and dropped a
+        // probe connection of its own, which may sit ahead of the real
+        // client in this listener's accept queue. That connection closes
+        // without ever delivering a frame — `Inbound::Closed` rather than the
+        // `Ping` the real client sends — so it is not what this test waits
+        // for.
+        let delivered = loop {
+            let (accepted, _identity) = first.accept().await.expect("the listener keeps answering");
+            let (_tx, mut rx) = accepted.split();
+            if let Some(frame @ Inbound::Frame(Frame::Ping)) = rx.recv().await {
+                break frame;
+            }
+        };
+        assert_eq!(delivered, Inbound::Frame(Frame::Ping));
+
+        dial.await.expect("the dial task runs");
+        first.close().await;
+    }
+
+    #[tokio::test]
+    async fn closing_leaves_a_replacement_address_alone() {
+        let address = Address::new();
+        let a_inode = {
+            let a = listening(&address).await;
+            let inode = a.inode;
+            // A crash: the file descriptor closes without the unlink `close`
+            // performs, leaving a stale file behind — the same shape
+            // `a_stale_socket_file_is_replaced` relies on.
+            drop(a);
+            inode
+        };
+
+        let b = listen_ipc_past_a_concurrent_forking_test(&address.path())
+            .await
+            .expect("a stale socket is not an occupied address");
+        assert_ne!(
+            a_inode, b.inode,
+            "B must be a different socket for this test to mean anything"
+        );
+
+        // A's own handle, as it looked right before the crash: what a caller
+        // holding a stale `IpcListener` and calling `close()` late on it is.
+        // The `listener` field itself is irrelevant to what `close` decides —
+        // only `path` and `inode` are — so a throwaway socket fills it.
+        let scratch = Address::new();
+        let throwaway = UnixListener::bind(scratch.path()).expect("a throwaway socket to bind");
+        let late = IpcListener {
+            listener: throwaway,
+            path: address.path(),
+            inode: a_inode,
+            max_frame_bytes: None,
+            accepted: Vec::new(),
+        };
+        late.close().await;
+
+        assert!(
+            address.path().exists(),
+            "expected B's address to survive A's close, received NotFound"
+        );
+        connect_ipc(address.path(), &ConnectDeadline::default())
+            .await
+            .expect("B still accepts a connection");
+
+        b.close().await;
     }
 
     #[tokio::test]

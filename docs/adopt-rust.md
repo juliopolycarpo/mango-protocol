@@ -223,6 +223,15 @@ let deadline = ConnectDeadline::default().with_timeout(Duration::from_secs(5));
 let port = connect_ipc(ipc_path("mango-hub")?, &deadline).await?;
 ```
 
+On POSIX, `listen_ipc` treats a socket file at the address as *stale* — and replaces it — only
+when a connection to it is refused; a connection that succeeds, or one the dial cannot judge
+either way, leaves the address in use and `listen_ipc` refuses to bind. `IpcListener::close` only
+ever removes the address when it is still this listener's own: the inode recorded when it
+published is checked against what sits at the path, so a listener that crashed and was replaced
+does not delete its replacement's address by closing a handle late. Windows has no equivalent
+staleness question — `CreateNamedPipe`'s first-instance flag already refuses a duplicate name
+outright.
+
 The WebSocket transport dials with the `mango.v1` subprotocol and the reference bearer
 credential, and accepts an upgrade either through its own helper or from whatever HTTP stack you
 already run:
