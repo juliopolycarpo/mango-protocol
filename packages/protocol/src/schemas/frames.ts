@@ -30,7 +30,7 @@ const MIN_ANNOUNCED_FRAME_BYTES = 4096;
 const MAX_ANNOUNCED_FRAME_BYTES = 2147483647;
 
 /** Fewest requests a peer may announce it will hold open (§11.2). */
-const MIN_ANNOUNCED_IN_FLIGHT = 1;
+export const MIN_ANNOUNCED_IN_FLIGHT = 1;
 
 /** Largest in-flight ceiling `hello.limits` can carry, one signed 32-bit integer. */
 const MAX_ANNOUNCED_IN_FLIGHT = 2147483647;

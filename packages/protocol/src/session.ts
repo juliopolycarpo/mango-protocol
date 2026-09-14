@@ -10,14 +10,15 @@ import {
   isValidMethodName,
   RPC_DISCOVER_MINOR,
 } from './schemas/common';
-import type {
-  ErrorPayload,
-  EventFrame,
-  Frame,
-  HelloFrame,
-  Limits,
-  PeerInfo,
-  RequestFrame,
+import {
+  type ErrorPayload,
+  type EventFrame,
+  type Frame,
+  type HelloFrame,
+  type Limits,
+  MIN_ANNOUNCED_IN_FLIGHT,
+  type PeerInfo,
+  type RequestFrame,
 } from './schemas/frames';
 import { negotiate, PROTOCOL_MINOR, PROTOCOL_VERSION, type ProtocolVersion } from './version';
 
@@ -96,16 +97,16 @@ export interface SessionOptions {
    */
   readonly maxFrameBytes?: number;
   /**
-   * How many requests this side will answer at once. Past it a `req` is
-   * refused with `UNAVAILABLE` and `details.kind` of `in_flight_limit`, which
-   * the requester may retry; 256 by default. Announced in
-   * `hello.limits.maxInFlight` so the peer can pace itself.
+   * How many requests this side will answer at once, never below 1. Past it a
+   * `req` is refused with `UNAVAILABLE` and `details.kind` of
+   * `in_flight_limit`, which the requester may retry; 256 by default.
+   * Announced in `hello.limits.maxInFlight` so the peer can pace itself.
    */
   readonly maxInFlight?: number;
   /**
-   * How many stream keys this side will emit on at once. A new key past it is
-   * refused locally and nothing is sent; 1024 by default. Local, never
-   * announced: reaching it means this side leaked stream ids.
+   * How many stream keys this side will emit on at once, never below 1. A new
+   * key past it is refused locally and nothing is sent; 1024 by default.
+   * Local, never announced: reaching it means this side leaked stream ids.
    */
   readonly maxStreamKeys?: number;
   /** How long to wait for the peer's `hello`; 15 seconds by default. */
@@ -140,6 +141,13 @@ export const DEFAULT_MAX_IN_FLIGHT = 256;
 
 /** Stream keys one side emits on at once before `emit` refuses (§11.2). */
 export const DEFAULT_MAX_STREAM_KEYS = 1024;
+
+/**
+ * Fewest stream keys a session can be configured for. Local rather than
+ * announced, so §11.2 does not bound it, but a session that may hold no key
+ * open at all refuses its own first `emit`.
+ */
+const MIN_OPEN_STREAM_KEYS = 1;
 
 /** How long `close()` waits for in-flight handlers before abandoning them. */
 export const DEFAULT_HANDLER_GRACE_MS = 5_000;
@@ -245,8 +253,18 @@ export class Session {
     this.#timers = options.timers ?? globalTimers();
     this.#localProtocol = options.protocol ?? PROTOCOL_VERSION;
     this.#localMaxFrameBytes = localFrameCeiling(options.maxFrameBytes, port.maxFrameBytes);
-    this.#maxInFlight = options.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT;
-    this.#maxStreamKeys = options.maxStreamKeys ?? DEFAULT_MAX_STREAM_KEYS;
+    this.#maxInFlight = resolveIntegerAtLeast(
+      'maxInFlight',
+      options.maxInFlight,
+      DEFAULT_MAX_IN_FLIGHT,
+      MIN_ANNOUNCED_IN_FLIGHT
+    );
+    this.#maxStreamKeys = resolveIntegerAtLeast(
+      'maxStreamKeys',
+      options.maxStreamKeys,
+      DEFAULT_MAX_STREAM_KEYS,
+      MIN_OPEN_STREAM_KEYS
+    );
     this.#handlerGraceMs = options.handlerGraceMs ?? DEFAULT_HANDLER_GRACE_MS;
     this.#requestIdPrefix = options.requestIdPrefix ?? 'r';
     for (const [method, handler] of Object.entries(options.handlers ?? {})) {

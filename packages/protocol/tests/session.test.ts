@@ -243,6 +243,20 @@ describe('Session handshake', () => {
     );
   });
 
+  it.each([
+    ['maxInFlight', 0, 'maxInFlight is 0; expected an integer of at least 1'],
+    ['maxInFlight', 1.5, 'maxInFlight is 1.5; expected an integer of at least 1'],
+    ['maxStreamKeys', 0, 'maxStreamKeys is 0; expected an integer of at least 1'],
+  ])('refuses %s of %p at construction', (option, value, message) => {
+    // `maxInFlight: 0` announces a limit the schema refuses and `maxStreamKeys:
+    // 0` refuses the session's own first emit; neither is a configuration a
+    // caller can have meant, so it is refused where it was written.
+    const ports = createInProcessPortPair();
+    expect(() => new Session(ports.a, { peer: HUB, [option]: value })).toThrow(
+      new RangeError(message)
+    );
+  });
+
   it('refuses a port whose own ceiling is below the floor of the wire', () => {
     // `Port.maxFrameBytes` is a plain number on an interface applications
     // implement, and the session now takes the lower of the two ceilings —
