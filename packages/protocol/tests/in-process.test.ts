@@ -44,6 +44,15 @@ describe('in-process transport (validate mode)', () => {
     expect(seen).toEqual(['ping', 'pong']);
   });
 
+  it('refuses a frame ceiling below the floor of the wire', () => {
+    // The pair round-trips every frame through the byte codec, which enforces
+    // the floor; the port itself must refuse the same value at construction
+    // rather than announce a ceiling no decoder in the SDK would accept.
+    expect(() => createInProcessPortPair({ maxFrameBytes: 512 })).toThrow(
+      new RangeError('maxFrameBytes is 512; expected an integer of at least 4096')
+    );
+  });
+
   it('reports the close code to the peer and not to the closer', async () => {
     const { a, b } = createInProcessPortPair();
     const closures: unknown[] = [];

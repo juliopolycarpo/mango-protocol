@@ -1,5 +1,6 @@
 import { CLOSE_CODES, isFatalCloseCode } from './close';
-import { DEFAULT_MAX_FRAME_BYTES, measureFrameBytes } from './codec/ndjson';
+import { resolveIntegerAtLeast } from './codec/limits';
+import { DEFAULT_MAX_FRAME_BYTES, MIN_MAX_FRAME_BYTES, measureFrameBytes } from './codec/ndjson';
 import { type CodecError, RESERVED_ERROR_CODES, RemoteError } from './errors';
 import { Listeners } from './listeners';
 import type { Port, PortClosure } from './port';
@@ -86,12 +87,12 @@ export interface SessionOptions {
   /** Highest wire version this side speaks; the SDK's own by default. */
   readonly protocol?: ProtocolVersion;
   /**
-   * Largest frame this side accepts. Defaults to the port's own decoder limit;
-   * when set, the session announces the lower of it and the port's, because a
-   * frame the port cannot decode is one this side cannot accept however high
-   * the option is. Announced in `hello.limits` when it is below the protocol
-   * default, and the lower of both sides' ceilings bounds every frame this
-   * side sends.
+   * Largest frame this side accepts, never below the 4096 of §11. Defaults to
+   * the port's own decoder limit; when set, the session announces the lower of
+   * it and the port's, because a frame the port cannot decode is one this side
+   * cannot accept however high the option is. Announced in `hello.limits` when
+   * it is below the protocol default, and the lower of both sides' ceilings
+   * bounds every frame this side sends.
    */
   readonly maxFrameBytes?: number;
   /**
@@ -157,14 +158,33 @@ interface PendingRequest {
  * The frame ceiling this side announces: the lower of what the session asked
  * for and what the port can actually decode. An absent option defers to the
  * port outright, so a transport that carries more than the protocol default
- * keeps its own ceiling.
+ * keeps its own ceiling. Either ceiling below the floor of §11 is a
+ * `RangeError` here rather than a `hello` the peer's schema refuses — the
+ * port's included, because `Port.maxFrameBytes` is a number anyone's own
+ * transport can supply, and a low one would otherwise drag a valid option
+ * under the floor without naming which of the two was out of range.
  *
  * @example
  * localFrameCeiling(8192, 4096); // 4096
  */
 function localFrameCeiling(requested: number | undefined, portCeiling: number | undefined): number {
-  if (requested === undefined) return portCeiling ?? DEFAULT_MAX_FRAME_BYTES;
-  return Math.min(requested, portCeiling ?? requested);
+  const ceiling =
+    portCeiling === undefined
+      ? undefined
+      : resolveIntegerAtLeast(
+          'port maxFrameBytes',
+          portCeiling,
+          DEFAULT_MAX_FRAME_BYTES,
+          MIN_MAX_FRAME_BYTES
+        );
+  if (requested === undefined) return ceiling ?? DEFAULT_MAX_FRAME_BYTES;
+  const floored = resolveIntegerAtLeast(
+    'maxFrameBytes',
+    requested,
+    DEFAULT_MAX_FRAME_BYTES,
+    MIN_MAX_FRAME_BYTES
+  );
+  return Math.min(floored, ceiling ?? floored);
 }
 
 interface Deferred<T> {

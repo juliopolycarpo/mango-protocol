@@ -32,15 +32,20 @@ Both peers send `hello` as soon as the transport opens; there is no client and n
 this layer. `ready` rejects with a `RemoteError` of code `PROTOCOL_MISMATCH` when the majors
 differ, and with `TIMEOUT` when the peer never says hello (15 seconds by default).
 
+A limit below the floor §11 sets is a `RangeError` from the call that sets it — the
+constructor, or the transport's own options — not a `hello` the peer's schema refuses. The
+schema's *maximum* is not checked yet; a ceiling above `2147483647` still builds a `hello` the
+peer refuses.
+
 Options worth knowing:
 
-| Option               | Default                   | Meaning                                                                       |
-| -------------------- | ------------------------- | ----------------------------------------------------------------------------- |
-| `maxFrameBytes`      | the port's limit, 16 MiB  | Largest frame accepted; the session announces the lower of it and the port's  |
-| `handshakeTimeoutMs` | 15000                     | How long to wait for the peer's `hello`                                       |
-| `livenessIntervalMs` | 20000, `false` to disable | Ping interval; one missed pong closes with 4000 and reason `liveness timeout` |
-| `handlers`           | none                      | Method handlers registered before the handshake, so early requests are served |
-| `timers`             | globals                   | Injected timers for tests                                                     |
+| Option               | Default                   | Meaning                                                                                        |
+| -------------------- | ------------------------- | ---------------------------------------------------------------------------------------------- |
+| `maxFrameBytes`      | the port's limit, 16 MiB  | Largest frame accepted, never below 4096; the session announces the lower of it and the port's |
+| `handshakeTimeoutMs` | 15000                     | How long to wait for the peer's `hello`                                                        |
+| `livenessIntervalMs` | 20000, `false` to disable | Ping interval; one missed pong closes with 4000 and reason `liveness timeout`                  |
+| `handlers`           | none                      | Method handlers registered before the handshake, so early requests are served                  |
+| `timers`             | globals                   | Injected timers for tests                                                                      |
 
 ## Choose a transport
 

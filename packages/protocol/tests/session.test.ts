@@ -233,6 +233,29 @@ describe('Session handshake', () => {
     session.close();
   });
 
+  it('refuses a frame ceiling below the floor of the wire', () => {
+    // 512 would build a `hello` whose `limits.maxFrameBytes` the schema
+    // refuses, killing the session at the handshake rather than at the call
+    // that set it. It is refused where it was written instead.
+    const ports = createInProcessPortPair();
+    expect(() => new Session(ports.a, { peer: HUB, maxFrameBytes: 512 })).toThrow(
+      new RangeError('maxFrameBytes is 512; expected an integer of at least 4096')
+    );
+  });
+
+  it('refuses a port whose own ceiling is below the floor of the wire', () => {
+    // `Port.maxFrameBytes` is a plain number on an interface applications
+    // implement, and the session now takes the lower of the two ceilings —
+    // so a low one would quietly drag a perfectly valid option under the
+    // floor, and the handshake would die naming neither number.
+    class NarrowPort extends FakePort {
+      readonly maxFrameBytes = 1024;
+    }
+    expect(() => new Session(new NarrowPort(), { peer: HUB, maxFrameBytes: 65_536 })).toThrow(
+      new RangeError('port maxFrameBytes is 1024; expected an integer of at least 4096')
+    );
+  });
+
   it('keeps a port ceiling above the default when no option asks for less', async () => {
     // The option is absent, so the port's own ceiling is the answer whole; a
     // transport that can carry more than 16 MiB is not clamped back to it.
