@@ -1,5 +1,6 @@
 import { CLOSE_CODES, isFatalCloseCode } from './close';
-import { DEFAULT_MAX_FRAME_BYTES, measureFrameBytes } from './codec/ndjson';
+import { resolveIntegerAtLeast } from './codec/limits';
+import { DEFAULT_MAX_FRAME_BYTES, MIN_MAX_FRAME_BYTES, measureFrameBytes } from './codec/ndjson';
 import { type CodecError, RESERVED_ERROR_CODES, RemoteError } from './errors';
 import { Listeners } from './listeners';
 import type { Port, PortClosure } from './port';
@@ -9,14 +10,15 @@ import {
   isValidMethodName,
   RPC_DISCOVER_MINOR,
 } from './schemas/common';
-import type {
-  ErrorPayload,
-  EventFrame,
-  Frame,
-  HelloFrame,
-  Limits,
-  PeerInfo,
-  RequestFrame,
+import {
+  type ErrorPayload,
+  type EventFrame,
+  type Frame,
+  type HelloFrame,
+  type Limits,
+  MIN_ANNOUNCED_IN_FLIGHT,
+  type PeerInfo,
+  type RequestFrame,
 } from './schemas/frames';
 import { negotiate, PROTOCOL_MINOR, PROTOCOL_VERSION, type ProtocolVersion } from './version';
 
@@ -86,22 +88,25 @@ export interface SessionOptions {
   /** Highest wire version this side speaks; the SDK's own by default. */
   readonly protocol?: ProtocolVersion;
   /**
-   * Largest frame this side accepts. Defaults to the port's own decoder limit.
-   * Announced in `hello.limits` when it is below the protocol default, and the
-   * lower of both sides' ceilings bounds every frame this side sends.
+   * Largest frame this side accepts, never below the 4096 of §11. Defaults to
+   * the port's own decoder limit; when set, the session announces the lower of
+   * it and the port's, because a frame the port cannot decode is one this side
+   * cannot accept however high the option is. Announced in `hello.limits` when
+   * it is below the protocol default, and the lower of both sides' ceilings
+   * bounds every frame this side sends.
    */
   readonly maxFrameBytes?: number;
   /**
-   * How many requests this side will answer at once. Past it a `req` is
-   * refused with `UNAVAILABLE` and `details.kind` of `in_flight_limit`, which
-   * the requester may retry; 256 by default. Announced in
-   * `hello.limits.maxInFlight` so the peer can pace itself.
+   * How many requests this side will answer at once, never below 1. Past it a
+   * `req` is refused with `UNAVAILABLE` and `details.kind` of
+   * `in_flight_limit`, which the requester may retry; 256 by default.
+   * Announced in `hello.limits.maxInFlight` so the peer can pace itself.
    */
   readonly maxInFlight?: number;
   /**
-   * How many stream keys this side will emit on at once. A new key past it is
-   * refused locally and nothing is sent; 1024 by default. Local, never
-   * announced: reaching it means this side leaked stream ids.
+   * How many stream keys this side will emit on at once, never below 1. A new
+   * key past it is refused locally and nothing is sent; 1024 by default.
+   * Local, never announced: reaching it means this side leaked stream ids.
    */
   readonly maxStreamKeys?: number;
   /** How long to wait for the peer's `hello`; 15 seconds by default. */
@@ -137,6 +142,13 @@ export const DEFAULT_MAX_IN_FLIGHT = 256;
 /** Stream keys one side emits on at once before `emit` refuses (§11.2). */
 export const DEFAULT_MAX_STREAM_KEYS = 1024;
 
+/**
+ * Fewest stream keys a session can be configured for. Local rather than
+ * announced, so §11.2 does not bound it, but a session that may hold no key
+ * open at all refuses its own first `emit`.
+ */
+const MIN_OPEN_STREAM_KEYS = 1;
+
 /** How long `close()` waits for in-flight handlers before abandoning them. */
 export const DEFAULT_HANDLER_GRACE_MS = 5_000;
 
@@ -148,6 +160,39 @@ interface PendingRequest {
   readonly resolve: (value: unknown) => void;
   readonly reject: (error: Error) => void;
   readonly cleanup: () => void;
+}
+
+/**
+ * The frame ceiling this side announces: the lower of what the session asked
+ * for and what the port can actually decode. An absent option defers to the
+ * port outright, so a transport that carries more than the protocol default
+ * keeps its own ceiling. Either ceiling below the floor of §11 is a
+ * `RangeError` here rather than a `hello` the peer's schema refuses — the
+ * port's included, because `Port.maxFrameBytes` is a number anyone's own
+ * transport can supply, and a low one would otherwise drag a valid option
+ * under the floor without naming which of the two was out of range.
+ *
+ * @example
+ * localFrameCeiling(8192, 4096); // 4096
+ */
+function localFrameCeiling(requested: number | undefined, portCeiling: number | undefined): number {
+  const ceiling =
+    portCeiling === undefined
+      ? undefined
+      : resolveIntegerAtLeast(
+          'port maxFrameBytes',
+          portCeiling,
+          DEFAULT_MAX_FRAME_BYTES,
+          MIN_MAX_FRAME_BYTES
+        );
+  if (requested === undefined) return ceiling ?? DEFAULT_MAX_FRAME_BYTES;
+  const floored = resolveIntegerAtLeast(
+    'maxFrameBytes',
+    requested,
+    DEFAULT_MAX_FRAME_BYTES,
+    MIN_MAX_FRAME_BYTES
+  );
+  return Math.min(floored, ceiling ?? floored);
 }
 
 interface Deferred<T> {
@@ -207,10 +252,19 @@ export class Session {
     this.#options = options;
     this.#timers = options.timers ?? globalTimers();
     this.#localProtocol = options.protocol ?? PROTOCOL_VERSION;
-    this.#localMaxFrameBytes =
-      options.maxFrameBytes ?? port.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
-    this.#maxInFlight = options.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT;
-    this.#maxStreamKeys = options.maxStreamKeys ?? DEFAULT_MAX_STREAM_KEYS;
+    this.#localMaxFrameBytes = localFrameCeiling(options.maxFrameBytes, port.maxFrameBytes);
+    this.#maxInFlight = resolveIntegerAtLeast(
+      'maxInFlight',
+      options.maxInFlight,
+      DEFAULT_MAX_IN_FLIGHT,
+      MIN_ANNOUNCED_IN_FLIGHT
+    );
+    this.#maxStreamKeys = resolveIntegerAtLeast(
+      'maxStreamKeys',
+      options.maxStreamKeys,
+      DEFAULT_MAX_STREAM_KEYS,
+      MIN_OPEN_STREAM_KEYS
+    );
     this.#handlerGraceMs = options.handlerGraceMs ?? DEFAULT_HANDLER_GRACE_MS;
     this.#requestIdPrefix = options.requestIdPrefix ?? 'r';
     for (const [method, handler] of Object.entries(options.handlers ?? {})) {

@@ -6,7 +6,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use mango_protocol::codec::ndjson::LineDecoder;
+use mango_protocol::codec::ndjson::{LineDecoder, MIN_MAX_FRAME_BYTES};
 use mango_protocol::error::CodecErrorKind;
 use mango_protocol::frame::Frame;
 
@@ -19,13 +19,15 @@ struct Input {
     bytes: Vec<u8>,
 }
 
-/// A ceiling well below libFuzzer's default `-max_len` (~4096), the same
-/// range `decode_line` uses. `MIN_MAX_FRAME_BYTES..=DEFAULT_MAX_FRAME_BYTES`
-/// (4096 to 16 MiB) would make the too-large refusal unreachable at any
-/// fuzzer-sized input, and it is exactly the path where the whole-push and
-/// split-push decoders once disagreed (a blank line over the limit).
+/// A ceiling in `MIN_MAX_FRAME_BYTES..=8192`, the same range `decode_line`
+/// uses. The floor is not a preference: `LineDecoder::new` refuses anything
+/// below it, so a smaller ceiling would abort the run rather than exercise
+/// the decoder. The top of the range is what keeps the too-large refusal
+/// reachable — it is exactly the path where the whole-push and split-push
+/// decoders once disagreed (a blank line over the limit) — and it is only
+/// reachable because the lane raises `-max_len` past 8192 for this target.
 fn max_frame_bytes(offset: u16) -> usize {
-    16 + (usize::from(offset) % (8192 - 16))
+    MIN_MAX_FRAME_BYTES + (usize::from(offset) % (8192 - MIN_MAX_FRAME_BYTES + 1))
 }
 
 /// Splits `bytes` at every cut point, each reduced into range so any `u16`

@@ -1,4 +1,4 @@
-import { DEFAULT_MAX_FRAME_BYTES, decodeLine, encodeFrameBytes } from '../codec/ndjson';
+import { decodeLine, encodeFrameBytes, resolveFrameLimit } from '../codec/ndjson';
 import { Listeners } from '../listeners';
 import type { Port, PortClosure } from '../port';
 import { assertFrame, type Frame } from '../schemas/frames';
@@ -10,6 +10,7 @@ export interface InProcessOptions {
    * embeddings may turn it off and keep the structural clone plus schema check.
    */
   readonly validateFrames?: boolean;
+  /** Largest frame the pair's codec accepts; the 16 MiB default of §11 when absent. */
   readonly maxFrameBytes?: number;
 }
 
@@ -45,7 +46,7 @@ class InProcessPort implements Port {
 
   constructor(options: InProcessOptions) {
     this.#options = options;
-    this.maxFrameBytes = options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
+    this.maxFrameBytes = resolveFrameLimit(options);
   }
 
   connect(peer: InProcessPort): void {

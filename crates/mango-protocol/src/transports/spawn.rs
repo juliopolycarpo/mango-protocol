@@ -32,6 +32,9 @@ pub const DEFAULT_STDERR_TAIL_BYTES: usize = 16 * 1024;
 pub const DEFAULT_TERMINATE_GRACE: Duration = Duration::from_secs(2);
 /// How long `SIGTERM` has to work before `SIGKILL`.
 pub const DEFAULT_KILL_GRACE: Duration = Duration::from_secs(2);
+/// How long [`LaunchedPeer::terminate`] waits for the exit once `SIGKILL` has
+/// been sent, before giving up (spawn.md, Termination step 4).
+pub const DEFAULT_EXIT_GRACE: Duration = Duration::from_secs(2);
 
 /// How long [`LaunchedPeer::start_error`] waits for an exit that has not
 /// landed yet.
@@ -186,6 +189,13 @@ pub struct SpawnOptions {
     pub terminate_grace: Duration,
     /// How long `SIGTERM` has to work before `SIGKILL`.
     pub kill_grace: Duration,
+    /// How long [`LaunchedPeer::terminate`] waits for the exit once `SIGKILL`
+    /// has been sent, before giving up and resolving `None`. A child stuck in
+    /// `D` state, or a process whose kill did not take, may never exit at
+    /// all — this bounds the wait so a shutdown awaiting `terminate` is
+    /// delayed but never blocked forever. [`LaunchedPeer::exited`] is
+    /// unaffected: it keeps waiting for the real exit.
+    pub exit_grace: Duration,
     /// Called with every stderr chunk, for a launcher that streams
     /// diagnostics on as it reads them.
     pub on_stderr: Option<StderrReader>,
@@ -206,6 +216,7 @@ impl fmt::Debug for SpawnOptions {
             .field("stderr_tail_bytes", &self.stderr_tail_bytes)
             .field("terminate_grace", &self.terminate_grace)
             .field("kill_grace", &self.kill_grace)
+            .field("exit_grace", &self.exit_grace)
             .field("on_stderr", &self.on_stderr.is_some())
             .field("windows_hide", &self.windows_hide)
             .finish()
@@ -237,6 +248,7 @@ impl SpawnOptions {
             stderr_tail_bytes: DEFAULT_STDERR_TAIL_BYTES,
             terminate_grace: DEFAULT_TERMINATE_GRACE,
             kill_grace: DEFAULT_KILL_GRACE,
+            exit_grace: DEFAULT_EXIT_GRACE,
             on_stderr: None,
             windows_hide: true,
         }
@@ -277,6 +289,11 @@ impl SpawnOptions {
 
     /// Sets the frame limit the child's port enforces.
     ///
+    /// # Panics
+    ///
+    /// Panics when `max_frame_bytes` is below
+    /// [`crate::codec::ndjson::MIN_MAX_FRAME_BYTES`], naming both.
+    ///
     /// # Example
     ///
     /// ```
@@ -287,7 +304,25 @@ impl SpawnOptions {
     /// ```
     #[must_use]
     pub fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Self {
-        self.max_frame_bytes = Some(max_frame_bytes);
+        self.max_frame_bytes = Some(crate::codec::limits::check_max_frame_bytes(max_frame_bytes));
+        self
+    }
+
+    /// Sets how long [`LaunchedPeer::terminate`] waits for the exit once
+    /// `SIGKILL` has been sent, before giving up and resolving `None`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use mango_protocol::transports::spawn::SpawnOptions;
+    ///
+    /// let options = SpawnOptions::new(["mango-runtime"]).with_exit_grace(Duration::from_secs(5));
+    /// assert_eq!(options.exit_grace, Duration::from_secs(5));
+    /// ```
+    #[must_use]
+    pub fn with_exit_grace(mut self, exit_grace: Duration) -> Self {
+        self.exit_grace = exit_grace;
         self
     }
 
@@ -444,7 +479,20 @@ fn is_secret_shaped(upper: &str) -> bool {
 /// command that does not exist, one this user may not run — is reported
 /// through the port and [`LaunchedPeer::start_error`], because by then there
 /// is a session waiting to be told why it never came up.
+///
+/// # Panics
+///
+/// Panics when `options.max_frame_bytes` is `Some` value below
+/// [`crate::codec::ndjson::MIN_MAX_FRAME_BYTES`], naming both.
+/// [`SpawnOptions::with_max_frame_bytes`] already refuses this on the builder
+/// path, but the field is `pub`, so this is the check for a caller that
+/// assigned it directly — checked before the command is started, not after,
+/// so a sub-floor value never leaves a child running with nothing left to
+/// signal it.
 pub fn spawn_port(options: SpawnOptions) -> Result<(SpawnPort, LaunchedPeer), SpawnArgvError> {
+    if let Some(max_frame_bytes) = options.max_frame_bytes {
+        let _ = crate::codec::limits::check_max_frame_bytes(max_frame_bytes);
+    }
     let command = match options.argv.first() {
         Some(command) if !command.is_empty() => command.clone(),
         _ => {
@@ -501,6 +549,7 @@ pub fn spawn_port(options: SpawnOptions) -> Result<(SpawnPort, LaunchedPeer), Sp
         exit_rx.clone(),
         options.terminate_grace,
         options.kill_grace,
+        options.exit_grace,
     ));
     let port = NdjsonPort::new(stdout, stdin);
     let port = match options.max_frame_bytes {
@@ -673,6 +722,18 @@ fn exit_status(status: std::process::ExitStatus) -> ExitStatus {
     }
 }
 
+/// What an escalation settled on, for a caller that asks after `start` has
+/// already run — or is running — rather than driving `escalate` itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminationOutcome {
+    /// The escalation has not settled yet.
+    Pending,
+    /// The child exited before the exit grace ran out.
+    Exited(ExitStatus),
+    /// The exit grace ran out after `SIGKILL`; the child had not exited.
+    GaveUp,
+}
+
 /// Runs the termination sequence once, however many callers ask for it.
 #[derive(Debug)]
 struct Terminator {
@@ -680,7 +741,11 @@ struct Terminator {
     exit: Option<watch::Receiver<Option<ExitStatus>>>,
     terminate_grace: Duration,
     kill_grace: Duration,
+    exit_grace: Duration,
     started: Mutex<bool>,
+    /// What `start`'s background escalation found, so `terminate` reads the
+    /// one escalation that ran instead of racing a second wait against it.
+    outcome: watch::Sender<TerminationOutcome>,
 }
 
 impl Terminator {
@@ -689,25 +754,34 @@ impl Terminator {
         exit: watch::Receiver<Option<ExitStatus>>,
         terminate_grace: Duration,
         kill_grace: Duration,
+        exit_grace: Duration,
     ) -> Self {
+        let (outcome, _) = watch::channel(TerminationOutcome::Pending);
         Self {
             kill: Some(kill),
             exit: Some(exit),
             terminate_grace,
             kill_grace,
+            exit_grace,
             started: Mutex::new(false),
+            outcome,
         }
     }
 
     /// A terminator for a child that never started: there is nothing to
-    /// escalate against.
+    /// escalate against, so the outcome is already known — the same
+    /// `ExitStatus::default()` sentinel the launch path put on the exit
+    /// watch, not a grace that ran out.
     fn unspawned() -> Self {
+        let (outcome, _) = watch::channel(TerminationOutcome::Exited(ExitStatus::default()));
         Self {
             kill: None,
             exit: None,
             terminate_grace: Duration::ZERO,
             kill_grace: Duration::ZERO,
+            exit_grace: Duration::ZERO,
             started: Mutex::new(true),
+            outcome,
         }
     }
 
@@ -725,44 +799,82 @@ impl Terminator {
             *started = true;
         }
         let terminator = Arc::clone(self);
-        tokio::spawn(async move { terminator.escalate().await });
+        tokio::spawn(async move {
+            let outcome = match terminator.escalate().await {
+                Some(status) => TerminationOutcome::Exited(status),
+                None => TerminationOutcome::GaveUp,
+            };
+            let _ = terminator.outcome.send(outcome);
+        });
     }
 
-    /// End of stdin, then `SIGTERM`, then `SIGKILL`, each after its grace.
-    async fn escalate(&self) -> ExitStatus {
+    /// End of stdin, then `SIGTERM`, then `SIGKILL`, each bounded by its own
+    /// grace. `None` once the exit grace runs out after `SIGKILL` — spawn.md
+    /// step 4's "a launcher that gives up": this reports that the child had
+    /// not exited, and never invents an exit status for it.
+    async fn escalate(&self) -> Option<ExitStatus> {
         let (Some(kill), Some(exit)) = (self.kill.as_ref(), self.exit.as_ref()) else {
-            return ExitStatus::default();
+            return Some(ExitStatus::default());
         };
         let mut exit = exit.clone();
         // Step 1 already happened: whoever closed the port ended the child's
         // stdin, and a conforming peer treats that as the session ending.
         if let Some(status) = settled_within(&mut exit, self.terminate_grace).await {
-            return status;
+            return Some(status);
         }
         let _ = kill.send(KillRequest::Terminate);
         if let Some(status) = settled_within(&mut exit, self.kill_grace).await {
-            return status;
+            return Some(status);
         }
         let _ = kill.send(KillRequest::Kill);
-        wait_for_exit(&mut exit).await
+        settled_within(&mut exit, self.exit_grace).await
+    }
+
+    /// Waits for the escalation this terminator ran to settle, and reads what
+    /// it found. Safe to call before, during or after `start`: an unspawned
+    /// terminator already knows its answer, and a live one blocks until its
+    /// own background escalation records one — never running a second
+    /// escalation of its own.
+    async fn outcome(&self) -> Option<ExitStatus> {
+        let mut outcome = self.outcome.subscribe();
+        loop {
+            match *outcome.borrow_and_update() {
+                TerminationOutcome::Exited(status) => return Some(status),
+                TerminationOutcome::GaveUp => return None,
+                TerminationOutcome::Pending => {}
+            }
+            if outcome.changed().await.is_err() {
+                // The sender lives as long as this `Terminator`, and `self`
+                // borrows it for the whole call — this arm is unreachable in
+                // practice, not a real "gave up before starting".
+                return None;
+            }
+        }
     }
 }
 
-/// The exit status if it lands inside `grace`, `None` when the grace ran out.
+/// The exit status if it lands inside `grace`; `None` when the grace ran out
+/// or the watch's sender is gone — both read the same to a caller waiting for
+/// an exit that is not coming.
 async fn settled_within(
     exit: &mut watch::Receiver<Option<ExitStatus>>,
     grace: Duration,
 ) -> Option<ExitStatus> {
-    tokio::time::timeout(grace, wait_for_exit(exit)).await.ok()
+    tokio::time::timeout(grace, wait_for_exit(exit))
+        .await
+        .ok()
+        .flatten()
 }
 
-async fn wait_for_exit(exit: &mut watch::Receiver<Option<ExitStatus>>) -> ExitStatus {
+/// The exit status once the watch reports one; `None` when its sender is gone
+/// without ever sending one.
+async fn wait_for_exit(exit: &mut watch::Receiver<Option<ExitStatus>>) -> Option<ExitStatus> {
     loop {
         if let Some(status) = *exit.borrow_and_update() {
-            return status;
+            return Some(status);
         }
         if exit.changed().await.is_err() {
-            return ExitStatus::default();
+            return None;
         }
     }
 }
@@ -849,7 +961,13 @@ impl LaunchedPeer {
     /// ```
     pub async fn exited(&self) -> ExitStatus {
         let mut exit = self.exit.clone();
-        wait_for_exit(&mut exit).await
+        // `None` only when the watch's sender is gone without ever recording
+        // an exit — the reaper task ending without sending, which no path
+        // through this launcher takes but `wait_for_exit`'s signature does
+        // not rule out. `exited` is unbounded on purpose: it is the one call
+        // that waits for the real exit, so a lost sender still resolves
+        // rather than reporting a grace that was never asked for here.
+        wait_for_exit(&mut exit).await.unwrap_or_default()
     }
 
     /// Why a launch that never reached a handshake failed, read once the child
@@ -886,9 +1004,20 @@ impl LaunchedPeer {
         }
     }
 
-    /// Runs the termination sequence and resolves once the child has exited.
-    /// Safe to call more than once, and safe to call after the port already
-    /// started the sequence on its own.
+    /// Runs the termination sequence and resolves once the child has exited,
+    /// or `None` once the exit grace has run out after `SIGKILL` without the
+    /// child leaving. The escalation itself runs once and is not repeated,
+    /// but a call after it gave up rechecks the exit watch rather than
+    /// replaying the stale answer: a child that outlived every grace and
+    /// left afterwards has an exit status now, matching the TypeScript
+    /// launcher, whose `terminate()` does not cache `undefined` either.
+    /// `None` from this call means the grace had run out *and* the child
+    /// still had not exited by the time this call was made — an unspawned
+    /// child (one that never became a process) still resolves
+    /// `Some(ExitStatus::default())`, the same sentinel
+    /// [`LaunchedPeer::exited`] reports for it, because there is nothing
+    /// there to time out on. Safe to call more than once, and safe to call
+    /// after the port already started the sequence on its own.
     ///
     /// Step 1 of spawn.md's sequence — ending the child's stdin — belongs to
     /// whoever holds the port, because that is who owns the writable half:
@@ -897,6 +1026,9 @@ impl LaunchedPeer {
     /// still ends the child, but by way of `SIGTERM` once the first grace has
     /// run out rather than by the end of file a conforming peer would have
     /// left on.
+    ///
+    /// [`LaunchedPeer::exited`] is the call to await for the real exit; it
+    /// has no deadline and never gives up.
     ///
     /// # Example
     ///
@@ -909,14 +1041,23 @@ impl LaunchedPeer {
     /// // Step 1 belongs to the port: dropping it ends the child's stdin, so
     /// // a conforming child leaves before any signal is reached for.
     /// drop(port);
-    /// let status = peer.terminate().await;
-    /// println!("the child left with {status}");
+    /// match peer.terminate().await {
+    ///     Some(status) => println!("the child left with {status}"),
+    ///     None => println!("the child had not exited"),
+    /// }
     /// # }
     /// ```
-    pub async fn terminate(&self) -> ExitStatus {
+    pub async fn terminate(&self) -> Option<ExitStatus> {
         self.terminator.start();
-        let mut exit = self.exit.clone();
-        wait_for_exit(&mut exit).await
+        match self.terminator.outcome().await {
+            Some(status) => Some(status),
+            // `GaveUp` is what the escalation recorded when its own grace
+            // ran out; it says nothing about now. A plain, non-blocking
+            // `borrow` is deliberate here — this must never wait, or a
+            // caller who already saw one `None` could hang on a second call
+            // forever, exactly what `exit_grace` exists to bound against.
+            None => *self.exit.borrow(),
+        }
     }
 
     /// Sends `SIGKILL` (on Windows, terminates) without waiting out the
@@ -1135,11 +1276,13 @@ fn append_line(tail: &Arc<Mutex<BoundedTail>>, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedTail, ExitStatus, SpawnOptions, last_non_empty_line, sanitized_env_from,
-        signal_name, spawn_port,
+        BoundedTail, ExitStatus, LaunchedPeer, SpawnOptions, Terminator, last_non_empty_line,
+        sanitized_env_from, signal_name, spawn_port,
     };
     use crate::port::{Inbound, Port, PortClosure, PortRx};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use tokio::sync::{mpsc, watch};
 
     #[test]
     fn an_argv_without_a_command_is_refused() {
@@ -1203,6 +1346,95 @@ mod tests {
         assert_eq!(
             env.get("MANGO_TOKEN").map(String::as_str),
             Some("deliberate")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "max_frame_bytes is 512; expected at least 4096")]
+    fn with_max_frame_bytes_below_the_floor_panics_naming_both() {
+        let _ = SpawnOptions::new(["mango-runtime"]).with_max_frame_bytes(512);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_frame_bytes is 512; expected at least 4096")]
+    fn spawn_port_panics_on_a_sub_floor_ceiling_before_starting_the_child() {
+        // `max_frame_bytes` assigned directly, the way a caller who skips
+        // `with_max_frame_bytes` would — the field is `pub`, so nothing but
+        // this check stops it. A command that names no real process on this
+        // system: if the check ever moves back to after the child starts,
+        // this reaches the "command never became a process" branch instead
+        // of panicking, and the test fails with "did not panic" rather than
+        // silently passing on the old, buggy ordering.
+        let mut options = SpawnOptions::new(["mango-no-such-command-exists-anywhere"]);
+        options.max_frame_bytes = Some(512);
+        let _ = spawn_port(options);
+    }
+
+    #[tokio::test]
+    async fn escalate_gives_up_once_the_exit_grace_runs_out() {
+        let (kill_tx, _kill_rx) = mpsc::unbounded_channel();
+        let (exit_tx, exit_rx) = watch::channel(None);
+        // Held for the whole test: dropping it would make `wait_for_exit` see
+        // a gone sender, which reads the same as a grace running out but
+        // proves nothing about the deadline this test exists to check.
+        let _exit_tx = exit_tx;
+        let terminator = Terminator::new(
+            kill_tx,
+            exit_rx,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        );
+
+        match tokio::time::timeout(Duration::from_millis(200), terminator.escalate()).await {
+            Ok(None) => {}
+            Ok(Some(status)) => panic!("expected Ok(None), received Ok(Some({status}))"),
+            Err(_) => panic!("expected Ok(None), received Err(Elapsed)"),
+        }
+    }
+
+    #[tokio::test]
+    async fn terminate_rechecks_the_exit_watch_after_giving_up() {
+        let (kill_tx, _kill_rx) = mpsc::unbounded_channel();
+        let (exit_tx, exit_rx) = watch::channel(None);
+        let terminator = Arc::new(Terminator::new(
+            kill_tx.clone(),
+            exit_rx.clone(),
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        ));
+        let peer = LaunchedPeer {
+            pid: Some(1),
+            exit: exit_rx,
+            tail: Arc::new(Mutex::new(BoundedTail::new(0))),
+            spawn_error: None,
+            kill: kill_tx,
+            terminator,
+        };
+
+        // No exit ever lands inside the graces: the escalation gives up and
+        // caches `GaveUp`.
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(200), peer.terminate())
+                .await
+                .expect("terminate must not hang past its own graces"),
+            None
+        );
+
+        // The child leaves *after* the grace — late, but it did leave.
+        let late = ExitStatus {
+            code: Some(0),
+            signal: None,
+        };
+        let _ = exit_tx.send(Some(late));
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(200), peer.terminate())
+                .await
+                .expect("a second terminate() call must not hang either"),
+            Some(late),
+            "a late exit must be visible to a caller who asks terminate() again"
         );
     }
 

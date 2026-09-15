@@ -110,6 +110,11 @@ where
     /// produces. The session announces it in `hello.limits`, so one number
     /// governs what is refused on arrival and what the peer is told to send.
     ///
+    /// # Panics
+    ///
+    /// Panics when `max_frame_bytes` is below
+    /// [`crate::codec::ndjson::MIN_MAX_FRAME_BYTES`], naming both.
+    ///
     /// # Example
     ///
     /// ```
@@ -124,7 +129,7 @@ where
     /// ```
     #[must_use]
     pub fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Self {
-        self.max_frame_bytes = max_frame_bytes;
+        self.max_frame_bytes = crate::codec::limits::check_max_frame_bytes(max_frame_bytes);
         self
     }
 }
@@ -835,6 +840,15 @@ mod tests {
             other => panic!("expected Refused, got {other:?}"),
         }
         drop(theirs);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_frame_bytes is 512; expected at least 4096")]
+    fn building_a_port_below_the_floor_panics_naming_both() {
+        let (one, two) = duplex(64);
+        let (read, _unused) = tokio::io::split(one);
+        let (_unused, write) = tokio::io::split(two);
+        let _ = NdjsonPort::new(read, write).with_max_frame_bytes(512);
     }
 
     #[tokio::test]

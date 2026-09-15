@@ -455,9 +455,12 @@ impl Session {
 
     /// Publishes an event. Sequence numbers are per stream key (`stream_id`,
     /// else `topic`); `end` releases the counter. Returns `Ok(false)`, and
-    /// sends nothing, before the handshake completes or after the session
-    /// closed; fails with `FRAME_TOO_LARGE` rather than sending an oversized
-    /// frame.
+    /// sends nothing, before the handshake completes, after the session
+    /// closed, or when the driver has stopped without the session's own
+    /// state reflecting it yet — none of those spend the stream key, so a
+    /// key `Ok(false)` was returned for is never counted against
+    /// `max_stream_keys`. Fails with `FRAME_TOO_LARGE` rather than sending an
+    /// oversized frame.
     ///
     /// # Example
     ///
@@ -513,15 +516,20 @@ impl Session {
             end: end.then_some(End),
         });
         self.shared.assert_fits(&frame, &what)?;
+        // `sequences` stays held across the send: two threads racing the same
+        // stream key must not be able to interleave their sends in an order
+        // that disagrees with the seq numbers they were just given. The send
+        // runs *before* the commit, too: a driver that is gone means the
+        // frame was never written, and a key nobody saw a frame for must not
+        // be spent against `max_stream_keys`.
+        if self.shared.commands.send(Command::Send(frame)).is_err() {
+            return Ok(false);
+        }
         if end {
             sequences.remove(&key);
         } else {
             sequences.insert(key, seq + 1);
         }
-        // `sequences` stays held across the send: two threads racing the same
-        // stream key must not be able to interleave their sends in an order
-        // that disagrees with the seq numbers they were just given.
-        let _ = self.shared.commands.send(Command::Send(frame));
         Ok(true)
     }
 

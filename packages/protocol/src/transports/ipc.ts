@@ -5,6 +5,7 @@
  * One accepted connection is one session; a listener serves many at once.
  */
 
+import type { Stats } from 'node:fs';
 import { chmod, lstat, unlink } from 'node:fs/promises';
 import { connect as connectSocket, createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -65,7 +66,10 @@ export function ipcPath(name: string): string {
  * Listens on a local socket and hands one port per accepted connection.
  *
  * On POSIX a stale socket file at the same path is removed before binding, and
- * the socket is owner-only from the instant it exists.
+ * the socket is owner-only from the instant it exists. A socket file a
+ * connection succeeds against — or one this call cannot judge — is a live
+ * listener's address, not a stale one, and binding refuses with `EADDRINUSE`
+ * rather than take it over.
  *
  * On Windows the same call creates a named pipe, and the address is **not**
  * restricted: Node exposes no way to set a pipe's security descriptor, so libuv
@@ -111,7 +115,7 @@ export async function listenIpc(
     // credentials and answer `close` 4401 before `hello` (local-socket.md).
     await listening(server, path);
   } else {
-    await removeStaleSocket(path);
+    await clearStaleSocket(path);
     await bindOwnerOnly(server, path);
   }
   server.on('error', () => {
@@ -287,19 +291,114 @@ async function bindOwnerOnly(server: Server, path: string): Promise<void> {
 }
 
 /**
- * Removes the socket file a previous process left behind. Only a socket is
- * removed: a regular file at the address is a mistake the caller must see as
- * `EADDRINUSE`, not something to delete.
+ * Removes the socket file a previous process left behind, and refuses to bind
+ * over one a live listener is still serving. Only a socket is inspected: a
+ * regular file at the address is a mistake the later `listen` call reports as
+ * `EADDRINUSE` on its own, not something this function judges or deletes.
+ *
+ * local-socket.md defines stale as "a connection to it is refused": a socket
+ * file is removed once `probe` reports `'stale'`, and binding is refused —
+ * the address counts as in use — once it reports `'live'`, which includes
+ * every address this call could not judge either way.
  */
-async function removeStaleSocket(path: string): Promise<void> {
+async function clearStaleSocket(path: string): Promise<void> {
+  let stats: Stats;
   try {
-    const stats = await lstat(path);
-    if (!stats.isSocket()) return;
+    stats = await lstat(path);
   } catch {
     // Nothing at the path, which is the ordinary case.
     return;
   }
-  await unlink(path);
+  if (!stats.isSocket()) return;
+
+  const verdict = await probe(path);
+  if (verdict === 'stale') {
+    await removeSocketFile(path, stats.ino);
+    return;
+  }
+  throw Object.assign(
+    new Error(
+      `${path} is served by a live listener; expected the address to be free or a socket file nothing answers on`
+    ),
+    { code: 'EADDRINUSE', path }
+  );
+}
+
+/**
+ * Unlinks a socket file already judged stale, but only while it is still the
+ * same file the probe judged: the probe waits up to a second, and a second
+ * supervisor restarting against the same address is exactly who can remove
+ * and rebind it inside that window — unlinking on the stale verdict alone
+ * would then delete the winner's live socket file out from under it.
+ * Silently leaving a changed path alone is correct: the later `listen`
+ * call's own `EADDRINUSE` is what tells *this* caller the address was
+ * taken, the same outcome an unguarded race would have produced for the
+ * loser anyway. This narrows the window from the whole probe down to the
+ * gap between this check and the unlink; it does not close it — Node offers
+ * no unlink-by-inode primitive to close it with (the Rust SDK's
+ * `remove_stale_socket` carries the same guard, for the same reason).
+ *
+ * A file that went away entirely while the probe was dialling it — the same
+ * kind of restart, just resolved before this call ran rather than during
+ * it — leaves the address free, which is the outcome this was after; only
+ * an error other than "gone" or "someone else's now" is the caller's to see.
+ */
+async function removeSocketFile(path: string, inode: number): Promise<void> {
+  let current: Stats;
+  try {
+    current = await lstat(path);
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw cause;
+  }
+  if (current.ino !== inode) return;
+  try {
+    await unlink(path);
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code !== 'ENOENT') throw cause;
+  }
+}
+
+/** Whether a dial to a socket file found a live listener, or found it gone. */
+type ProbeVerdict = 'stale' | 'live';
+
+/** How long a probe dial waits for a verdict before erring toward `'live'`. */
+const PROBE_TIMEOUT_MS = 1000;
+
+/**
+ * Dials `path` to tell a stale socket file from one a live listener answers
+ * on. `ECONNREFUSED` and `ENOENT` are `'stale'`: the listener that made the
+ * file is gone, whether the socket still refuses connections or the file was
+ * removed under the dial. Everything else — a `'connect'`, the timeout,
+ * `EACCES`, `EAGAIN` — is `'live'`. Erring toward `'live'` is deliberate:
+ * taking over an address this could not judge is the failure `clearStaleSocket`
+ * exists to refuse, so an inconclusive dial must never read as stale.
+ */
+function probe(path: string): Promise<ProbeVerdict> {
+  return new Promise((resolve) => {
+    const socket = connectSocket(path);
+    let settled = false;
+    const finish = (verdict: ProbeVerdict): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.removeListener('connect', onConnect);
+      socket.removeListener('error', onError);
+      // The probe's own listeners are gone, so a reset that lands after the
+      // verdict would reach an emitter with no `error` handler; `discard`
+      // owns that, here as it does for an abandoned dial.
+      discard(socket);
+      resolve(verdict);
+    };
+    const onConnect = (): void => finish('live');
+    const onError = (error: NodeJS.ErrnoException): void => {
+      finish(error.code === 'ECONNREFUSED' || error.code === 'ENOENT' ? 'stale' : 'live');
+    };
+    const timer = setTimeout(() => finish('live'), PROBE_TIMEOUT_MS);
+    timer.unref();
+    socket.once('connect', onConnect);
+    socket.once('error', onError);
+  });
 }
 
 function listening(server: Server, path: string): Promise<void> {

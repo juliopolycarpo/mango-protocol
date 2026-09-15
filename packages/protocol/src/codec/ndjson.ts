@@ -8,7 +8,7 @@
 
 import { CodecError } from '../errors';
 import { assertFrame, type Frame } from '../schemas/frames';
-import { resolveByteCeiling } from './limits';
+import { resolveIntegerAtLeast } from './limits';
 
 /** Frame limit when neither peer announced a lower one (§11). */
 export const DEFAULT_MAX_FRAME_BYTES = 16 * 1024 * 1024;
@@ -47,7 +47,7 @@ const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
  * resolveFrameLimit({ maxFrameBytes: 4194304 }); // 4194304
  */
 export function resolveFrameLimit(options?: FrameLimitOptions): number {
-  return resolveByteCeiling(
+  return resolveIntegerAtLeast(
     'maxFrameBytes',
     options?.maxFrameBytes,
     DEFAULT_MAX_FRAME_BYTES,

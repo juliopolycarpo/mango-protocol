@@ -32,15 +32,22 @@ Both peers send `hello` as soon as the transport opens; there is no client and n
 this layer. `ready` rejects with a `RemoteError` of code `PROTOCOL_MISMATCH` when the majors
 differ, and with `TIMEOUT` when the peer never says hello (15 seconds by default).
 
+A limit below the floor §11 sets is a `RangeError` from the call that sets it — the
+constructor, or the transport's own options — not a `hello` the peer's schema refuses. The
+schema's *maximum* is not checked yet; a ceiling above `2147483647` still builds a `hello` the
+peer refuses.
+
 Options worth knowing:
 
-| Option               | Default                   | Meaning                                                                         |
-| -------------------- | ------------------------- | ------------------------------------------------------------------------------- |
-| `maxFrameBytes`      | the port's limit, 16 MiB  | Largest frame accepted; announced in `hello.limits` when lower than the default |
-| `handshakeTimeoutMs` | 15000                     | How long to wait for the peer's `hello`                                         |
-| `livenessIntervalMs` | 20000, `false` to disable | Ping interval; one missed pong closes with 4000 and reason `liveness timeout`   |
-| `handlers`           | none                      | Method handlers registered before the handshake, so early requests are served   |
-| `timers`             | globals                   | Injected timers for tests                                                       |
+| Option               | Default                   | Meaning                                                                                        |
+| -------------------- | ------------------------- | ---------------------------------------------------------------------------------------------- |
+| `maxFrameBytes`      | the port's limit, 16 MiB  | Largest frame accepted, never below 4096; the session announces the lower of it and the port's |
+| `maxInFlight`        | 256                       | Requests answered at once, never below 1; announced in `hello.limits`                          |
+| `maxStreamKeys`      | 1024                      | Stream keys open at once, never below 1; local, never announced                                |
+| `handshakeTimeoutMs` | 15000                     | How long to wait for the peer's `hello`                                                        |
+| `livenessIntervalMs` | 20000, `false` to disable | Ping interval; one missed pong closes with 4000 and reason `liveness timeout`                  |
+| `handlers`           | none                      | Method handlers registered before the handshake, so early requests are served                  |
+| `timers`             | globals                   | Injected timers for tests                                                                      |
 
 ## Choose a transport
 
@@ -75,6 +82,12 @@ inventing a status when the grace runs out.
 and on close sends SIGTERM then SIGKILL after a grace period. The launcher decides what to run;
 WSL and container wrappers are argv arrays the application builds.
 
+`child.terminate()` may resolve `undefined`: once `SIGKILL` has had `exitGraceMs` (2 seconds by
+default) and the child still has not exited — stuck in `D` state, or a Windows process whose
+`kill()` returned `false` — it gives up rather than waiting forever, and does not invent a
+status. `child.exited` is the promise with no deadline; it always waits for the real exit, so a
+caller that needs to know for certain awaits that one instead.
+
 **Local socket.** A Unix domain socket or a Windows named pipe, NDJSON framed:
 
 ```ts
@@ -90,11 +103,21 @@ stopped answering — stays in flight for as long as the process lives. A deadli
 destroys what the dial opened and rejects with a `TimeoutError`; an abort rejects with the
 reason the caller gave.
 
-On POSIX the socket is owner-only from the moment it exists, and a stale socket
-file left by a crashed listener is replaced. On Windows the named pipe is **not**
-restricted — Node cannot set a pipe's security descriptor, so any local user may
-connect. Check the peer's credentials and close with `4401` before `hello` if the
-address alone is not enough trust there.
+On POSIX the socket is owner-only from the moment it exists. A socket file at the address is
+*stale* when a connection to it is refused — the listener that made it is gone — and `listenIpc`
+removes a stale file before binding; a file a connection succeeds against, or one the dial
+cannot judge either way, is a live listener's address, and `listenIpc` refuses to bind over it
+with `EADDRINUSE` instead of silently taking it over. On Windows the named pipe is **not**
+restricted — Node cannot set a pipe's security descriptor, so any local user may connect. Check
+the peer's credentials and close with `4401` before `hello` if the address alone is not enough
+trust there.
+
+One residual race is outside what a probe can close: libuv's `uv__pipe_close` unlinks a Unix
+socket path unconditionally on `close()`, with no way from JavaScript to make it check first. A
+listener that crashes, gets replaced at the same address, and *then* runs its delayed `close()`
+will unlink the replacement's socket file out from under it — the replacement keeps running on
+an inode nothing can reach. The probe above closes the far more common case, a stale file with
+no process behind it at all; this one needs a crash landing inside that exact window.
 
 **WebSocket.** Binary chunked messages under subprotocol `mango.v1`; the SDK never sends text
 frames. Authentication is a bearer token on the upgrade request, checked by the HTTP layer
@@ -129,7 +152,24 @@ const port = webSocketPort(socket);
 if (!isOriginAllowed(request.headers.get('origin') ?? undefined, ALLOWED_ORIGINS)) {
   return new Response(null, { status: 403 });
 }
+
+// or, if the framework hands the SDK an already-open socket instead of a
+// chance to refuse the upgrade, hand the origin to the port and let it close
+// with 4403 before `hello` rather than check at the HTTP layer:
+const { port } = createWebSocketPort(sink, {
+  accept: { origin: request.headers.get('origin') ?? undefined, allowedOrigins: ALLOWED_ORIGINS },
+});
 ```
+
+Both paths are conformant (spec/transports/websocket.md, Origin); pick whichever one this SDK
+actually owns. Refusing at the upgrade is cheaper — the socket never opens — but only works when
+the framework lets the acceptor answer the upgrade itself. `accept` is for the framework that
+hands over an already-open socket: TypeScript owns no HTTP upgrade of its own, so
+`createWebSocketPort` closes it with `4403` and `origin not allowed` before it would otherwise
+send anything, and a `Session` built on the returned port fails its handshake instead of hanging
+to the timeout. `origin` is required but nullable on purpose — write
+`request.headers.get('origin') ?? undefined` rather than omit the field, so a caller who forgot
+to read the header cannot read as an origin to let through.
 
 The sink reports each send as sent, buffered or dropped, so the port can pause its queue under
 backpressure and close with `4400` when the socket drops a chunk; `outcomeOfBunSend` maps the

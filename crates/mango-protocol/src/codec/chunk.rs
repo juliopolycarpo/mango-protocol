@@ -5,6 +5,7 @@
 //! line without its terminator. Chunks of two frames never interleave, so one
 //! [`ChunkReassembler`] per connection is enough.
 
+use crate::codec::limits::{check_at_least, check_max_frame_bytes};
 use crate::codec::ndjson::{decode_line, encode_frame_bytes};
 use crate::error::{CodecError, CodecErrorKind};
 use crate::frame::Frame;
@@ -130,6 +131,12 @@ impl ChunkReassembler {
     /// sizes the reassembly buffer. `max_frame_bytes` is the frame limit and is
     /// what actually bounds reassembly.
     ///
+    /// # Panics
+    ///
+    /// Panics when `max_message_bytes` is below [`MIN_MAX_MESSAGE_BYTES`] or
+    /// `max_frame_bytes` is below [`crate::codec::ndjson::MIN_MAX_FRAME_BYTES`],
+    /// naming both.
+    ///
     /// # Example
     ///
     /// ```
@@ -141,7 +148,13 @@ impl ChunkReassembler {
     /// assert_eq!(reassembler.max_message_bytes(), 16 * 1024);
     /// ```
     #[must_use]
-    pub const fn new(max_message_bytes: usize, max_frame_bytes: usize) -> Self {
+    pub fn new(max_message_bytes: usize, max_frame_bytes: usize) -> Self {
+        let max_message_bytes = check_at_least(
+            "max_message_bytes",
+            max_message_bytes,
+            MIN_MAX_MESSAGE_BYTES,
+        );
+        let max_frame_bytes = check_max_frame_bytes(max_frame_bytes);
         Self {
             max_message_bytes,
             max_frame_bytes,
@@ -411,6 +424,34 @@ mod tests {
         let error = encode_chunks(&Frame::Ping, 1024, DEFAULT_MAX_FRAME_BYTES).expect_err("floor");
         assert_eq!(error.kind, CodecErrorKind::ChunkHeader);
         assert!(error.message.contains("2048"), "{error}");
+    }
+
+    #[test]
+    fn building_a_reassembler_below_the_message_floor_panics_naming_both() {
+        let message = crate::codec::limits::panic_message(|| {
+            let _ = ChunkReassembler::new(MIN_MAX_MESSAGE_BYTES - 1, DEFAULT_MAX_FRAME_BYTES);
+        });
+        assert_eq!(
+            message,
+            format!(
+                "max_message_bytes is {}; expected at least {MIN_MAX_MESSAGE_BYTES}",
+                MIN_MAX_MESSAGE_BYTES - 1
+            )
+        );
+    }
+
+    #[test]
+    fn building_a_reassembler_below_the_frame_floor_panics_naming_both() {
+        let message = crate::codec::limits::panic_message(|| {
+            let _ = ChunkReassembler::new(DEFAULT_MAX_MESSAGE_BYTES, MIN_MAX_FRAME_BYTES - 1);
+        });
+        assert_eq!(
+            message,
+            format!(
+                "max_frame_bytes is {}; expected at least {MIN_MAX_FRAME_BYTES}",
+                MIN_MAX_FRAME_BYTES - 1
+            )
+        );
     }
 
     #[test]

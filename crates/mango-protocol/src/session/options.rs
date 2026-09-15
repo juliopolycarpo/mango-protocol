@@ -20,6 +20,15 @@ pub const DEFAULT_HANDLER_GRACE: Duration = Duration::from_secs(5);
 pub const DEFAULT_MAX_IN_FLIGHT: usize = 256;
 /// 1024: the default [`SessionOptions::max_stream_keys`] (§11.2).
 pub const DEFAULT_MAX_STREAM_KEYS: usize = 1024;
+/// Fewest requests a session can be configured to answer at once: `0` would
+/// build a `hello.limits.maxInFlight` the schema refuses (§11.2). The same
+/// floor as [`crate::validate::MIN_ANNOUNCED_IN_FLIGHT`] and carrying its
+/// name, which is the one `session.ts` uses for it too.
+pub(crate) const MIN_ANNOUNCED_IN_FLIGHT: usize = crate::validate::MIN_ANNOUNCED_IN_FLIGHT as usize;
+/// Fewest stream keys a session can be configured for. Local rather than
+/// announced, so §11.2 does not bound it, but a session that may hold no key
+/// open at all refuses its own first `emit`.
+pub(crate) const MIN_OPEN_STREAM_KEYS: usize = 1;
 /// `error.details.kind` on the refusal that says the responder is full (§11.2).
 pub const IN_FLIGHT_LIMIT_KIND: &str = "in_flight_limit";
 /// `error.details.kind` on the local refusal of one stream key too many (§11.2).
@@ -58,6 +67,10 @@ pub struct SessionOptions {
     pub protocol: ProtocolVersion,
     /// Largest frame this side accepts. `None` defers to the port's own
     /// ceiling, then to [`crate::codec::ndjson::DEFAULT_MAX_FRAME_BYTES`].
+    /// Set, the session announces the *lower* of this and the port's own
+    /// ceiling: a session option narrows what the port decodes, it never
+    /// widens it, so the peer is never told to send more than the port
+    /// actually accepts.
     pub max_frame_bytes: Option<usize>,
     /// How many requests this side will answer at once. Past it a `req` is
     /// refused with `UNAVAILABLE` and `details.kind` of `in_flight_limit`,
@@ -150,13 +163,22 @@ impl SessionOptions {
     }
 
     /// Sets the largest frame this side accepts.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `max_frame_bytes` is below
+    /// [`crate::codec::ndjson::MIN_MAX_FRAME_BYTES`], naming both.
     #[must_use]
     pub fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Self {
-        self.max_frame_bytes = Some(max_frame_bytes);
+        self.max_frame_bytes = Some(crate::codec::limits::check_max_frame_bytes(max_frame_bytes));
         self
     }
 
     /// Sets how many requests this side will answer at once (§11.2).
+    ///
+    /// # Panics
+    ///
+    /// Panics when `max_in_flight` is `0`, naming both.
     ///
     /// # Example
     ///
@@ -169,12 +191,20 @@ impl SessionOptions {
     /// assert_eq!(options.max_in_flight, 8);
     /// ```
     #[must_use]
-    pub const fn with_max_in_flight(mut self, max_in_flight: usize) -> Self {
-        self.max_in_flight = max_in_flight;
+    pub fn with_max_in_flight(mut self, max_in_flight: usize) -> Self {
+        self.max_in_flight = crate::codec::limits::check_at_least(
+            "max_in_flight",
+            max_in_flight,
+            MIN_ANNOUNCED_IN_FLIGHT,
+        );
         self
     }
 
     /// Sets how many stream keys this side will emit on at once (§11.2).
+    ///
+    /// # Panics
+    ///
+    /// Panics when `max_stream_keys` is `0`, naming both.
     ///
     /// # Example
     ///
@@ -187,8 +217,12 @@ impl SessionOptions {
     /// assert_eq!(options.max_stream_keys, 4);
     /// ```
     #[must_use]
-    pub const fn with_max_stream_keys(mut self, max_stream_keys: usize) -> Self {
-        self.max_stream_keys = max_stream_keys;
+    pub fn with_max_stream_keys(mut self, max_stream_keys: usize) -> Self {
+        self.max_stream_keys = crate::codec::limits::check_at_least(
+            "max_stream_keys",
+            max_stream_keys,
+            MIN_OPEN_STREAM_KEYS,
+        );
         self
     }
 
@@ -251,5 +285,65 @@ impl SessionOptions {
     pub fn handle(mut self, method: impl Into<String>, handler: impl Handler) -> Self {
         self.handlers.push((method.into(), Arc::new(handler)));
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionOptions;
+    use crate::codec::limits::panic_message;
+    use crate::codec::ndjson::MIN_MAX_FRAME_BYTES;
+    use crate::frame::PeerInfo;
+
+    fn peer() -> PeerInfo {
+        PeerInfo {
+            name: "hub".into(),
+            version: "1.0.0".into(),
+            role: "hub".into(),
+        }
+    }
+
+    /// One expected panic message and the builder call that must produce it.
+    type PanicCase = (&'static str, Box<dyn FnOnce()>);
+
+    /// Every builder here panics naming the value and the floor it broke,
+    /// rather than building an option a peer's schema would refuse anyway.
+    #[test]
+    fn a_ceiling_below_its_floor_panics_naming_both() {
+        let cases: [PanicCase; 3] = [
+            (
+                "max_frame_bytes is 512; expected at least 4096",
+                Box::new(|| {
+                    let _ = SessionOptions::new(peer()).with_max_frame_bytes(512);
+                }),
+            ),
+            (
+                "max_in_flight is 0; expected at least 1",
+                Box::new(|| {
+                    let _ = SessionOptions::new(peer()).with_max_in_flight(0);
+                }),
+            ),
+            (
+                "max_stream_keys is 0; expected at least 1",
+                Box::new(|| {
+                    let _ = SessionOptions::new(peer()).with_max_stream_keys(0);
+                }),
+            ),
+        ];
+        for (expected, body) in cases {
+            assert_eq!(panic_message(body), expected);
+        }
+    }
+
+    #[test]
+    fn a_ceiling_at_its_floor_is_accepted() {
+        let options = SessionOptions::new(peer()).with_max_frame_bytes(MIN_MAX_FRAME_BYTES);
+        assert_eq!(options.max_frame_bytes, Some(MIN_MAX_FRAME_BYTES));
+
+        let options = SessionOptions::new(peer())
+            .with_max_in_flight(1)
+            .with_max_stream_keys(1);
+        assert_eq!(options.max_in_flight, 1);
+        assert_eq!(options.max_stream_keys, 1);
     }
 }

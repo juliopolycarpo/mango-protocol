@@ -166,6 +166,55 @@ and `details.kind` of `in_flight_limit`; that refusal is **retryable** — send 
 once one of yours has settled, and never latch on it the way you would on `METHOD_UNSUPPORTED`.
 `max_stream_keys` is local and never announced: `emit` returns `Err` when a new key would pass
 it, because reaching it means this side leaked stream ids rather than that the peer did anything.
+`emit`'s `Ok(false)` means more than "not ready yet", too: it also covers a driver that has
+stopped, and either way the stream key `emit` was called with is never spent — a session whose
+driver died does not burn its `max_stream_keys` budget on frames nobody saw.
+
+`with_max_frame_bytes` sets what this session *asks for*; the port it opens over may decode less.
+The session announces the lower of the two — never the session's own ceiling outright — so a
+session configured above a port's ceiling never tells the peer to send frames the port then
+refuses.
+
+A frame or message ceiling set below what the spec allows panics at configuration, naming the
+value and the floor it broke, the way the TypeScript SDK raises a `RangeError` for the same call.
+`with_max_in_flight` and `with_max_stream_keys` carry the same rule at a floor of `1`: `0` would
+build a `hello.limits.maxInFlight` the schema refuses, or make the very first `emit` answer
+`UNAVAILABLE`.
+
+**Upgrading from `0.1`:** that check costs six constructors their `const fn`. The message names
+the value received and the floor it broke, which means building a `String`, and a formatted panic
+cannot appear in a `const fn`. The six are `LineDecoder::new`, `ChunkReassembler::new`,
+`SessionOptions::with_max_in_flight`, `SessionOptions::with_max_stream_keys`,
+`WebSocketOptions::with_max_frame_bytes` and `WebSocketOptions::with_max_message_bytes`.
+
+Only the first two can break your build. The other four are builders taking `self`, and the
+receiver they need — `SessionOptions::new`, which allocates a `String`, or
+`WebSocketOptions::default` — was never `const` itself, so no caller could reach them from a
+`const` context in `0.1` either.
+
+Calling either of the first two at run time is unchanged. What stops compiling is a `const` item,
+a `static`, or your own `const fn` built on one:
+
+```rust,ignore
+// 0.1: fine. 0.2.0: error[E0015], cannot call non-const fn in constants.
+static DECODER: LineDecoder = LineDecoder::new(DEFAULT_MAX_FRAME_BYTES);
+```
+
+A `OnceLock` gives you the same single instance, and takes the floor check with it:
+
+```rust,ignore
+use std::sync::OnceLock;
+use mango_protocol::codec::ndjson::{DEFAULT_MAX_FRAME_BYTES, LineDecoder};
+
+static DECODER: OnceLock<LineDecoder> = OnceLock::new();
+let decoder = DECODER.get_or_init(|| LineDecoder::new(DEFAULT_MAX_FRAME_BYTES));
+```
+
+A decoder carries per-connection buffer state, so one per connection is usually what you want
+rather than a shared one.
+
+`cargo-semver-checks` reports these as `inherent_method_const_removed` against the published
+`0.1.0`, and it is right to.
 
 ## Serve a contract
 
@@ -208,6 +257,15 @@ let (port, identity) = listener.accept().await?;
 let deadline = ConnectDeadline::default().with_timeout(Duration::from_secs(5));
 let port = connect_ipc(ipc_path("mango-hub")?, &deadline).await?;
 ```
+
+On POSIX, `listen_ipc` treats a socket file at the address as *stale* — and replaces it — only
+when a connection to it is refused; a connection that succeeds, or one the dial cannot judge
+either way, leaves the address in use and `listen_ipc` refuses to bind. `IpcListener::close` only
+ever removes the address when it is still this listener's own: the inode recorded when it
+published is checked against what sits at the path, so a listener that crashed and was replaced
+does not delete its replacement's address by closing a handle late. Windows has no equivalent
+staleness question — `CreateNamedPipe`'s first-instance flag already refuses a duplicate name
+outright.
 
 The WebSocket transport dials with the `mango.v1` subprotocol and the reference bearer
 credential, and accepts an upgrade either through its own helper or from whatever HTTP stack you
@@ -266,7 +324,10 @@ if session.ready().await.is_err() {
 }
 // Closing the session ends the child's stdin, which is step 1 of the
 // sequence and all a conforming peer needs; `terminate` waits that out and
-// escalates to SIGTERM and SIGKILL for a child that does not leave.
+// escalates to SIGTERM and SIGKILL for a child that does not leave. It gives
+// up and resolves `None` once the exit grace runs out after SIGKILL, so a
+// shutdown awaiting it is delayed but never blocked forever; `exited` is the
+// call to await for the real exit — it has no deadline.
 session.close(close_codes::RELEASED, Some("done")).await;
 peer.terminate().await;
 

@@ -26,11 +26,16 @@ jobs:
       matrix:
         include:
           - target: decode_line
+            # The ceiling under test starts at the codec's own floor of 4096,
+            # which the default -max_len (~4096) can only just reach; a line
+            # over the limit needs room past it.
             features: ""
-            extra_args: ""
+            extra_args: "-max_len=16384"
           - target: line_decoder_push
+            # Same reason as decode_line: the too-large refusal is the path
+            # where the whole-push and split-push decoders once disagreed.
             features: ""
-            extra_args: ""
+            extra_args: "-max_len=16384"
           - target: chunk_reassembler_push
             # The default libFuzzer -max_len (~4096) never reaches a
             # multi-chunk message; the chunk framing's own floor is 2048.

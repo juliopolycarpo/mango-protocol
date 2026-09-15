@@ -213,6 +213,73 @@ describe('Session handshake', () => {
     expect(session.sendLimitBytes).toBe(4096);
     session.close();
   });
+
+  it('announces the lower of its own ceiling and the one the port decodes', async () => {
+    // A port that only decodes 4096 cannot be talked into accepting 8192 by a
+    // session option: announcing the higher number invites the peer to send a
+    // frame the port will refuse, and the refusal ends the session.
+    const ports = createInProcessPortPair({ maxFrameBytes: 4096 });
+    const recorder = new FrameRecorder(ports.b);
+    const session = new Session(ports.a, {
+      peer: HUB,
+      maxFrameBytes: 8192,
+      livenessIntervalMs: false,
+    });
+    const hello = await recorder.until((frame) => frame.type === 'hello');
+    expect(hello).toMatchObject({ type: 'hello', limits: { maxFrameBytes: 4096 } });
+    ports.b.send(rawHello());
+    await session.ready;
+    expect(session.sendLimitBytes).toBe(4096);
+    session.close();
+  });
+
+  it('refuses a frame ceiling below the floor of the wire', () => {
+    // 512 would build a `hello` whose `limits.maxFrameBytes` the schema
+    // refuses, killing the session at the handshake rather than at the call
+    // that set it. It is refused where it was written instead.
+    const ports = createInProcessPortPair();
+    expect(() => new Session(ports.a, { peer: HUB, maxFrameBytes: 512 })).toThrow(
+      new RangeError('maxFrameBytes is 512; expected an integer of at least 4096')
+    );
+  });
+
+  it.each([
+    ['maxInFlight', 0, 'maxInFlight is 0; expected an integer of at least 1'],
+    ['maxInFlight', 1.5, 'maxInFlight is 1.5; expected an integer of at least 1'],
+    ['maxStreamKeys', 0, 'maxStreamKeys is 0; expected an integer of at least 1'],
+  ])('refuses %s of %p at construction', (option, value, message) => {
+    // `maxInFlight: 0` announces a limit the schema refuses and `maxStreamKeys:
+    // 0` refuses the session's own first emit; neither is a configuration a
+    // caller can have meant, so it is refused where it was written.
+    const ports = createInProcessPortPair();
+    expect(() => new Session(ports.a, { peer: HUB, [option]: value })).toThrow(
+      new RangeError(message)
+    );
+  });
+
+  it('refuses a port whose own ceiling is below the floor of the wire', () => {
+    // `Port.maxFrameBytes` is a plain number on an interface applications
+    // implement, and the session now takes the lower of the two ceilings —
+    // so a low one would quietly drag a perfectly valid option under the
+    // floor, and the handshake would die naming neither number.
+    class NarrowPort extends FakePort {
+      readonly maxFrameBytes = 1024;
+    }
+    expect(() => new Session(new NarrowPort(), { peer: HUB, maxFrameBytes: 65_536 })).toThrow(
+      new RangeError('port maxFrameBytes is 1024; expected an integer of at least 4096')
+    );
+  });
+
+  it('keeps a port ceiling above the default when no option asks for less', async () => {
+    // The option is absent, so the port's own ceiling is the answer whole; a
+    // transport that can carry more than 16 MiB is not clamped back to it.
+    const ports = createInProcessPortPair({ maxFrameBytes: 32 * 1024 * 1024 });
+    const session = new Session(ports.a, { peer: HUB, livenessIntervalMs: false });
+    ports.b.send({ ...rawHello(), limits: { maxFrameBytes: 32 * 1024 * 1024 } });
+    await session.ready;
+    expect(session.sendLimitBytes).toBe(32 * 1024 * 1024);
+    session.close();
+  });
 });
 
 describe('Session close', () => {

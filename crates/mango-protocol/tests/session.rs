@@ -12,7 +12,7 @@ use mango_protocol::error::{CodecErrorKind, RemoteError, codes};
 use mango_protocol::frame::{
     Cancel, Close, ErrorPayload, ErrorResponse, Hello, Limits, PeerInfo, Request, Response,
 };
-use mango_protocol::port::{Inbound, PortClosure, port_pair};
+use mango_protocol::port::{Inbound, MemoryPortOptions, PortClosure, port_pair, port_pair_with};
 use mango_protocol::session::{
     CallContext, DEFAULT_HANDSHAKE_TIMEOUT, EventInput, HANDSHAKE_TIMEOUT_REASON, RequestOptions,
     Session, SessionOptions, SessionState,
@@ -354,6 +354,108 @@ async fn announces_its_frame_ceiling_and_honours_the_lower_one() {
         .await
         .expect("handshake succeeds");
     assert_eq!(session.send_limit_bytes(), 4096);
+}
+
+#[tokio::test]
+async fn a_session_ceiling_above_the_ports_own_is_clamped_to_it() {
+    // A session option narrows the port's ceiling; it must never replace it.
+    // The port here only decodes 4096, so a session configured at 8192 must
+    // still announce 4096 — otherwise the peer sends frames this port then
+    // refuses.
+    let (a, b) = port_pair_with(MemoryPortOptions {
+        max_frame_bytes: Some(4096),
+        validate_frames: true,
+    });
+    let options = SessionOptions::new(peer("a")).with_max_frame_bytes(8192);
+    let (_session, _driver) = Session::spawn(a, options);
+    let mut raw = RawPeer::new(b);
+
+    let sent_hello = within(
+        "the session's own hello",
+        raw.until(|frame| matches!(frame, Frame::Hello(_))),
+    )
+    .await;
+    let Frame::Hello(sent_hello) = sent_hello else {
+        unreachable!("until() only returns a frame matching the predicate")
+    };
+    assert_eq!(
+        sent_hello.limits,
+        Some(Limits {
+            max_frame_bytes: Some(4096),
+            max_in_flight: None,
+        }),
+        "expected 4096, received {:?}",
+        sent_hello.limits
+    );
+}
+
+#[tokio::test]
+async fn an_unset_session_ceiling_still_defers_to_a_port_ceiling_above_the_default() {
+    // No `with_max_frame_bytes` call: the session must defer to the port's
+    // own ceiling even when that ceiling sits above the 16 MiB default,
+    // rather than silently clamping it down to the default.
+    let port_ceiling = mango_protocol::codec::ndjson::DEFAULT_MAX_FRAME_BYTES + 4096;
+    let (a, b) = port_pair_with(MemoryPortOptions {
+        max_frame_bytes: Some(port_ceiling),
+        validate_frames: false,
+    });
+    let (session, _driver) = Session::spawn(a, SessionOptions::new(peer("a")));
+    let mut raw = RawPeer::new(b);
+
+    raw.send(Frame::Hello(Hello {
+        protocol: mango_protocol::PROTOCOL_VERSION,
+        peer: peer("b"),
+        capabilities: Default::default(),
+        limits: Some(Limits {
+            max_frame_bytes: Some(port_ceiling as u64),
+            max_in_flight: None,
+        }),
+    }))
+    .await;
+
+    within("ready()", session.ready())
+        .await
+        .expect("handshake succeeds");
+    assert_eq!(session.send_limit_bytes(), port_ceiling);
+}
+
+#[test]
+#[should_panic(expected = "max_frame_bytes is 512; expected at least 4096")]
+fn opening_a_session_refuses_a_sub_floor_ceiling_set_directly_on_the_pub_field() {
+    // `max_frame_bytes` is `pub`, so a caller can set it without
+    // `with_max_frame_bytes` ever running its floor check. `Session::open`
+    // re-checks it, even though `with_max_frame_bytes` already panics on the
+    // builder path — the field is a second door into the same value.
+    let (a, _b) = port_pair();
+    let mut options = SessionOptions::new(peer("a"));
+    options.max_frame_bytes = Some(512);
+    let _ = Session::open(a, options);
+}
+
+#[test]
+#[should_panic(expected = "max_in_flight is 0; expected at least 1")]
+fn opening_a_session_refuses_a_zero_max_in_flight_set_directly_on_the_pub_field() {
+    // A zero here would build a `hello.limits.maxInFlight` the schema
+    // refuses, so the peer's handshake would die on a decode error rather
+    // than a clear local one. `max_in_flight` is `pub`, so `with_max_in_flight`
+    // alone is not enough.
+    let (a, _b) = port_pair();
+    let mut options = SessionOptions::new(peer("a"));
+    options.max_in_flight = 0;
+    let _ = Session::open(a, options);
+}
+
+#[test]
+#[should_panic(expected = "max_stream_keys is 0; expected at least 1")]
+fn opening_a_session_refuses_a_zero_max_stream_keys_set_directly_on_the_pub_field() {
+    // A zero here makes the very first `emit` answer UNAVAILABLE, because
+    // `sequences.len() >= limit` is true for any new key when the limit is
+    // zero. `max_stream_keys` is `pub`, so `with_max_stream_keys` alone is
+    // not enough.
+    let (a, _b) = port_pair();
+    let mut options = SessionOptions::new(peer("a"));
+    options.max_stream_keys = 0;
+    let _ = Session::open(a, options);
 }
 
 #[tokio::test]
@@ -944,6 +1046,45 @@ async fn sequences_events_per_stream_key_and_releases_the_counter_on_end() {
             ("fs.tick".to_string(), None, 0, false),
         ]
     );
+}
+
+#[tokio::test]
+async fn emit_burns_no_stream_key_when_the_driver_is_gone() {
+    // `state()` only changes when the driver runs, so it stays `Ready` after
+    // the driver task is aborted — `emit`'s top-of-function short circuit
+    // never fires, and the send to the (now gone) driver is what must fail.
+    let (a, b) = port_pair();
+    let options_a = SessionOptions::new(peer("a")).with_max_stream_keys(1);
+    let (session_a, driver_a) = Session::spawn(a, options_a);
+    let (session_b, _driver_b) = Session::spawn(b, SessionOptions::new(peer("b")));
+
+    within("a's ready()", session_a.ready())
+        .await
+        .expect("handshake succeeds");
+    within("b's ready()", session_b.ready())
+        .await
+        .expect("handshake succeeds");
+
+    driver_a.abort();
+    let _ = driver_a.await;
+
+    let first = session_a.emit(EventInput {
+        topic: "stream.a".into(),
+        payload: Value::Null,
+        stream_id: None,
+        end: false,
+    });
+    assert_eq!(first, Ok(false), "expected Ok(false), received {first:?}");
+
+    // A ceiling of 1: if the first emit had burned its key, this one would
+    // come back UNAVAILABLE instead of Ok — proof the key was never spent.
+    let second = session_a.emit(EventInput {
+        topic: "stream.b".into(),
+        payload: Value::Null,
+        stream_id: None,
+        end: false,
+    });
+    assert_eq!(second, Ok(false), "expected Ok(false), received {second:?}");
 }
 
 #[tokio::test]
