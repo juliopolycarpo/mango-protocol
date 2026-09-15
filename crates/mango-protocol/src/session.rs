@@ -61,11 +61,13 @@ impl Session {
     /// # Panics
     ///
     /// Panics when `options.max_frame_bytes` is `Some` value below
-    /// [`crate::codec::ndjson::MIN_MAX_FRAME_BYTES`], naming both. Likewise
-    /// for `options.max_in_flight` or `options.max_stream_keys` at `0`.
-    /// `SessionOptions`'s builders already refuse these on the builder path,
-    /// but every field involved is `pub`, so this is the check for a caller
-    /// that assigned one directly.
+    /// [`crate::codec::ndjson::MIN_MAX_FRAME_BYTES`], naming both — and the
+    /// same for `port`'s own ceiling, an application-defined [`Port`] being
+    /// as free to report a sub-floor value as a caller is to set the option
+    /// directly. Likewise for `options.max_in_flight` or
+    /// `options.max_stream_keys` at `0`. `SessionOptions`'s builders already
+    /// refuse these on the builder path, but every field involved is `pub`,
+    /// so this is the check for a caller that assigned one directly.
     #[must_use]
     pub fn open<P: Port>(
         port: P,
@@ -80,13 +82,16 @@ impl Session {
         // unchanged, and never clamped down to the default on its own.
         let local_max_frame_bytes = match (options.max_frame_bytes, port_max_frame_bytes) {
             (Some(session_ceiling), Some(port_ceiling)) => {
-                check_at_least("max_frame_bytes", session_ceiling, MIN_MAX_FRAME_BYTES)
-                    .min(port_ceiling)
+                check_at_least("max_frame_bytes", session_ceiling, MIN_MAX_FRAME_BYTES).min(
+                    check_at_least("port max_frame_bytes", port_ceiling, MIN_MAX_FRAME_BYTES),
+                )
             }
             (Some(session_ceiling), None) => {
                 check_at_least("max_frame_bytes", session_ceiling, MIN_MAX_FRAME_BYTES)
             }
-            (None, Some(port_ceiling)) => port_ceiling,
+            (None, Some(port_ceiling)) => {
+                check_at_least("port max_frame_bytes", port_ceiling, MIN_MAX_FRAME_BYTES)
+            }
             (None, None) => DEFAULT_MAX_FRAME_BYTES,
         };
         let max_in_flight = check_at_least("max_in_flight", options.max_in_flight, 1);
@@ -174,5 +179,60 @@ impl Session {
         let (session, driver) = Self::open(port, options);
         let handle = tokio::spawn(driver.run());
         (session, handle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::codec::limits::panic_message;
+    use crate::frame::PeerInfo;
+    use crate::port::{Port, port_pair};
+    use crate::session::{Session, SessionOptions};
+
+    fn peer() -> PeerInfo {
+        PeerInfo {
+            name: "hub".into(),
+            version: "1.0.0".into(),
+            role: "hub".into(),
+        }
+    }
+
+    /// A port that reports whatever ceiling the test asks for, regardless of
+    /// whether that ceiling would itself pass [`crate::codec::limits::check_at_least`] —
+    /// standing in for an application-defined [`Port`] this crate does not
+    /// control, as opposed to [`crate::port::MemoryPort`], which already
+    /// refuses a sub-floor ceiling before `Session::open` is ever reached.
+    struct FixedCeilingPort<P: Port> {
+        inner: P,
+        max_frame_bytes: Option<usize>,
+    }
+
+    impl<P: Port> Port for FixedCeilingPort<P> {
+        type Tx = P::Tx;
+        type Rx = P::Rx;
+
+        fn max_frame_bytes(&self) -> Option<usize> {
+            self.max_frame_bytes
+        }
+
+        fn split(self) -> (Self::Tx, Self::Rx) {
+            self.inner.split()
+        }
+    }
+
+    #[test]
+    fn a_ports_own_sub_floor_ceiling_panics_naming_both() {
+        let message = panic_message(|| {
+            let (port, _peer_port) = port_pair();
+            let port = FixedCeilingPort {
+                inner: port,
+                max_frame_bytes: Some(1024),
+            };
+            let _ = Session::open(port, SessionOptions::new(peer()));
+        });
+        assert_eq!(
+            message,
+            "port max_frame_bytes is 1024; expected at least 4096"
+        );
     }
 }
