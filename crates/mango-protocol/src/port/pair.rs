@@ -2,10 +2,8 @@
 
 use tokio::sync::mpsc;
 
-use crate::codec::limits::check_at_least;
-use crate::codec::ndjson::{
-    DEFAULT_MAX_FRAME_BYTES, MIN_MAX_FRAME_BYTES, decode_line, encode_frame_bytes,
-};
+use crate::codec::limits::check_max_frame_bytes;
+use crate::codec::ndjson::{DEFAULT_MAX_FRAME_BYTES, decode_line, encode_frame_bytes};
 use crate::frame::Frame;
 
 use super::{Inbound, Port, PortClosure, PortRx, PortTx, SendOutcome};
@@ -120,11 +118,11 @@ pub fn port_pair() -> (MemoryPort, MemoryPort) {
 /// # Panics
 ///
 /// Panics when `options.max_frame_bytes` is `Some` value below
-/// [`MIN_MAX_FRAME_BYTES`], naming both.
+/// [`crate::codec::ndjson::MIN_MAX_FRAME_BYTES`], naming both.
 #[must_use]
 pub fn port_pair_with(options: MemoryPortOptions) -> (MemoryPort, MemoryPort) {
     if let Some(max_frame_bytes) = options.max_frame_bytes {
-        let _ = check_at_least("max_frame_bytes", max_frame_bytes, MIN_MAX_FRAME_BYTES);
+        let _ = check_max_frame_bytes(max_frame_bytes);
     }
     let (a_to_b, b_from_a) = mpsc::unbounded_channel();
     let (b_to_a, a_from_b) = mpsc::unbounded_channel();

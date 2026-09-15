@@ -34,6 +34,32 @@ pub fn check_at_least(name: &str, value: usize, floor: usize) -> usize {
     value
 }
 
+/// [`check_at_least`] for the one ceiling nearly every builder in this crate
+/// takes: the frame limit, against [`crate::codec::ndjson::MIN_MAX_FRAME_BYTES`].
+/// Every transport's `with_max_frame_bytes` spells the same rule, so it is
+/// spelled once here.
+///
+/// # Panics
+///
+/// Panics when `max_frame_bytes` is below
+/// [`crate::codec::ndjson::MIN_MAX_FRAME_BYTES`], naming both.
+///
+/// # Example
+///
+/// ```
+/// use mango_protocol::codec::limits::check_max_frame_bytes;
+///
+/// assert_eq!(check_max_frame_bytes(8192), 8192);
+/// ```
+#[must_use]
+pub fn check_max_frame_bytes(max_frame_bytes: usize) -> usize {
+    check_at_least(
+        "max_frame_bytes",
+        max_frame_bytes,
+        crate::codec::ndjson::MIN_MAX_FRAME_BYTES,
+    )
+}
+
 /// [`check_at_least`]'s rule for a caller that must return a `Result`
 /// instead of panicking: `Ok(value)` at or above `floor`, an `Err` naming
 /// both otherwise.
@@ -82,7 +108,26 @@ pub(crate) fn panic_message(body: impl FnOnce()) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_at_least, checked_at_least, panic_message};
+    use super::{check_at_least, check_max_frame_bytes, checked_at_least, panic_message};
+    use crate::codec::ndjson::MIN_MAX_FRAME_BYTES;
+
+    #[test]
+    fn the_frame_ceiling_rule_names_the_floor_of_the_wire() {
+        assert_eq!(
+            check_max_frame_bytes(MIN_MAX_FRAME_BYTES),
+            MIN_MAX_FRAME_BYTES
+        );
+        let message = panic_message(|| {
+            let _ = check_max_frame_bytes(MIN_MAX_FRAME_BYTES - 1);
+        });
+        assert_eq!(
+            message,
+            format!(
+                "max_frame_bytes is {}; expected at least {MIN_MAX_FRAME_BYTES}",
+                MIN_MAX_FRAME_BYTES - 1
+            )
+        );
+    }
 
     #[test]
     fn accepts_a_value_at_or_above_the_floor() {

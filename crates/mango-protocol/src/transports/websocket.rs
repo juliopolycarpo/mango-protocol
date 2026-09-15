@@ -106,11 +106,7 @@ impl WebSocketOptions {
     /// ```
     #[must_use]
     pub fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Self {
-        self.max_frame_bytes = crate::codec::limits::check_at_least(
-            "max_frame_bytes",
-            max_frame_bytes,
-            crate::codec::ndjson::MIN_MAX_FRAME_BYTES,
-        );
+        self.max_frame_bytes = crate::codec::limits::check_max_frame_bytes(max_frame_bytes);
         self
     }
 

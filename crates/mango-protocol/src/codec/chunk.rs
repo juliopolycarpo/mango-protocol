@@ -5,8 +5,8 @@
 //! line without its terminator. Chunks of two frames never interleave, so one
 //! [`ChunkReassembler`] per connection is enough.
 
-use crate::codec::limits::check_at_least;
-use crate::codec::ndjson::{MIN_MAX_FRAME_BYTES, decode_line, encode_frame_bytes};
+use crate::codec::limits::{check_at_least, check_max_frame_bytes};
+use crate::codec::ndjson::{decode_line, encode_frame_bytes};
 use crate::error::{CodecError, CodecErrorKind};
 use crate::frame::Frame;
 
@@ -134,7 +134,8 @@ impl ChunkReassembler {
     /// # Panics
     ///
     /// Panics when `max_message_bytes` is below [`MIN_MAX_MESSAGE_BYTES`] or
-    /// `max_frame_bytes` is below [`MIN_MAX_FRAME_BYTES`], naming both.
+    /// `max_frame_bytes` is below [`crate::codec::ndjson::MIN_MAX_FRAME_BYTES`],
+    /// naming both.
     ///
     /// # Example
     ///
@@ -153,8 +154,7 @@ impl ChunkReassembler {
             max_message_bytes,
             MIN_MAX_MESSAGE_BYTES,
         );
-        let max_frame_bytes =
-            check_at_least("max_frame_bytes", max_frame_bytes, MIN_MAX_FRAME_BYTES);
+        let max_frame_bytes = check_max_frame_bytes(max_frame_bytes);
         Self {
             max_message_bytes,
             max_frame_bytes,

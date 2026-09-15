@@ -304,11 +304,7 @@ impl SpawnOptions {
     /// ```
     #[must_use]
     pub fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Self {
-        self.max_frame_bytes = Some(crate::codec::limits::check_at_least(
-            "max_frame_bytes",
-            max_frame_bytes,
-            crate::codec::ndjson::MIN_MAX_FRAME_BYTES,
-        ));
+        self.max_frame_bytes = Some(crate::codec::limits::check_max_frame_bytes(max_frame_bytes));
         self
     }
 
@@ -495,11 +491,7 @@ fn is_secret_shaped(upper: &str) -> bool {
 /// signal it.
 pub fn spawn_port(options: SpawnOptions) -> Result<(SpawnPort, LaunchedPeer), SpawnArgvError> {
     if let Some(max_frame_bytes) = options.max_frame_bytes {
-        let _ = crate::codec::limits::check_at_least(
-            "max_frame_bytes",
-            max_frame_bytes,
-            crate::codec::ndjson::MIN_MAX_FRAME_BYTES,
-        );
+        let _ = crate::codec::limits::check_max_frame_bytes(max_frame_bytes);
     }
     let command = match options.argv.first() {
         Some(command) if !command.is_empty() => command.clone(),

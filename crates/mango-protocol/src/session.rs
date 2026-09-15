@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-use crate::codec::limits::check_at_least;
+use crate::codec::limits::{check_at_least, check_max_frame_bytes};
 use crate::codec::ndjson::{DEFAULT_MAX_FRAME_BYTES, MIN_MAX_FRAME_BYTES};
 use crate::port::Port;
 
@@ -37,6 +37,8 @@ pub use options::{
     HANDSHAKE_TIMEOUT_REASON, IN_FLIGHT_LIMIT_KIND, STREAM_KEY_LIMIT_KIND, SessionOptions,
 };
 pub use teardown::SessionClosure;
+
+use options::{MIN_ANNOUNCED_IN_FLIGHT, MIN_OPEN_STREAM_KEYS};
 
 use shared::{Inner, Shared};
 
@@ -80,22 +82,24 @@ impl Session {
         // more than it accepts would make the peer send frames this side
         // then refuses. Unset defers to the port, then to the default —
         // unchanged, and never clamped down to the default on its own.
-        let local_max_frame_bytes = match (options.max_frame_bytes, port_max_frame_bytes) {
-            (Some(session_ceiling), Some(port_ceiling)) => {
-                check_at_least("max_frame_bytes", session_ceiling, MIN_MAX_FRAME_BYTES).min(
-                    check_at_least("port max_frame_bytes", port_ceiling, MIN_MAX_FRAME_BYTES),
-                )
-            }
-            (Some(session_ceiling), None) => {
-                check_at_least("max_frame_bytes", session_ceiling, MIN_MAX_FRAME_BYTES)
-            }
-            (None, Some(port_ceiling)) => {
-                check_at_least("port max_frame_bytes", port_ceiling, MIN_MAX_FRAME_BYTES)
-            }
+        let session_ceiling = options.max_frame_bytes.map(check_max_frame_bytes);
+        let port_ceiling = port_max_frame_bytes
+            .map(|ceiling| check_at_least("port max_frame_bytes", ceiling, MIN_MAX_FRAME_BYTES));
+        let local_max_frame_bytes = match (session_ceiling, port_ceiling) {
+            (Some(session), Some(port)) => session.min(port),
+            (Some(only), None) | (None, Some(only)) => only,
             (None, None) => DEFAULT_MAX_FRAME_BYTES,
         };
-        let max_in_flight = check_at_least("max_in_flight", options.max_in_flight, 1);
-        let max_stream_keys = check_at_least("max_stream_keys", options.max_stream_keys, 1);
+        let max_in_flight = check_at_least(
+            "max_in_flight",
+            options.max_in_flight,
+            MIN_ANNOUNCED_IN_FLIGHT,
+        );
+        let max_stream_keys = check_at_least(
+            "max_stream_keys",
+            options.max_stream_keys,
+            MIN_OPEN_STREAM_KEYS,
+        );
         let (ready, _) = watch::channel(None);
         let (closure, _) = watch::channel(None);
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();

@@ -20,6 +20,15 @@ pub const DEFAULT_HANDLER_GRACE: Duration = Duration::from_secs(5);
 pub const DEFAULT_MAX_IN_FLIGHT: usize = 256;
 /// 1024: the default [`SessionOptions::max_stream_keys`] (§11.2).
 pub const DEFAULT_MAX_STREAM_KEYS: usize = 1024;
+/// Fewest requests a session can be configured to answer at once: `0` would
+/// build a `hello.limits.maxInFlight` the schema refuses (§11.2). The same
+/// floor as [`crate::validate::MIN_ANNOUNCED_IN_FLIGHT`] and carrying its
+/// name, which is the one `session.ts` uses for it too.
+pub(crate) const MIN_ANNOUNCED_IN_FLIGHT: usize = crate::validate::MIN_ANNOUNCED_IN_FLIGHT as usize;
+/// Fewest stream keys a session can be configured for. Local rather than
+/// announced, so §11.2 does not bound it, but a session that may hold no key
+/// open at all refuses its own first `emit`.
+pub(crate) const MIN_OPEN_STREAM_KEYS: usize = 1;
 /// `error.details.kind` on the refusal that says the responder is full (§11.2).
 pub const IN_FLIGHT_LIMIT_KIND: &str = "in_flight_limit";
 /// `error.details.kind` on the local refusal of one stream key too many (§11.2).
@@ -161,11 +170,7 @@ impl SessionOptions {
     /// [`crate::codec::ndjson::MIN_MAX_FRAME_BYTES`], naming both.
     #[must_use]
     pub fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Self {
-        self.max_frame_bytes = Some(crate::codec::limits::check_at_least(
-            "max_frame_bytes",
-            max_frame_bytes,
-            crate::codec::ndjson::MIN_MAX_FRAME_BYTES,
-        ));
+        self.max_frame_bytes = Some(crate::codec::limits::check_max_frame_bytes(max_frame_bytes));
         self
     }
 
@@ -187,8 +192,11 @@ impl SessionOptions {
     /// ```
     #[must_use]
     pub fn with_max_in_flight(mut self, max_in_flight: usize) -> Self {
-        self.max_in_flight =
-            crate::codec::limits::check_at_least("max_in_flight", max_in_flight, 1);
+        self.max_in_flight = crate::codec::limits::check_at_least(
+            "max_in_flight",
+            max_in_flight,
+            MIN_ANNOUNCED_IN_FLIGHT,
+        );
         self
     }
 
@@ -210,8 +218,11 @@ impl SessionOptions {
     /// ```
     #[must_use]
     pub fn with_max_stream_keys(mut self, max_stream_keys: usize) -> Self {
-        self.max_stream_keys =
-            crate::codec::limits::check_at_least("max_stream_keys", max_stream_keys, 1);
+        self.max_stream_keys = crate::codec::limits::check_at_least(
+            "max_stream_keys",
+            max_stream_keys,
+            MIN_OPEN_STREAM_KEYS,
+        );
         self
     }
 
