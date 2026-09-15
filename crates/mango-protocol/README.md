@@ -6,7 +6,7 @@ sockets and WebSocket. The TypeScript SDK `@mangostudio/protocol` reads the same
 
 ```toml
 [dependencies]
-mango-protocol = "0.1"
+mango-protocol = "0.2"
 ```
 
 ```rust

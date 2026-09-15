@@ -27,7 +27,7 @@ build implements and negotiates the lower minor with the peer.
 
 ## Pinning
 
-Pin the package with a caret requirement (`^0.1.0`, `mango-protocol = "0.1"`). Before `1.0.0`
+Pin the package with a caret requirement (`^0.2.0`, `mango-protocol = "0.2"`). Before `1.0.0`
 a minor package release may still change the wire, and the changelog says so under a
 "Breaking" heading; read it before upgrading one side of a deployment without the other.
 

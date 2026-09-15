@@ -9,7 +9,7 @@ the [transports](#transports) that session is opened over.
 
 ```toml
 [dependencies]
-mango-protocol = { version = "0.1", features = ["tokio"] }
+mango-protocol = { version = "0.2", features = ["tokio"] }
 serde_json = "1"
 ```
 

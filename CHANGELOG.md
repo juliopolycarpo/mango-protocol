@@ -4,6 +4,50 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.2.0] - 2026-09-15
+
+### 💥 Breaking Changes
+
+- Bounded terminate(), limit panics, selected const fn removals, optional WebSocket accept.
+- **(ts)** `SpawnedPeer` no longer declares `startError`. Code that reads a launch failure from a peer must type it as `LaunchedPeer`, which is what `spawnPort` has returned since this change.
+- **(rs)** A serialized `Catalog` no longer carries optional members that are empty. Readers that indexed `events` or `capabilities` blindly must treat them as absent, which the schema has always allowed.
+
+### 🚀 Features
+
+- Wire minor 1.1 session limits, rpc.discover and the spec gaps behind them (#8)
+- **(rs)** Every transport the TypeScript SDK offers, and an interop lane (#4)
+- **(rs)** A tokio session and contract builder for mango-protocol (#2)
+- **(rs)** Emit the catalog schema
+- **(ts)** Carry the child's exit status on a refused spawn
+- **(ts)** Give the connect functions a deadline
+
+### 🐛 Bug Fixes
+
+- **(build)** Carry breaking changes into the generated changelog (#20)
+- **[breaking]** Bring seven cross-SDK behaviours back into step before 0.2.0 (#12)
+- **[breaking]** **(rs)** Leave absent catalog members absent when serializing
+- **(build)** Restore the not-in-the-spec guard for catalog $defs
+- **(rs)** Name what the catalog emission found when the root is missing
+- **(ts)** Unref the connect deadline timer
+- **(ts)** Keep listening for errors on a socket the dial gave up on
+
+### 🏗️ Build
+
+- Retire the default normaliser rule
+
+### ♻️ Refactor
+
+- **[breaking]** **(ts)** Move startError onto a peer this launcher started
+- **(ts)** Move lastNonEmptyLine out of the child-process module
+
+### 🧪 Testing
+
+- **(ts)** Replace the inline I/O stubs with named fakes
+- **(rs)** Prove the catalog schema against the crate
+
+### 👷 CI
+
+- **(release)** Check crates.io before asking for a trusted-publishing token
 ## [0.1.0] - 2026-09-10
 
 ### 🚀 Features

@@ -9,7 +9,7 @@ members = ["crates/mango-protocol"]
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Julio Polycarpo"]
 edition = "2024"
 license = "MIT"

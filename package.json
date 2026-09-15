@@ -2,7 +2,7 @@
   "name": "@mangostudio/protocol-root",
   "private": true,
   "license": "MIT",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Mango Protocol: one JSON-Schema wire contract for MangoStudio hubs, runtimes and tools.",
   "author": "Julio Polycarpo",
   "repository": {
