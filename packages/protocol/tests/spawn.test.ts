@@ -467,6 +467,18 @@ describe('spawn launcher', () => {
     );
     expect(() => spawnPort({ argv: [''] })).toThrow('spawn argv is [""]');
   });
+
+  it('refuses a sub-floor maxFrameBytes before the child is ever started', () => {
+    const spawner = new RecordingSpawn();
+
+    expect(() => spawnPort({ argv: ['runtime'], maxFrameBytes: 100 }, spawner.spawn)).toThrow(
+      'maxFrameBytes is 100; expected an integer of at least 4096'
+    );
+    // The check runs before `start()`, not after `createStreamPort` would
+    // have thrown on the same value with a child already running and no
+    // handle left to signal it.
+    expect(spawner.calls).toEqual([]);
+  });
 });
 
 describe('sanitizedEnv', () => {

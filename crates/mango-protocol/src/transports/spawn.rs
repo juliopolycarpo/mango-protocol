@@ -483,7 +483,24 @@ fn is_secret_shaped(upper: &str) -> bool {
 /// command that does not exist, one this user may not run — is reported
 /// through the port and [`LaunchedPeer::start_error`], because by then there
 /// is a session waiting to be told why it never came up.
+///
+/// # Panics
+///
+/// Panics when `options.max_frame_bytes` is `Some` value below
+/// [`crate::codec::ndjson::MIN_MAX_FRAME_BYTES`], naming both.
+/// [`SpawnOptions::with_max_frame_bytes`] already refuses this on the builder
+/// path, but the field is `pub`, so this is the check for a caller that
+/// assigned it directly — checked before the command is started, not after,
+/// so a sub-floor value never leaves a child running with nothing left to
+/// signal it.
 pub fn spawn_port(options: SpawnOptions) -> Result<(SpawnPort, LaunchedPeer), SpawnArgvError> {
+    if let Some(max_frame_bytes) = options.max_frame_bytes {
+        let _ = crate::codec::limits::check_at_least(
+            "max_frame_bytes",
+            max_frame_bytes,
+            crate::codec::ndjson::MIN_MAX_FRAME_BYTES,
+        );
+    }
     let command = match options.argv.first() {
         Some(command) if !command.is_empty() => command.clone(),
         _ => {
@@ -1344,6 +1361,21 @@ mod tests {
     #[should_panic(expected = "max_frame_bytes is 512; expected at least 4096")]
     fn with_max_frame_bytes_below_the_floor_panics_naming_both() {
         let _ = SpawnOptions::new(["mango-runtime"]).with_max_frame_bytes(512);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_frame_bytes is 512; expected at least 4096")]
+    fn spawn_port_panics_on_a_sub_floor_ceiling_before_starting_the_child() {
+        // `max_frame_bytes` assigned directly, the way a caller who skips
+        // `with_max_frame_bytes` would — the field is `pub`, so nothing but
+        // this check stops it. A command that names no real process on this
+        // system: if the check ever moves back to after the child starts,
+        // this reaches the "command never became a process" branch instead
+        // of panicking, and the test fails with "did not panic" rather than
+        // silently passing on the old, buggy ordering.
+        let mut options = SpawnOptions::new(["mango-no-such-command-exists-anywhere"]);
+        options.max_frame_bytes = Some(512);
+        let _ = spawn_port(options);
     }
 
     #[tokio::test]

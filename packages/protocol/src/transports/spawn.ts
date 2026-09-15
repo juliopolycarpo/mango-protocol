@@ -15,6 +15,7 @@ import {
 } from 'node:child_process';
 import { CLOSE_CODES } from '../close';
 import { resolveIntegerAtLeast } from '../codec/limits';
+import { DEFAULT_MAX_FRAME_BYTES, MIN_MAX_FRAME_BYTES } from '../codec/ndjson';
 import type { Port, PortClosure } from '../port';
 import type { Frame } from '../schemas/frames';
 import { type ByteSink, createNdjsonPort, type NdjsonPortHandle } from './ndjson-port';
@@ -235,6 +236,16 @@ export function spawnPort(options: SpawnOptions, spawnChild: SpawnChild = spawn)
       `spawn argv is ${JSON.stringify(options.argv)}; expected [command, ...args] with a non-empty command`
     );
   }
+  // Resolved before `start()` runs, not after: `createStreamPort` is what
+  // would otherwise throw on a sub-floor value, and by then the child is
+  // already a running process this function has thrown away every handle
+  // to — nothing left to signal it.
+  const maxFrameBytes = resolveIntegerAtLeast(
+    'maxFrameBytes',
+    options.maxFrameBytes,
+    DEFAULT_MAX_FRAME_BYTES,
+    MIN_MAX_FRAME_BYTES
+  );
   const tail = new BoundedTail(
     resolveIntegerAtLeast('stderrTailBytes', options.stderrTailBytes, DEFAULT_STDERR_TAIL_BYTES, 1)
   );
@@ -242,7 +253,7 @@ export function spawnPort(options: SpawnOptions, spawnChild: SpawnChild = spawn)
   const launch = new LaunchRecord();
 
   const child = start(spawnChild, command, options.argv.slice(1), options, tail, exit, launch);
-  const limit = options.maxFrameBytes !== undefined ? { maxFrameBytes: options.maxFrameBytes } : {};
+  const limit = { maxFrameBytes };
   const handle =
     child?.stdin && child.stdout
       ? createStreamPort(child.stdout, child.stdin, limit)
