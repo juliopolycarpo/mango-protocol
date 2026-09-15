@@ -777,9 +777,14 @@ mod tests {
     #[tokio::test]
     async fn a_replacement_at_the_same_path_survives_a_stale_removal_judged_before_it_arrived() {
         let address = Address::new();
+        // Keeps A's inode number out of B's reach once A's file is unlinked;
+        // see `closing_leaves_a_replacement_address_alone` for why the bare
+        // `assert_ne!` below is not self-sufficient.
+        let pin = Address::new();
         let stale_inode = {
             let a = listening(&address).await;
             let inode = a.inode;
+            std::fs::hard_link(address.path(), pin.path()).expect("A's inode to be pinned");
             drop(a);
             inode
         };
@@ -787,7 +792,9 @@ mod tests {
         // The window `remove_stale_socket`'s probe leaves open: another
         // supervisor already removed and rebound the address by the time the
         // stale verdict this call is acting on is applied.
-        let b = listening(&address).await;
+        let b = listen_ipc_past_a_concurrent_forking_test(&address.path())
+            .await
+            .expect("a stale socket is not an occupied address");
         assert_ne!(
             stale_inode, b.inode,
             "B must be a different socket for this test to mean anything"
@@ -858,9 +865,18 @@ mod tests {
     #[tokio::test]
     async fn closing_leaves_a_replacement_address_alone() {
         let address = Address::new();
+        // A's inode has to stay distinct from B's for the rest of this test to
+        // mean anything, and unlinking A's socket frees its inode number for
+        // B's `bind` to be handed straight back — CI has done exactly that. A
+        // hard link elsewhere keeps A's link count above zero past the unlink,
+        // so the number cannot be reused while this test still needs it. The
+        // link lives under its own `Address` so nothing extra sits in the
+        // directory `listen_ipc` stages beside.
+        let pin = Address::new();
         let a_inode = {
             let a = listening(&address).await;
             let inode = a.inode;
+            std::fs::hard_link(address.path(), pin.path()).expect("A's inode to be pinned");
             // A crash: the file descriptor closes without the unlink `close`
             // performs, leaving a stale file behind — the same shape
             // `a_stale_socket_file_is_replaced` relies on.
