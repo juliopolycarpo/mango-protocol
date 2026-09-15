@@ -249,6 +249,10 @@ export function spawnPort(options: SpawnOptions, spawnChild: SpawnChild = spawn)
   const tail = new BoundedTail(
     resolveIntegerAtLeast('stderrTailBytes', options.stderrTailBytes, DEFAULT_STDERR_TAIL_BYTES, 1)
   );
+  // Resolved here for the same reason as `maxFrameBytes`: a grace the
+  // sequence cannot honour must be refused at the call that set it, not
+  // discovered by a shutdown that reports a healthy child as unreaped.
+  const graces = resolveGraces(options);
   const exit = deferredExit();
   const launch = new LaunchRecord();
 
@@ -266,7 +270,7 @@ export function spawnPort(options: SpawnOptions, spawnChild: SpawnChild = spawn)
     // outlived the graces and exited afterwards has an exit status now, and
     // a caller who asks again deserves it rather than the `undefined` the
     // first call was right about at the time.
-    termination ??= escalate(child, handle, exit.promise, options);
+    termination ??= escalate(child, handle, exit.promise, graces);
     return (await termination) ?? (await settledStatus(exit.promise));
   };
   // The launcher owns the child's lifetime whichever side ended the port: a
@@ -408,7 +412,7 @@ async function escalate(
   child: ChildProcess | undefined,
   handle: NdjsonPortHandle,
   exited: Promise<ExitStatus>,
-  options: SpawnOptions
+  graces: Graces
 ): Promise<ExitStatus | undefined> {
   // A `close` frame first, so a conforming child knows why it is leaving; the
   // port ends stdin behind it, which is step 1 of the sequence.
@@ -418,19 +422,16 @@ async function escalate(
   // child that never started never reaches the bounded wait below.
   if (child === undefined) return await exited;
 
-  const terminateGrace = options.terminateGraceMs ?? DEFAULT_TERMINATE_GRACE_MS;
-  if (await settledWithin(exited, terminateGrace)) return await exited;
+  if (await settledWithin(exited, graces.terminateMs)) return await exited;
   kill(child, 'SIGTERM');
 
-  const killGrace = options.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
-  if (await settledWithin(exited, killGrace)) return await exited;
+  if (await settledWithin(exited, graces.killMs)) return await exited;
   kill(child, 'SIGKILL');
 
   // Bounded from here: a child that ignores SIGKILL (a process stuck in `D`
   // state, a Windows `kill()` that returned `false`) must not keep a shutdown
   // awaiting `terminate()` stuck forever. `exited` itself stays unbounded.
-  const exitGrace = options.exitGraceMs ?? DEFAULT_EXIT_GRACE_MS;
-  return (await settledWithin(exited, exitGrace)) ? await exited : undefined;
+  return (await settledWithin(exited, graces.exitMs)) ? await exited : undefined;
 }
 
 function kill(child: ChildProcess, signal: 'SIGTERM' | 'SIGKILL'): void {
@@ -439,6 +440,41 @@ function kill(child: ChildProcess, signal: 'SIGTERM' | 'SIGKILL'): void {
   // the same call with a name the platform cannot deliver.
   if (WINDOWS) child.kill();
   else child.kill(signal);
+}
+
+/** The three bounded waits of spawn.md's termination sequence, in milliseconds. */
+interface Graces {
+  readonly terminateMs: number;
+  readonly killMs: number;
+  readonly exitMs: number;
+}
+
+/**
+ * Reads the three termination graces, refusing anything that is not a
+ * whole, non-negative number of milliseconds where it was written. A
+ * negative `exitGraceMs` would otherwise fire its timer before any exit
+ * could land, so `terminate()` would report every child as unreaped — a
+ * healthy one that left on the end of its stdin included.
+ *
+ * `0` is admitted and reads as "do not wait" — the same meaning
+ * `settledStatus` gives `settledWithin(exited, 0)` — because a caller asking
+ * the sequence to move straight to its next step is asking for something the
+ * sequence can honour. A negative value is not that; it is a mistake.
+ *
+ * @example
+ * resolveGraces({ argv: ['runtime'], exitGraceMs: 500 }).exitMs; // 500
+ */
+function resolveGraces(options: SpawnOptions): Graces {
+  return {
+    terminateMs: resolveIntegerAtLeast(
+      'terminateGraceMs',
+      options.terminateGraceMs,
+      DEFAULT_TERMINATE_GRACE_MS,
+      0
+    ),
+    killMs: resolveIntegerAtLeast('killGraceMs', options.killGraceMs, DEFAULT_KILL_GRACE_MS, 0),
+    exitMs: resolveIntegerAtLeast('exitGraceMs', options.exitGraceMs, DEFAULT_EXIT_GRACE_MS, 0),
+  };
 }
 
 /** The exit status if it has already landed, `undefined` while it has not. */

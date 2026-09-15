@@ -479,6 +479,21 @@ describe('spawn launcher', () => {
     // handle left to signal it.
     expect(spawner.calls).toEqual([]);
   });
+
+  it.each([
+    ['exitGraceMs', -1, 'exitGraceMs is -1; expected an integer of at least 0'],
+    ['terminateGraceMs', -1, 'terminateGraceMs is -1; expected an integer of at least 0'],
+    ['killGraceMs', 1.5, 'killGraceMs is 1.5; expected an integer of at least 0'],
+  ])('refuses %s of %p before the child is ever started', (option, value, message) => {
+    // A grace the sequence cannot honour is refused where it was written. A
+    // negative `exitGraceMs` in particular fires its timer before any exit
+    // can land, so `terminate()` would answer `undefined` for a child that
+    // left on the end of its own stdin — an unreaped child that never was.
+    const spawner = new RecordingSpawn();
+
+    expect(() => spawnPort({ argv: ['runtime'], [option]: value }, spawner.spawn)).toThrow(message);
+    expect(spawner.calls).toEqual([]);
+  });
 });
 
 describe('sanitizedEnv', () => {
