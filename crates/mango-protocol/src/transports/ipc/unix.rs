@@ -62,9 +62,11 @@ pub(super) fn address_for(name: &str) -> PathBuf {
 pub struct IpcListener {
     listener: UnixListener,
     path: PathBuf,
-    /// The address's inode at the moment this listener published it. `close`
-    /// unlinks only while this is still what sits at `path`, so a listener
-    /// that crashed and was replaced does not delete its replacement's file.
+    /// The inode of the socket this listener bound, read while it was still
+    /// staged and unreachable, and carried onto `path` by the link or rename
+    /// that published it. `close` unlinks only while this is still what sits
+    /// at `path`, so a listener that crashed and was replaced does not delete
+    /// its replacement's file.
     inode: u64,
     max_frame_bytes: Option<usize>,
     /// Weak handles to the ports handed out, so shutting down can tell the
@@ -205,11 +207,7 @@ pub async fn listen_ipc(path: impl AsRef<Path>) -> io::Result<IpcListener> {
     let staging = staging_path(&path);
     let staged = stage_and_publish(&staging, &path).await;
     discard(&staging).await;
-    let listener = staged?;
-    // Recorded now, right after publishing succeeded, so a later `close` can
-    // tell this listener's own address from one a replacement has since
-    // bound at the same path.
-    let inode = tokio::fs::symlink_metadata(&path).await?.ino();
+    let (listener, inode) = staged?;
 
     Ok(IpcListener {
         listener,
@@ -297,10 +295,21 @@ struct Staging {
 
 /// Binds inside a fresh owner-only directory, restricts the socket, and links
 /// it onto the address. Whatever this fails at, [`discard`] cleans up after.
-async fn stage_and_publish(staging: &Staging, path: &Path) -> io::Result<UnixListener> {
+///
+/// The inode comes back with the listener, read from the staged socket while
+/// it is still inside a directory nobody else may enter — and so while
+/// nothing can be racing it. Both of [`publish`]'s moves keep the inode the
+/// `bind` created, so it is the number that sits at `path` afterwards.
+/// Reading it from `path` *after* publishing would record a replacement's
+/// inode whenever another listener took the address in between, which is the
+/// one case [`IpcListener::close`]'s guard exists to survive; it would also
+/// leave a bound, published address behind if that read were the call to
+/// fail.
+async fn stage_and_publish(staging: &Staging, path: &Path) -> io::Result<(UnixListener, u64)> {
     let listener = stage(staging).await?;
+    let inode = tokio::fs::symlink_metadata(&staging.socket).await?.ino();
     publish(&staging.socket, path).await?;
-    Ok(listener)
+    Ok((listener, inode))
 }
 
 /// Binds the socket somewhere no other user may reach it.
