@@ -17,10 +17,19 @@ body = """
 {% else -%}
 ## [Unreleased]
 {% endif -%}
+{% set breaking = commits | filter(attribute="breaking", value=true) -%}
+{% if breaking | length > 0 %}
+### 💥 Breaking Changes
+{% for commit in breaking %}
+- {% if commit.scope %}**({{ commit.scope }})** {% endif %}\
+{{ commit.breaking_description | replace(from="\n", to=" ") | trim | upper_first }}\
+{% endfor %}
+{% endif -%}
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | upper_first }}
 {% for commit in commits %}
-- {% if commit.scope %}**({{ commit.scope }})** {% endif %}{{ commit.message | upper_first }}\
+- {% if commit.breaking %}**[breaking]** {% endif %}\
+{% if commit.scope %}**({{ commit.scope }})** {% endif %}{{ commit.message | upper_first }}\
 {% endfor %}
 {% endfor %}
 """
@@ -33,7 +42,12 @@ postprocessors = [{ pattern = '<!-- [0-9]+ -->', replace = "" }]
 conventional_commits = true
 filter_unconventional = true
 split_commits = false
-commit_preprocessors = []
+# `e39d1f8` states its breaking surface as "Breaking pre-1.0:", which the
+# conventional parser does not recognise. Rewrite it to the footer token so the
+# surface reaches the changelog and the generated release notes.
+commit_preprocessors = [
+  { pattern = '(?m)^Breaking pre-1\.0: ', replace = "BREAKING CHANGE: " },
+]
 commit_parsers = [
   { message = "^chore\\(release\\)", skip = true },
   { message = "^chore\\(deps\\)", group = "<!-- 8 -->⬆️ Dependencies" },
