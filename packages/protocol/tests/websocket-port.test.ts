@@ -456,6 +456,25 @@ describe('createWebSocketPort accept', () => {
     expect(closures).toHaveLength(1);
   });
 
+  it('still reports the refusal when the framework closes before anyone subscribes', async () => {
+    // The ordinary integration order: `refuseOrigin` closes the socket, the
+    // framework calls back with its own close, and only then does the
+    // acceptor wire a `Session` to the port. A closure the port emitted to
+    // nobody must not count as reported, or the subscriber that follows
+    // learns nothing about the 4403 the socket was closed with.
+    const sink = new FakeWebSocketSink();
+    const handle = createWebSocketPort(sink, {
+      accept: { origin: 'https://evil.example', allowedOrigins: ALLOWED_ORIGINS },
+    });
+    handle.onClose(4403, 'origin not allowed');
+
+    const closures: PortClosure[] = [];
+    handle.port.onClosed((closure) => closures.push(closure));
+    await Promise.resolve();
+
+    expect(closures).toEqual([{ kind: 'closed', code: 4403, reason: 'origin not allowed' }]);
+  });
+
   it('lets hello flow for an allowed origin', () => {
     const sink = new FakeWebSocketSink();
     const handle = createWebSocketPort(sink, {

@@ -251,19 +251,18 @@ class WebSocketPort implements Port {
    *
    * Unlike `close()`, the closure here is not one the caller already knows
    * about — this runs inside `createWebSocketPort`, before the caller has
-   * the handle back — so `#ownerClosed` stays false and the closure is held
-   * until somebody subscribes, the way `#arrivals` holds a frame that
-   * arrived before anyone was listening for frames.
+   * the handle back — so `#ownerClosed` stays false and `#report` holds the
+   * closure until somebody subscribes, the way `#arrivals` holds a frame
+   * that arrived before anyone was listening for frames.
    */
   refuseOrigin(): void {
     this.#shutdown(CLOSE_CODES.FORBIDDEN);
     this.#sink.close(CLOSE_CODES.FORBIDDEN, 'origin not allowed');
-    this.#pendingClosure = {
+    this.#report({
       kind: 'closed',
       code: CLOSE_CODES.FORBIDDEN,
       reason: 'origin not allowed',
-    };
-    this.#scheduleClosure();
+    });
   }
 
   /** One incoming message: text is fatal, bytes feed the reassembler. */
@@ -442,10 +441,23 @@ class WebSocketPort implements Port {
     });
   }
 
-  /** At most one closure, and never for a close this side asked for. */
+  /**
+   * At most one closure, and never for a close this side asked for.
+   *
+   * A closure raised before anyone subscribed is held rather than dropped:
+   * the socket is closing from the moment it exists, so a refused upgrade or
+   * a peer that hangs up can close it before the `Session` is constructed,
+   * and a listener attached afterwards must still learn why. Only the first
+   * such closure is kept — it is the one that ended the port.
+   */
   #report(closure: PortClosure): void {
     if (this.#reported || this.#ownerClosed) return;
+    if (this.#closed.size === 0) {
+      this.#pendingClosure ??= closure;
+      return;
+    }
     this.#reported = true;
+    this.#pendingClosure = undefined;
     this.#closed.emit(closure);
     this.#closed.clear();
   }
