@@ -181,6 +181,41 @@ value and the floor it broke, the way the TypeScript SDK raises a `RangeError` f
 build a `hello.limits.maxInFlight` the schema refuses, or make the very first `emit` answer
 `UNAVAILABLE`.
 
+**Upgrading from `0.1`:** that check costs six constructors their `const fn`. The message names
+the value received and the floor it broke, which means building a `String`, and a formatted panic
+cannot appear in a `const fn`. The six are `LineDecoder::new`, `ChunkReassembler::new`,
+`SessionOptions::with_max_in_flight`, `SessionOptions::with_max_stream_keys`,
+`WebSocketOptions::with_max_frame_bytes` and `WebSocketOptions::with_max_message_bytes`.
+
+Only the first two can break your build. The other four are builders taking `self`, and the
+receiver they need — `SessionOptions::new`, which allocates a `String`, or
+`WebSocketOptions::default` — was never `const` itself, so no caller could reach them from a
+`const` context in `0.1` either.
+
+Calling either of the first two at run time is unchanged. What stops compiling is a `const` item,
+a `static`, or your own `const fn` built on one:
+
+```rust,ignore
+// 0.1: fine. 0.2.0: error[E0015], cannot call non-const fn in constants.
+static DECODER: LineDecoder = LineDecoder::new(DEFAULT_MAX_FRAME_BYTES);
+```
+
+A `OnceLock` gives you the same single instance, and takes the floor check with it:
+
+```rust,ignore
+use std::sync::OnceLock;
+use mango_protocol::codec::ndjson::{DEFAULT_MAX_FRAME_BYTES, LineDecoder};
+
+static DECODER: OnceLock<LineDecoder> = OnceLock::new();
+let decoder = DECODER.get_or_init(|| LineDecoder::new(DEFAULT_MAX_FRAME_BYTES));
+```
+
+A decoder carries per-connection buffer state, so one per connection is usually what you want
+rather than a shared one.
+
+`cargo-semver-checks` reports these as `inherent_method_const_removed` against the published
+`0.1.0`, and it is right to.
+
 ## Serve a contract
 
 A `Contract` (see [Build a contract](build-a-contract.md)) wraps a session with schema
