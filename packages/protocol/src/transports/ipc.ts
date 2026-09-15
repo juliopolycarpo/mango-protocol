@@ -5,6 +5,7 @@
  * One accepted connection is one session; a listener serves many at once.
  */
 
+import type { Stats } from 'node:fs';
 import { chmod, lstat, unlink } from 'node:fs/promises';
 import { connect as connectSocket, createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -301,18 +302,18 @@ async function bindOwnerOnly(server: Server, path: string): Promise<void> {
  * every address this call could not judge either way.
  */
 async function clearStaleSocket(path: string): Promise<void> {
-  let isSocket: boolean;
+  let stats: Stats;
   try {
-    isSocket = (await lstat(path)).isSocket();
+    stats = await lstat(path);
   } catch {
     // Nothing at the path, which is the ordinary case.
     return;
   }
-  if (!isSocket) return;
+  if (!stats.isSocket()) return;
 
   const verdict = await probe(path);
   if (verdict === 'stale') {
-    await removeSocketFile(path);
+    await removeSocketFile(path, stats.ino);
     return;
   }
   throw Object.assign(
@@ -324,13 +325,33 @@ async function clearStaleSocket(path: string): Promise<void> {
 }
 
 /**
- * Unlinks a socket file already judged stale. A file that went away while the
- * probe was dialling it — the probe waits up to a second, and a second
- * supervisor restarting against the same address is exactly who removes it —
- * leaves the address free, which is the outcome this was after; anything else
- * is the caller's to see.
+ * Unlinks a socket file already judged stale, but only while it is still the
+ * same file the probe judged: the probe waits up to a second, and a second
+ * supervisor restarting against the same address is exactly who can remove
+ * and rebind it inside that window — unlinking on the stale verdict alone
+ * would then delete the winner's live socket file out from under it.
+ * Silently leaving a changed path alone is correct: the later `listen`
+ * call's own `EADDRINUSE` is what tells *this* caller the address was
+ * taken, the same outcome an unguarded race would have produced for the
+ * loser anyway. This narrows the window from the whole probe down to the
+ * gap between this check and the unlink; it does not close it — Node offers
+ * no unlink-by-inode primitive to close it with (the Rust SDK's
+ * `remove_stale_socket` carries the same guard, for the same reason).
+ *
+ * A file that went away entirely while the probe was dialling it — the same
+ * kind of restart, just resolved before this call ran rather than during
+ * it — leaves the address free, which is the outcome this was after; only
+ * an error other than "gone" or "someone else's now" is the caller's to see.
  */
-async function removeSocketFile(path: string): Promise<void> {
+async function removeSocketFile(path: string, inode: number): Promise<void> {
+  let current: Stats;
+  try {
+    current = await lstat(path);
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw cause;
+  }
+  if (current.ino !== inode) return;
   try {
     await unlink(path);
   } catch (cause) {

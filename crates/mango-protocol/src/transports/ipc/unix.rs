@@ -401,7 +401,7 @@ async fn remove_stale_socket(path: &Path) -> io::Result<()> {
         ));
     }
     match probe(path).await {
-        Staleness::Stale => tokio::fs::remove_file(path).await,
+        Staleness::Stale => remove_if_still(path, metadata.ino()).await,
         Staleness::Live => Err(io::Error::new(
             io::ErrorKind::AddrInUse,
             format!(
@@ -411,6 +411,27 @@ async fn remove_stale_socket(path: &Path) -> io::Result<()> {
             ),
         )),
     }
+}
+
+/// Unlinks `path`, but only while it is still the same file the probe judged
+/// stale. `probe` waits up to a second, and a second supervisor racing the
+/// same restart against the same address is exactly who can remove and
+/// rebind it inside that window — unlinking on the stale verdict alone would
+/// then delete the winner's live socket file out from under it. Silently
+/// doing nothing when the inode has moved on is correct: [`publish`]'s own
+/// `AlreadyExists` guard is what tells *this* caller the address was taken,
+/// the same outcome a plain, unguarded race would have produced for the
+/// loser anyway. This narrows the window from the whole probe to the gap
+/// between this check and the unlink; it does not close it — there is no
+/// unlink-by-inode primitive on this platform to close it with.
+async fn remove_if_still(path: &Path, inode: u64) -> io::Result<()> {
+    let Ok(metadata) = tokio::fs::symlink_metadata(path).await else {
+        return Ok(());
+    };
+    if metadata.ino() == inode {
+        tokio::fs::remove_file(path).await?;
+    }
+    Ok(())
 }
 
 /// Whether a socket file at an address is stale, or a live listener still
@@ -454,14 +475,14 @@ async fn probe(path: &Path) -> Staleness {
 mod tests {
     use super::{
         ConnectDeadline, IpcListener, SOCKET_MODE, STAGING_DIRECTORY_MODE, UnixListener,
-        connect_ipc, discard, listen_ipc, publish, stage, staging_path,
+        connect_ipc, discard, listen_ipc, publish, remove_if_still, stage, staging_path,
     };
     use crate::close::close_codes;
     use crate::frame::Frame;
     use crate::port::{Inbound, Port, PortRx, PortTx};
     use crate::transports::deadline::ConnectError;
     use std::io;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio_util::sync::CancellationToken;
@@ -751,6 +772,43 @@ mod tests {
             .await
             .expect("a stale socket is not an occupied address");
         second.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_replacement_at_the_same_path_survives_a_stale_removal_judged_before_it_arrived() {
+        let address = Address::new();
+        let stale_inode = {
+            let a = listening(&address).await;
+            let inode = a.inode;
+            drop(a);
+            inode
+        };
+
+        // The window `remove_stale_socket`'s probe leaves open: another
+        // supervisor already removed and rebound the address by the time the
+        // stale verdict this call is acting on is applied.
+        let b = listening(&address).await;
+        assert_ne!(
+            stale_inode, b.inode,
+            "B must be a different socket for this test to mean anything"
+        );
+
+        remove_if_still(&address.path(), stale_inode)
+            .await
+            .expect("a path B still occupies is not an error to leave alone");
+
+        let survived =
+            std::fs::symlink_metadata(address.path()).expect("B's socket file must still be there");
+        assert_eq!(
+            survived.ino(),
+            b.inode,
+            "expected B's socket file untouched, received a different inode at its path"
+        );
+        connect_ipc(address.path(), &ConnectDeadline::default())
+            .await
+            .expect("B still accepts a connection");
+
+        b.close().await;
     }
 
     #[tokio::test]
