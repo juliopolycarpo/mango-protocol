@@ -494,6 +494,7 @@ mod tests {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
     static NEXT_ADDRESS: AtomicU64 = AtomicU64::new(0);
@@ -858,13 +859,23 @@ mod tests {
         // without ever delivering a frame — `Inbound::Closed` rather than the
         // `Ping` the real client sends — so it is not what this test waits
         // for.
-        let delivered = loop {
-            let (accepted, _identity) = first.accept().await.expect("the listener keeps answering");
-            let (_tx, mut rx) = accepted.split();
-            if let Some(frame @ Inbound::Frame(Frame::Ping)) = rx.recv().await {
-                break frame;
+        // Bounded, because the skipping is what makes this loop able to wait
+        // forever: if the real client's `Ping` never arrives, the probe's own
+        // connection is the only thing the queue ever holds, and an unbounded
+        // `accept()` would hang the test binary instead of saying what was
+        // expected.
+        let delivered = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let (accepted, _identity) =
+                    first.accept().await.expect("the listener keeps answering");
+                let (_tx, mut rx) = accepted.split();
+                if let Some(frame @ Inbound::Frame(Frame::Ping)) = rx.recv().await {
+                    break frame;
+                }
             }
-        };
+        })
+        .await
+        .expect("expected Inbound::Frame(Ping) from the real client, received nothing in 10s");
         assert_eq!(delivered, Inbound::Frame(Frame::Ping));
 
         dial.await.expect("the dial task runs");
