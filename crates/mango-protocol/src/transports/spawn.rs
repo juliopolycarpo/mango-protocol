@@ -997,12 +997,18 @@ impl LaunchedPeer {
 
     /// Runs the termination sequence and resolves once the child has exited,
     /// or `None` once the exit grace has run out after `SIGKILL` without the
-    /// child leaving. `None` means exactly that one thing — the grace ran
-    /// out — and nothing else: an unspawned child (one that never became a
-    /// process) still resolves `Some(ExitStatus::default())`, the same
-    /// sentinel [`LaunchedPeer::exited`] reports for it, because there is
-    /// nothing there to time out on. Safe to call more than once, and safe to
-    /// call after the port already started the sequence on its own.
+    /// child leaving. The escalation itself runs once and is not repeated,
+    /// but a call after it gave up rechecks the exit watch rather than
+    /// replaying the stale answer: a child that outlived every grace and
+    /// left afterwards has an exit status now, matching the TypeScript
+    /// launcher, whose `terminate()` does not cache `undefined` either.
+    /// `None` from this call means the grace had run out *and* the child
+    /// still had not exited by the time this call was made — an unspawned
+    /// child (one that never became a process) still resolves
+    /// `Some(ExitStatus::default())`, the same sentinel
+    /// [`LaunchedPeer::exited`] reports for it, because there is nothing
+    /// there to time out on. Safe to call more than once, and safe to call
+    /// after the port already started the sequence on its own.
     ///
     /// Step 1 of spawn.md's sequence — ending the child's stdin — belongs to
     /// whoever holds the port, because that is who owns the writable half:
@@ -1034,7 +1040,15 @@ impl LaunchedPeer {
     /// ```
     pub async fn terminate(&self) -> Option<ExitStatus> {
         self.terminator.start();
-        self.terminator.outcome().await
+        match self.terminator.outcome().await {
+            Some(status) => Some(status),
+            // `GaveUp` is what the escalation recorded when its own grace
+            // ran out; it says nothing about now. A plain, non-blocking
+            // `borrow` is deliberate here — this must never wait, or a
+            // caller who already saw one `None` could hang on a second call
+            // forever, exactly what `exit_grace` exists to bound against.
+            None => *self.exit.borrow(),
+        }
     }
 
     /// Sends `SIGKILL` (on Windows, terminates) without waiting out the
@@ -1253,10 +1267,11 @@ fn append_line(tail: &Arc<Mutex<BoundedTail>>, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedTail, ExitStatus, SpawnOptions, Terminator, last_non_empty_line, sanitized_env_from,
-        signal_name, spawn_port,
+        BoundedTail, ExitStatus, LaunchedPeer, SpawnOptions, Terminator, last_non_empty_line,
+        sanitized_env_from, signal_name, spawn_port,
     };
     use crate::port::{Inbound, Port, PortClosure, PortRx};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::{mpsc, watch};
 
@@ -1352,6 +1367,51 @@ mod tests {
             Ok(Some(status)) => panic!("expected Ok(None), received Ok(Some({status}))"),
             Err(_) => panic!("expected Ok(None), received Err(Elapsed)"),
         }
+    }
+
+    #[tokio::test]
+    async fn terminate_rechecks_the_exit_watch_after_giving_up() {
+        let (kill_tx, _kill_rx) = mpsc::unbounded_channel();
+        let (exit_tx, exit_rx) = watch::channel(None);
+        let terminator = Arc::new(Terminator::new(
+            kill_tx.clone(),
+            exit_rx.clone(),
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        ));
+        let peer = LaunchedPeer {
+            pid: Some(1),
+            exit: exit_rx,
+            tail: Arc::new(Mutex::new(BoundedTail::new(0))),
+            spawn_error: None,
+            kill: kill_tx,
+            terminator,
+        };
+
+        // No exit ever lands inside the graces: the escalation gives up and
+        // caches `GaveUp`.
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(200), peer.terminate())
+                .await
+                .expect("terminate must not hang past its own graces"),
+            None
+        );
+
+        // The child leaves *after* the grace — late, but it did leave.
+        let late = ExitStatus {
+            code: Some(0),
+            signal: None,
+        };
+        let _ = exit_tx.send(Some(late));
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(200), peer.terminate())
+                .await
+                .expect("a second terminate() call must not hang either"),
+            Some(late),
+            "a late exit must be visible to a caller who asks terminate() again"
+        );
     }
 
     #[test]
