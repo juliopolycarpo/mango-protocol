@@ -24,15 +24,15 @@
     "prepare": "lefthook install"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.5.7",
-    "@dprint/markdown": "^0.22.1",
-    "@dprint/toml": "^0.7.0",
+    "@biomejs/biome": "^2.5.15",
+    "@dprint/markdown": "^0.26.0",
+    "@dprint/toml": "^0.9.0",
     "@types/bun": "^1.4.1",
     "ajv": "^8",
-    "dprint": "^0.55.2",
-    "git-cliff": "^2.13.1",
-    "lefthook": "^2.1.10",
-    "typebox": "1.3.13",
+    "dprint": "^0.61.1",
+    "git-cliff": "^2.14.2",
+    "lefthook": "^2.2.1",
+    "typebox": "1.3.36",
     "typescript": "7.0.2"
   }
 }
