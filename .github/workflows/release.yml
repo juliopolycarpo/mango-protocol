@@ -48,7 +48,7 @@ jobs:
         with:
           bun-version-file: .bun-version
       - run: rustup show active-toolchain
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: bun install --frozen-lockfile
       - name: Manifests match the tag
         run: bun ./scripts/check-versions.ts "${{ steps.resolve.outputs.version }}"
@@ -79,7 +79,7 @@ jobs:
       - run: bun run build
       # npm trusted publishing needs the npm CLI (>= 11.5.1 on Node >= 22.14);
       # this is the one place the repository runs npm instead of bun.
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
           registry-url: https://registry.npmjs.org
@@ -111,7 +111,7 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup show active-toolchain
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - id: published
         name: Already on crates.io?
         env:
@@ -130,7 +130,7 @@ jobs:
       # only when there is something left to publish.
       - id: auth
         if: steps.published.outputs.skip != 'true'
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
       - name: Publish
         if: steps.published.outputs.skip != 'true'
         env:
